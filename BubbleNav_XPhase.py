@@ -1539,6 +1539,45 @@ except Exception:                                   # pragma: no cover
 _TkBase = tk.Tk if _TK_OK else object
 
 
+def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
+                     idx: int, view: View, calib: Calib, filters: HotspotFilter,
+                     has_image, eye: float = EYE_HEIGHT_DEFAULT,
+                     disc: float = DISC_RADIUS_M, r_min: float = DISC_PX_MIN,
+                     r_max: float = DISC_PX_MAX) -> Tuple[List["Hotspot"], int]:
+    """Pastilles projetées dans une vue, filtres compris.
+
+    Fonction partagée par la vue principale et la vue de comparaison : les deux
+    obtiennent exactement la même géométrie.
+
+    Retourne (pastilles du plus loin au plus près, nombre de pastilles masquées).
+    """
+    if not (0 <= idx < len(stations)) or idx >= len(links):
+        return [], 0
+    st = stations[idx]
+    retenus = [lk for lk in links[idx]
+               if filters.accepts(st, stations[lk.target], lk,
+                                  has_image(stations[lk.target].photo))]
+    masques = len(links[idx]) - len(retenus)
+    f = view.focal()
+    out: List[Hotspot] = []
+    for lk in retenus:
+        tgt = stations[lk.target]
+        dz = (tgt.z - eye) - st.z          # pastille posée au sol de la cible
+        dh = lk.dist_h
+        elev = math.degrees(math.atan2(dz, dh)) if dh > 1e-6 else (90.0 if dz > 0 else -90.0)
+        pr = project(view, calib.pano_yaw(lk.azimuth, st.north_pct), elev)
+        if pr is None:
+            continue
+        col, row, _ = pr
+        if not (-80 <= col <= view.width + 80 and -80 <= row <= view.height + 80):
+            continue
+        # rayon a l'ecran = focale x rayon physique / distance, borne des deux cotes
+        radius = clamp(f * disc / max(lk.dist, 0.35), r_min, r_max)
+        out.append(Hotspot(lk, col, row, radius, tgt.locator))
+    out.sort(key=lambda h: -h.link.dist)     # les plus lointaines dessinees d'abord
+    return out, masques
+
+
 @dataclass
 class Hotspot:
     """Pastille projetee dans la vue."""
@@ -1597,6 +1636,8 @@ class BubbleNavApp(_TkBase):
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
         self._cone_sig = None                    # état du camembert du plan
+        self._cmp_sig = None                     # état de synchro de la vue B
+        self._last_current = -1
         self._plan_hit = None                    # deplacement sur le plan
         self._autosave_job = None
         self._graph_job = None
@@ -1610,8 +1651,10 @@ class BubbleNavApp(_TkBase):
         self._plan_drag = None
         self._plan_floor = ''
 
-        # Rendu asynchrone : 1 thread, derniere demande gagnante
-        self._req: Optional[tuple] = None
+        # Rendu asynchrone : 1 thread, derniere demande gagnante par vue
+        # (« A » = vue principale, « B » = vue de comparaison)
+        self._reqs: "OrderedDict[str, tuple]" = OrderedDict()
+        self.compare: Optional["CompareView"] = None
         self._req_seq = 0
         self._shown_seq = -1
         self._cv = threading.Condition()
@@ -1760,6 +1803,8 @@ class BubbleNavApp(_TkBase):
 
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
                                                          padx=8, pady=6)
+        self.cmp_btn = self._mk_button(bar, "Comparer  (C)", self._toggle_compare)
+        self.cmp_btn.pack(side='left', padx=3, pady=4)
         self.edit_var = tk.BooleanVar(value=False)
         self.edit_btn = self._mk_button(bar, "Édition  (E)", self._toggle_edit)
         self.edit_btn.pack(side='left', padx=3, pady=4)
@@ -1853,6 +1898,8 @@ class BubbleNavApp(_TkBase):
         self.bind('<BackSpace>', lambda e: self.go_back())
         self.bind('<Home>', lambda e: self._reset_view())
         self.bind('<F11>', lambda e: self._toggle_fullscreen())
+        self.bind('<c>', lambda e: self._toggle_compare())
+        self.bind('<C>', lambda e: self._toggle_compare())
         self.bind('<f>', lambda e: self._toggle_filters())
         self.bind('<F>', lambda e: self._toggle_filters())
         self.bind('<e>', lambda e: self._toggle_edit())
@@ -1891,6 +1938,7 @@ class BubbleNavApp(_TkBase):
         self._pump_job = None
         if not self._stop.is_set():
             try:
+                self._sync_compare()
                 self._sync_plan_cone()
             except Exception:
                 pass
@@ -2070,14 +2118,24 @@ class BubbleNavApp(_TkBase):
         rv = View(wrap180(self.view.yaw - fix), self.view.pitch, self.view.fov, w, h)
         dv = View(self.view.yaw, self.view.pitch, self.view.fov,
                   self.view.width, self.view.height)
-        with self._cv:
-            self._req_seq += 1
-            self._req = (self._req_seq, self.current, rv, dv, scale)
-            self._cv.notify()
+        self.submit_render('A', self.current, rv, dv, scale, self)
         if interactive:
             if self._idle_job:
                 self.after_cancel(self._idle_job)
             self._idle_job = self.after(IDLE_FULL_MS, self._render_full)
+
+    def submit_render(self, key: str, idx: int, rv: View, dv: View,
+                      scale: float, pane) -> None:
+        """Dépose une demande de rendu pour une vue.
+
+        Une seule demande en attente par vue : la plus récente remplace la
+        précédente, et la vue manipulée en dernier est servie en premier.
+        """
+        with self._cv:
+            self._req_seq += 1
+            self._reqs.pop(key, None)
+            self._reqs[key] = (self._req_seq, idx, rv, dv, scale, pane)
+            self._cv.notify()
 
     def _render_full(self) -> None:
         self._idle_job = None
@@ -2089,12 +2147,13 @@ class BubbleNavApp(_TkBase):
         from PIL import Image
         while not self._stop.is_set():
             with self._cv:
-                while self._req is None and not self._stop.is_set():
+                while not self._reqs and not self._stop.is_set():
                     self._cv.wait(0.3)
-                req, self._req = self._req, None
-            if req is None or self._stop.is_set():
-                continue
-            seq, idx, rv, dv, scale = req
+                if self._stop.is_set():
+                    break
+                key = next(reversed(self._reqs))      # la vue la plus sollicitée
+                req = self._reqs.pop(key)
+            seq, idx, rv, dv, scale, pane = req
             try:
                 st = self.stations[idx]
             except Exception:
@@ -2102,16 +2161,16 @@ class BubbleNavApp(_TkBase):
             src = self.store.peek(st.photo)
             if src is None:
                 if not self.store.has(st.photo):
-                    self._post(self._publish_missing, seq, idx)
+                    self._post(pane.publish_missing, seq, idx)
                     continue
                 self._post(self._set_status, f"Chargement de {st.photo} …")
                 src = self.store.load(st.photo)
                 with self._cv:
-                    superseded = self._req is not None
+                    superseded = key in self._reqs
                 if superseded:
                     continue                    # une demande plus recente existe
                 if src is None:
-                    self._post(self._publish_missing, seq, idx)
+                    self._post(pane.publish_missing, seq, idx)
                     continue
             try:
                 out = self.renderer.render(src, rv)
@@ -2119,9 +2178,9 @@ class BubbleNavApp(_TkBase):
             except Exception as exc:
                 self._post(self._set_status, f"Erreur de rendu : {exc}", COLORS['error'])
                 continue
-            self._post(self._publish, img, seq, rv, dv, idx, scale)
+            self._post(pane.publish, img, seq, rv, dv, idx, scale)
 
-    def _publish(self, img, seq: int, rv: View, dv: View, idx: int, scale: float) -> None:
+    def publish(self, img, seq: int, rv: View, dv: View, idx: int, scale: float) -> None:
         """Affiche une image rendue (thread principal uniquement)."""
         if self._stop.is_set() or seq <= self._shown_seq or idx != self.current:
             return
@@ -2149,7 +2208,7 @@ class BubbleNavApp(_TkBase):
         except Exception as exc:
             self._set_status(f"Affichage impossible : {exc}", COLORS['error'])
 
-    def _publish_missing(self, seq: int, idx: int) -> None:
+    def publish_missing(self, seq: int, idx: int) -> None:
         """Bulle sans image : fond neutre, pastilles conservees."""
         if self._stop.is_set() or seq <= self._shown_seq or idx != self.current:
             return
@@ -2172,34 +2231,11 @@ class BubbleNavApp(_TkBase):
     # PASTILLES
     # ═════════════════════════════════════════════════════════════════
     def _compute_hotspots(self, view: View) -> List[Hotspot]:
-        st = self.station()
-        if st is None or self.current >= len(self.links):
-            return []
-        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        disc = float(self.cfg.get('disc_radius', DISC_RADIUS_M))
-        r_min, r_max = self.disc_bounds()
-        f = view.focal()
-        links = self._visible_links(self.current)
-        self.hidden_count = len(self.links[self.current]) - len(links)
-        out: List[Hotspot] = []
-        for lk in links:
-            tgt = self.stations[lk.target]
-            dz = (tgt.z - eye) - st.z          # pastille posee au sol de la cible
-            dh = lk.dist_h
-            elev = math.degrees(math.atan2(dz, dh)) if dh > 1e-6 else (90.0 if dz > 0 else -90.0)
-            psi = self.calib.pano_yaw(lk.azimuth, st.north_pct)
-            pr = project(view, psi, elev)
-            if pr is None:
-                continue
-            col, row, _ = pr
-            if not (-80 <= col <= view.width + 80 and -80 <= row <= view.height + 80):
-                continue
-            # rayon a l'ecran = focale x rayon physique / distance : la pastille
-            # retrecit exactement comme un disque pose au sol s'eloignerait,
-            # entre deux bornes qui la gardent cliquable sans jamais l'imposer.
-            radius = clamp(f * disc / max(lk.dist, 0.35), r_min, r_max)
-            out.append(Hotspot(lk, col, row, radius, tgt.locator))
-        out.sort(key=lambda h: -h.link.dist)     # les plus lointaines dessinees d'abord
+        out, masques = compute_hotspots(
+            self.stations, self.links, self.current, view, self.calib, self.filters,
+            self.store.has, float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
+            float(self.cfg.get('disc_radius', DISC_RADIUS_M)), *self.disc_bounds())
+        self.hidden_count = masques
         return out
 
     def disc_bounds(self) -> Tuple[float, float]:
@@ -2650,6 +2686,38 @@ class BubbleNavApp(_TkBase):
                                   before=self.info_title)
             self.filter_toggle.config(text="▾")
             self.plan.config(height=PLAN_H_EDIT)
+
+    def _toggle_compare(self) -> None:
+        """Ouvre ou ferme la seconde vue bulle."""
+        if self.compare is not None:
+            self.compare.close()
+            self.cmp_btn.config(bg=COLORS['bg_light'], fg=COLORS['text'])
+            self._set_status("Vue de comparaison fermée")
+            return
+        if self.current < 0:
+            return
+        depart = self.current
+        voisins = self._visible_links(self.current)
+        if voisins:                      # un voisin immédiat : comparaison utile d'emblée
+            depart = min(voisins, key=lambda lk: lk.dist).target
+        self.compare = CompareView(self, depart)
+        self.cmp_btn.config(bg=COLORS['sel'], fg='#101010')
+        self._cone_sig = None
+        self._set_status("Vue de comparaison ouverte — « Vue liée » fait tourner "
+                         "les deux vues ensemble", COLORS['sel'])
+
+    def _sync_compare(self) -> None:
+        """Tient la seconde vue alignée sur la vue principale."""
+        cmp_view = self.compare
+        if cmp_view is None:
+            return
+        if self._last_current != self.current:
+            self._last_current = self.current
+            cmp_view.follow_a(self.current)
+        sig = cmp_view.sync_signature()
+        if sig != self._cmp_sig:
+            self._cmp_sig = sig
+            cmp_view.sync_from_a()
 
     def _toggle_filters(self) -> None:
         self.filter_var.set(not self.filter_var.get())
@@ -3517,7 +3585,10 @@ class BubbleNavApp(_TkBase):
             taille = (self.plan.winfo_width(), self.plan.winfo_height())
         except Exception:
             return None
-        return (cur.idx, round(self.view.yaw, 2), round(self.view.fov, 2),
+        cmp_view = self.compare
+        cmp_etat = ((cmp_view.idx, round(cmp_view.view.yaw, 2),
+                     round(cmp_view.view.fov, 2)) if cmp_view is not None else None)
+        return (cmp_etat, cur.idx, round(self.view.yaw, 2), round(self.view.fov, 2),
                 self.floor_var.get(), round(cur.x, 3), round(cur.y, 3),
                 round(cur.north_pct, 4), round(float(pv.get('scale', 1.0)), 4),
                 round(float(pv.get('ox', 0.0)), 1), round(float(pv.get('oy', 0.0)), 1),
@@ -3573,6 +3644,25 @@ class BubbleNavApp(_TkBase):
                               fill=COLORS['plan_cone'], width=1, tags='cone')
         self.plan.create_oval(x - 5, y - 5, x + 5, y + 5, fill=COLORS['plan_here'],
                               outline='#000000', tags='cone')
+
+        cmp_view = self.compare      # repère de la seconde vue, si elle est ouverte
+        b = cmp_view.station() if cmp_view is not None else None
+        if b is not None and b.floor == floor:
+            bx, by = to_screen(b.x, b.y)
+            azb = self.calib.azimuth(cmp_view.view.yaw, b.north_pct)
+            halfb = cmp_view.view.fov / 2.0
+            plb = [bx, by]
+            for k in range(9):
+                ab = math.radians(azb - halfb + k * (2 * halfb / 8))
+                plb += [bx + rad * math.sin(ab), by - rad * math.cos(ab)]
+            self.plan.create_polygon(plb, fill=COLORS['sel'], outline='',
+                                     stipple='gray12', tags='cone')
+            self.plan.create_line(x, y, bx, by, fill=COLORS['sel'], width=1,
+                                  dash=(3, 3), tags='cone')
+            self.plan.create_oval(bx - 5, by - 5, bx + 5, by + 5, fill=COLORS['sel'],
+                                  outline='#000000', tags='cone')
+            self.plan.create_text(bx, by - 11, text="B", fill=COLORS['sel'],
+                                  font=F_UI_B, tags='cone')
         self._cone_sig = self._cone_signature()
 
     def _plan_nearest(self, event, max_px: float = 20.0) -> Optional[int]:
@@ -3843,6 +3933,14 @@ class BubbleNavApp(_TkBase):
             "  • Flèches                : tourner (Maj = pas large)\n"
             "  • Origine (Home)         : redresser la vue\n"
             "  • F11 / Échap            : plein écran\n\n"
+            "COMPARAISON  (touche C)\n"
+            "  • Seconde vue bulle dans sa propre fenêtre\n"
+            "  • « Vue liée » : les deux vues regardent la même direction terrain,\n"
+            "    tourner ou zoomer d'un côté agit sur les deux\n"
+            "  • « Suivi de A » : la vue B se place automatiquement sur le même\n"
+            "    local à un autre plancher, ou sur la bulle la plus proche\n"
+            "  • « A → B » recopie la bulle courante · « ⇄ » échange les deux vues\n"
+            "  • Les pastilles de B restent cliquables pour s'y déplacer seul\n\n"
             "PLAN\n"
             "  • Clic gauche            : aller sur la bulle la plus proche\n"
             "  • Molette                : zoom · clic droit glissé : déplacer\n"
@@ -3887,6 +3985,11 @@ class BubbleNavApp(_TkBase):
             save_config(self.cfg)
         except Exception:
             pass
+        if self.compare is not None:
+            try:
+                self.compare.close()
+            except Exception:
+                pass
         self._stop.set()
         for attr in ('_pump_job', '_idle_job', '_autosave_job', '_graph_job'):
             job = getattr(self, attr, None)
@@ -3900,6 +4003,417 @@ class BubbleNavApp(_TkBase):
             self._cv.notify_all()
         try:
             self.store.close()
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECONDE VUE BULLE (COMPARAISON)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CompareView(tk.Toplevel if _TK_OK else object):
+    """Seconde vue bulle, pour comparer deux points de vue.
+
+    Elle partage tout le modèle avec la vue principale (relevé, réseau, filtres,
+    calibration, corrections, cache d'images) et se contente d'un point de vue
+    distinct. En mode « vue liée », elle regarde en permanence dans la même
+    direction terrain que la vue principale : tourner d'un côté tourne des deux.
+    """
+
+    FOLLOW_MODES = ('aucun', 'même local, autre plancher', 'bulle la plus proche')
+
+    def __init__(self, app: "BubbleNavApp", idx: int):
+        super().__init__(app)
+        self.app = app
+        self.idx = idx
+        self.view = View(app.view.yaw, app.view.pitch, app.view.fov, 900, 560)
+        self.hotspots: List[Hotspot] = []
+        self.hidden_count = 0
+        self._frame_view: Optional[View] = None
+        self._tk_img = None
+        self._shown_seq = -1
+        self._drag = None
+        self._hover: Optional[int] = None
+        self._hover_xy = None
+        self._idle_job = None
+        self._closed = False
+        self.linked = tk.BooleanVar(value=True)
+        self.follow = tk.StringVar(value=self.FOLLOW_MODES[0])
+
+        self.title("BubbleNav — vue de comparaison")
+        self.configure(bg=COLORS['bg_dark'])
+        self.geometry("920x620")
+        self.minsize(420, 320)
+        self._build_ui()
+        self.protocol('WM_DELETE_WINDOW', self.close)
+        self.bind('<Escape>', lambda e: self.close())
+        self.after(0, self._place_beside)
+        self.after(40, lambda: self.request_render(force=True))
+
+    def _place_beside(self) -> None:
+        """Se place à côté de la fenêtre principale, sans la recouvrir."""
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            ax, ay = self.app.winfo_rootx(), self.app.winfo_rooty()
+            aw = self.app.winfo_width()
+            w, h = 920, 620
+            x = ax + aw + 8
+            if x + w > sw:
+                if sw - x >= 460:               # on rétrécit plutôt que recouvrir A
+                    w = sw - x - 8
+                else:                           # écran trop étroit : on cadre à droite
+                    x = max(0, sw - w - 8)
+            y = max(0, min(ay, sh - h - 40))
+            self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+    # ── interface ────────────────────────────────────────────────────
+    def _build_ui(self) -> None:
+        bar = tk.Frame(self, bg=COLORS['bg_medium'])
+        bar.pack(fill='x', side='top')
+        tk.Label(bar, text="Vue B", font=F_TITLE, bg=COLORS['bg_medium'],
+                 fg=COLORS['sel']).pack(side='left', padx=(10, 8), pady=4)
+        self.title_lbl = tk.Label(bar, text="—", font=F_UI_B, bg=COLORS['bg_medium'],
+                                  fg=COLORS['text'])
+        self.title_lbl.pack(side='left', padx=4)
+
+        self.app._mk_button(bar, "⇄ Échanger", self.swap).pack(side='right', padx=4, pady=4)
+        self.app._mk_button(bar, "A → B", self.copy_from_a).pack(side='right', padx=4, pady=4)
+        tk.Checkbutton(bar, text="Vue liée", variable=self.linked,
+                       command=self._on_linked, font=F_UI, bg=COLORS['bg_medium'],
+                       fg=COLORS['text'], selectcolor=COLORS['bg_light'], bd=0,
+                       highlightthickness=0, activebackground=COLORS['bg_medium'],
+                       activeforeground=COLORS['text']).pack(side='right', padx=6)
+        tk.Label(bar, text="Suivi de A", font=F_UI, bg=COLORS['bg_medium'],
+                 fg=COLORS['text_muted']).pack(side='right', padx=(8, 2))
+        cb = ttk.Combobox(bar, textvariable=self.follow, state='readonly', width=22,
+                          style='BN.TCombobox', values=self.FOLLOW_MODES)
+        cb.pack(side='right', pady=4)
+        cb.bind('<<ComboboxSelected>>', lambda e: self.follow_a(self.app.current))
+
+        self.canvas = tk.Canvas(self, bg='#101010', highlightthickness=0, cursor='fleur')
+        self.canvas.pack(fill='both', expand=True)
+        self.canvas.bind('<Configure>', self._on_resize)
+        self.canvas.bind('<ButtonPress-1>', self._on_press)
+        self.canvas.bind('<B1-Motion>', self._on_drag)
+        self.canvas.bind('<ButtonRelease-1>', self._on_release)
+        self.canvas.bind('<Motion>', self._on_motion)
+        self.canvas.bind('<MouseWheel>', self._on_wheel)
+        self.canvas.bind('<Button-4>', lambda e: self._on_wheel(e, +1))
+        self.canvas.bind('<Button-5>', lambda e: self._on_wheel(e, -1))
+        self.canvas.bind('<Double-Button-1>', self._on_double)
+
+        self.status = tk.Label(self, text="", anchor='w', bg=COLORS['bg_medium'],
+                               fg=COLORS['text_muted'], font=F_UI, padx=10, pady=3)
+        self.status.pack(fill='x', side='bottom')
+
+    # ── modele ───────────────────────────────────────────────────────
+    def station(self) -> Optional[Station]:
+        sts = self.app.stations
+        return sts[self.idx] if 0 <= self.idx < len(sts) else None
+
+    def goto(self, idx: int, keep_heading: bool = True) -> None:
+        if not (0 <= idx < len(self.app.stations)) or idx == self.idx:
+            return
+        prev = self.station()
+        if keep_heading and prev is not None and not self.linked.get():
+            az = self.app.calib.azimuth(self.view.yaw, prev.north_pct)
+            self.view.yaw = self.app.calib.pano_yaw(az, self.app.stations[idx].north_pct)
+        self.idx = idx
+        self.request_render(force=True)
+        self._refresh_title()
+        self.app.store.prefetch([self.app.stations[lk.target].photo
+                                 for lk in self.app.links[idx]]
+                                if idx < len(self.app.links) else [])
+
+    def copy_from_a(self) -> None:
+        self.goto(self.app.current)
+
+    def swap(self) -> None:
+        """Échange les points de vue des deux fenêtres."""
+        a, b = self.app.current, self.idx
+        if a == b:
+            return
+        self.idx = a
+        self.app.goto(b, keep_heading=True)
+        self.request_render(force=True)
+        self._refresh_title()
+
+    def counterpart(self, idx_a: int) -> Optional[int]:
+        """Bulle de B correspondant à la bulle A, selon le mode de suivi."""
+        mode = self.follow.get()
+        sts = self.app.stations
+        if mode == self.FOLLOW_MODES[0] or not (0 <= idx_a < len(sts)):
+            return None
+        a = sts[idx_a]
+        if mode == self.FOLLOW_MODES[1]:          # même local, autre plancher
+            pa = a.parts()
+            memes = [s for s in sts
+                     if s.idx != a.idx and s.floor != a.floor
+                     and s.parts().local == pa.local and pa.local]
+            if not memes:
+                return None
+            exact = [s for s in memes if s.parts().index == pa.index]
+            pool = exact or memes
+            # on garde le niveau le plus proche, en privilegiant l'aplomb
+            return min(pool, key=lambda s: (round(abs(s.z - a.z), 1),
+                                            (s.x - a.x) ** 2 + (s.y - a.y) ** 2)).idx
+        best, best_d = None, float('inf')          # bulle la plus proche
+        for s in sts:
+            if s.idx == a.idx:
+                continue
+            d = (s.x - a.x) ** 2 + (s.y - a.y) ** 2 + (s.z - a.z) ** 2
+            if d < best_d:
+                best, best_d = s.idx, d
+        return best
+
+    def follow_a(self, idx_a: int) -> None:
+        cible = self.counterpart(idx_a)
+        if cible is not None:
+            self.goto(cible)
+
+    # ── synchronisation avec la vue principale ───────────────────────
+    def sync_signature(self) -> tuple:
+        a = self.app.station()
+        return (self.idx, bool(self.linked.get()), self.app.current,
+                round(self.app.view.yaw, 2), round(self.app.view.pitch, 2),
+                round(self.app.view.fov, 2), round(a.north_pct, 4) if a else 0.0,
+                self.app.calib.mode, self.app.calib.sense, round(self.app.calib.offset, 3))
+
+    def sync_from_a(self) -> None:
+        """Aligne B sur la direction terrain de A (mode « vue liée »)."""
+        if not self.linked.get():
+            return
+        a, b = self.app.station(), self.station()
+        if a is None or b is None:
+            return
+        az = self.app.calib.azimuth(self.app.view.yaw, a.north_pct)
+        yaw = self.app.calib.pano_yaw(az, b.north_pct)
+        if (abs(wrap180(yaw - self.view.yaw)) < 1e-6
+                and abs(self.view.pitch - self.app.view.pitch) < 1e-6
+                and abs(self.view.fov - self.app.view.fov) < 1e-6):
+            return
+        self.view.yaw = yaw
+        self.view.pitch = self.app.view.pitch
+        self.view.fov = self.app.view.fov
+        self.request_render()
+
+    def _on_linked(self) -> None:
+        if self.linked.get():
+            self.sync_from_a()
+        self._refresh_title()
+
+    # ── rendu ────────────────────────────────────────────────────────
+    def _on_resize(self, event) -> None:
+        self.view.width = max(64, int(event.width))
+        self.view.height = max(64, int(event.height))
+        self.request_render(force=True)
+
+    def request_render(self, force: bool = False, interactive: bool = False) -> None:
+        st = self.station()
+        if st is None or self._closed:
+            return
+        scale = DRAG_SCALE if interactive else 1.0
+        w = max(64, int(self.view.width * scale))
+        h = max(64, int(self.view.height * scale))
+        rv = View(wrap180(self.view.yaw - st.yaw_fix), self.view.pitch, self.view.fov, w, h)
+        dv = View(self.view.yaw, self.view.pitch, self.view.fov,
+                  self.view.width, self.view.height)
+        self.app.submit_render('B', self.idx, rv, dv, scale, self)
+        if interactive:
+            if self._idle_job:
+                self.after_cancel(self._idle_job)
+            self._idle_job = self.after(IDLE_FULL_MS,
+                                        lambda: self.request_render(force=True))
+
+    def publish(self, img, seq: int, rv: View, dv: View, idx: int, scale: float) -> None:
+        if self._closed or seq <= self._shown_seq or idx != self.idx:
+            return
+        try:
+            from PIL import Image, ImageTk
+            if scale != 1.0 and (rv.width != self.view.width or rv.height != self.view.height):
+                img = img.resize((max(1, self.view.width), max(1, self.view.height)),
+                                 Image.BILINEAR)
+            self._shown_seq = seq
+            self._frame_view = View(dv.yaw, dv.pitch, dv.fov,
+                                    self.view.width, self.view.height)
+            self._tk_img = ImageTk.PhotoImage(img)
+            self.canvas.delete('frame')
+            self.canvas.create_image(0, 0, anchor='nw', image=self._tk_img, tags='frame')
+            self.canvas.tag_lower('frame')
+            self._draw_overlay()
+        except Exception as exc:
+            self.status.config(text=f"Affichage impossible : {exc}", fg=COLORS['error'])
+
+    def publish_missing(self, seq: int, idx: int) -> None:
+        if self._closed or seq <= self._shown_seq or idx != self.idx:
+            return
+        self._shown_seq = seq
+        self._frame_view = View(self.view.yaw, self.view.pitch, self.view.fov,
+                                self.view.width, self.view.height)
+        self._tk_img = None
+        self.canvas.delete('frame')
+        self.canvas.create_rectangle(0, 0, self.view.width, self.view.height,
+                                     fill='#181818', outline='', tags='frame')
+        st = self.station()
+        self.canvas.create_text(self.view.width // 2, self.view.height // 2,
+                                text=f"Image introuvable\n{st.photo if st else ''}",
+                                fill=COLORS['warning'], font=('Segoe UI', 13), tags='frame')
+        self.canvas.tag_lower('frame')
+        self._draw_overlay()
+
+    # ── pastilles ────────────────────────────────────────────────────
+    def _draw_overlay(self) -> None:
+        view = self._frame_view
+        self.canvas.delete('hs')
+        if view is None:
+            return
+        app = self.app
+        self.hotspots, self.hidden_count = compute_hotspots(
+            app.stations, app.links, self.idx, view, app.calib, app.filters,
+            app.store.has, float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
+            float(app.cfg.get('disc_radius', DISC_RADIUS_M)), *app.disc_bounds())
+        for i, hs in enumerate(self.hotspots):
+            tgt = app.stations[hs.link.target]
+            color = {'same': COLORS['hot'], 'up': COLORS['hot_up'],
+                     'down': COLORS['hot_down']}[hs.link.kind]
+            if not app.store.has(tgt.photo):
+                color = COLORS['plan_missing']
+            if tgt.modified():
+                color = COLORS['edit']
+            r = hs.radius * (1.25 if i == self._hover else 1.0)
+            self.canvas.create_oval(hs.col - r, hs.row - r * 0.55, hs.col + r,
+                                    hs.row + r * 0.55, fill=color,
+                                    outline=COLORS['hot_edge'],
+                                    width=2 if i == self._hover else 1, tags='hs')
+            txt = f"{hs.label} · {human_dist(hs.link.dist)}" if i == self._hover \
+                else human_dist(hs.link.dist)
+            ty = hs.row + r * 0.55 + 10
+            self.canvas.create_text(hs.col + 1, ty + 1, text=txt, fill='#000000',
+                                    font=F_UI, tags='hs')
+            self.canvas.create_text(hs.col, ty, text=txt, fill='#e8e8e8',
+                                    font=F_UI, tags='hs')
+        st = self.station()
+        if st is not None:
+            titre = f"B · {st.locator}   ({st.floor})"
+            self.canvas.create_text(15, 13, text=titre, anchor='nw', fill='#000000',
+                                    font=('Segoe UI', 12, 'bold'), tags='hs')
+            self.canvas.create_text(14, 12, text=titre, anchor='nw', fill=COLORS['sel'],
+                                    font=('Segoe UI', 12, 'bold'), tags='hs')
+        self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        st, a = self.station(), self.app.station()
+        if st is None:
+            return
+        p = st.parts()
+        detail = f"{st.locator}  ·  {st.floor}"
+        if p.local:
+            detail += f"  ·  local {p.local}"
+        if p.date_lisible():
+            detail += f"  ·  {p.date_lisible()}"
+        self.title_lbl.config(text=detail)
+        if a is not None and a.idx != st.idx:
+            _, _, d3 = azimuth_elev(st.x - a.x, st.y - a.y, st.z - a.z)
+            cap = self.app.calib.azimuth(self.view.yaw, st.north_pct)
+            self.status.config(
+                text=f"{'vue liée à A' if self.linked.get() else 'vue libre'} · "
+                     f"cap {cap:+.1f}° · {len(self.hotspots)} pastille(s) · "
+                     f"{d3:.2f} m de A ({a.locator}) · Δz {st.z - a.z:+.2f} m")
+        else:
+            self.status.config(text="même bulle que la vue principale")
+
+    def _hotspot_at(self, x: float, y: float) -> Optional[int]:
+        best, best_d = None, float('inf')
+        for i, hs in enumerate(self.hotspots):
+            rx, ry = hs.radius + HIT_SLACK_PX, hs.radius * 0.55 + HIT_SLACK_PX
+            d = ((x - hs.col) / rx) ** 2 + ((y - hs.row) / ry) ** 2
+            if d <= 1.0 and d < best_d:
+                best, best_d = i, d
+        return best
+
+    # ── interactions ─────────────────────────────────────────────────
+    def _on_press(self, event) -> None:
+        self._drag = (event.x, event.y, self.view.yaw, self.view.pitch,
+                      self.app.view.yaw, self.app.view.pitch)
+        self._press_xy = (event.x, event.y)
+
+    def _on_drag(self, event) -> None:
+        if self._drag is None:
+            return
+        x0, y0, yaw0, pitch0, ayaw0, apitch0 = self._drag
+        deg = self.view.fov / max(1, self.view.width)
+        dx, dy = (event.x - x0) * deg, (event.y - y0) * deg
+        if self.linked.get():
+            # en vue liée, tourner ici tourne les deux vues : on pilote A,
+            # la synchronisation ramène B dans la foulée
+            self.app.view.yaw = wrap180(ayaw0 - dx)
+            self.app.view.pitch = clamp(apitch0 + dy, PITCH_MIN, PITCH_MAX)
+            self.app._request_render(interactive=True)
+        else:
+            self.view.yaw = wrap180(yaw0 - dx)
+            self.view.pitch = clamp(pitch0 + dy, PITCH_MIN, PITCH_MAX)
+            self.request_render(interactive=True)
+
+    def _on_release(self, event) -> None:
+        moved = 0
+        if getattr(self, '_press_xy', None):
+            moved = abs(event.x - self._press_xy[0]) + abs(event.y - self._press_xy[1])
+        self._drag = None
+        if moved <= 4:
+            hit = self._hotspot_at(event.x, event.y)
+            if hit is not None:
+                self.goto(self.hotspots[hit].link.target)
+                return
+        self.request_render(force=True)
+
+    def _on_motion(self, event) -> None:
+        hit = self._hotspot_at(event.x, event.y)
+        if hit != self._hover:
+            self._hover = hit
+            self.canvas.config(cursor='hand2' if hit is not None else 'fleur')
+            self._draw_overlay()
+
+    def _on_wheel(self, event, direction: int = 0) -> None:
+        step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
+        if self.linked.get():
+            self.app._zoom(-6 * step)
+        else:
+            self.view.fov = clamp(self.view.fov - 6 * step, FOV_MIN, FOV_MAX)
+            self.request_render(interactive=True)
+
+    def _on_double(self, event) -> None:
+        if self._hotspot_at(event.x, event.y) is not None:
+            return
+        view = self._frame_view or self.view
+        f = view.focal()
+        dyaw = math.degrees(math.atan2(event.x - view.width / 2.0, f))
+        dpitch = math.degrees(math.atan2(event.y - view.height / 2.0, f))
+        if self.linked.get():
+            self.app.view.yaw = wrap180(self.app.view.yaw + dyaw)
+            self.app.view.pitch = clamp(self.app.view.pitch - dpitch, PITCH_MIN, PITCH_MAX)
+            self.app._request_render(force=True)
+        else:
+            self.view.yaw = wrap180(self.view.yaw + dyaw)
+            self.view.pitch = clamp(self.view.pitch - dpitch, PITCH_MIN, PITCH_MAX)
+            self.request_render(force=True)
+
+    # ── fermeture ────────────────────────────────────────────────────
+    def close(self) -> None:
+        self._closed = True
+        if self._idle_job:
+            try:
+                self.after_cancel(self._idle_job)
+            except Exception:
+                pass
+        with self.app._cv:
+            self.app._reqs.pop('B', None)
+        if self.app.compare is self:
+            self.app.compare = None
+        try:
+            self.app._draw_plan()
         except Exception:
             pass
         self.destroy()
