@@ -72,9 +72,14 @@ violet ▼ = niveau en dessous · rouge sombre = image absente du dossier · ora
 bulle corrigée.
 
 **Taille des pastilles** : rayon à l'écran = focale × rayon physique ÷ distance —
-une pastille quatre fois plus loin est quatre fois plus petite, et zoomer les
-grossit exactement comme un disque posé au sol. Le rayon physique (0,42 m par
-défaut) se règle dans « Réglages… », entre des bornes de 7 et 70 px.
+une pastille trois fois plus loin est trois fois plus petite, et zoomer les
+grossit exactement comme un disque posé au sol. La taille est **bornée** :
+jamais moins de **10 px** (elle reste visible et cliquable), jamais plus de
+**36 px** (elle n'envahit pas la vue, soit 4,5 % de la largeur d'une vue de
+1600 px). Rayon physique (0,32 m) et bornes mini/maxi se règlent dans
+« Réglages… », qui affiche la plage de distances où la taille reste pleinement
+proportionnelle — environ 5,5 m à 20 m avec les valeurs par défaut ; en deçà la
+taille plafonne, au-delà elle atteint son plancher.
 
 ### Fiche de la bulle
 Le panneau de droite décrit la bulle **visée** — celle qu'on survole ou qu'on
@@ -264,8 +269,9 @@ Contrôle les angles, la réciprocité azimut ↔ image, la **cohérence entre l
 calculée des pastilles et le rendu réel** (écart mesuré < 2 px), la lecture du CSV, la
 construction du réseau, les temps de rendu, l'aller-retour **écran ↔ sol** utilisé pour
 déplacer une pastille, l'analyse des noms de fichiers (convention, variantes, noms incomplets, cohérence
-avec les colonnes du relevé sur les 693 bulles), les filtres de pastilles et la loi de
-taille en 1/distance, l'aller-retour du fichier de corrections (écriture, relecture, ligne orpheline,
+avec les colonnes du relevé sur les 693 bulles), les filtres de pastilles, la loi de
+taille en 1/distance et ses bornes (taille toujours comprise entre 10 et 36 px, de
+0,4 m à 200 m), l'aller-retour du fichier de corrections (écriture, relecture, ligne orpheline,
 date d'application) avec relevé source inchangé octet pour octet, l'écriture du relevé
 complet corrigé (colonne Δ nord créée puis réutilisée, seules les lignes modifiées
 changent), et l'équivalence **image tournée de Δ ≡ vue décalée de Δ** — autrement dit, ce que vous

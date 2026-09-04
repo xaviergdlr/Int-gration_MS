@@ -86,9 +86,11 @@ FLOOR_DZ_MAX = 12.0            # m — denivele max d'un lien inter-plancher
 EYE_HEIGHT_DEFAULT = 1.65      # m — hauteur de la camera au-dessus du sol
 
 # Pastilles
-DISC_RADIUS_M = 0.42           # m — rayon physique de la pastille au sol
+DISC_RADIUS_M = 0.32           # m — rayon physique de la pastille au sol
                                # (le rayon a l'ecran vaut f x rayon / distance)
-DISC_PX_MIN, DISC_PX_MAX = 7.0, 70.0
+DISC_PX_MIN, DISC_PX_MAX = 10.0, 36.0   # bornes d'affichage (px) : jamais
+                               # minuscule (donc cliquable), jamais envahissante
+DISC_PX_LIMITS = (5.0, 90.0)   # bornes admises pour le reglage utilisateur
 HIT_SLACK_PX = 10.0            # tolerance de clic autour de la pastille
 
 PLAN_H = 250                   # hauteur du plan (px)
@@ -207,6 +209,8 @@ DEFAULT_CONFIG = {
     'show_labels': True,
     'keep_heading': True,
     'disc_radius': DISC_RADIUS_M,
+    'disc_min_px': DISC_PX_MIN,
+    'disc_max_px': DISC_PX_MAX,
     'filter_active': False,
     'filter_floor': 'tous',
     'filter_dist': 0.0,
@@ -2166,6 +2170,7 @@ class BubbleNavApp(_TkBase):
             return []
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         disc = float(self.cfg.get('disc_radius', DISC_RADIUS_M))
+        r_min, r_max = self.disc_bounds()
         f = view.focal()
         links = self._visible_links(self.current)
         self.hidden_count = len(self.links[self.current]) - len(links)
@@ -2183,11 +2188,21 @@ class BubbleNavApp(_TkBase):
             if not (-80 <= col <= view.width + 80 and -80 <= row <= view.height + 80):
                 continue
             # rayon a l'ecran = focale x rayon physique / distance : la pastille
-            # retrecit exactement comme un disque pose au sol s'eloignerait.
-            radius = clamp(f * disc / max(lk.dist, 0.35), DISC_PX_MIN, DISC_PX_MAX)
+            # retrecit exactement comme un disque pose au sol s'eloignerait,
+            # entre deux bornes qui la gardent cliquable sans jamais l'imposer.
+            radius = clamp(f * disc / max(lk.dist, 0.35), r_min, r_max)
             out.append(Hotspot(lk, col, row, radius, tgt.locator))
         out.sort(key=lambda h: -h.link.dist)     # les plus lointaines dessinees d'abord
         return out
+
+    def disc_bounds(self) -> Tuple[float, float]:
+        """Bornes d'affichage des pastilles (px), toujours cohérentes."""
+        lo, hi = DISC_PX_LIMITS
+        r_min = clamp(float(self.cfg.get('disc_min_px', DISC_PX_MIN)), lo, hi)
+        r_max = clamp(float(self.cfg.get('disc_max_px', DISC_PX_MAX)), lo, hi)
+        if r_max < r_min + 2.0:      # un réglage incohérent ne casse pas le rendu
+            r_max = r_min + 2.0
+        return r_min, r_max
 
     def _draw_overlay(self) -> None:
         view = self._frame_view
@@ -3656,9 +3671,29 @@ class BubbleNavApp(_TkBase):
         slider(cal, "Correction nord (°)", off_var, -180, 180, 0.5, apply_calib)
         slider(cal, "Hauteur caméra (m)", eye_var, 0.0, 3.0, 0.05, apply_calib)
         disc_var = tk.DoubleVar(value=float(self.cfg.get('disc_radius', DISC_RADIUS_M)))
-        slider(cal, "Rayon des pastilles (m)", disc_var, 0.15, 1.20, 0.01,
-               lambda _=None: (self.cfg.__setitem__('disc_radius', float(disc_var.get())),
-                               self._draw_overlay()))
+        dmin_var = tk.DoubleVar(value=self.disc_bounds()[0])
+        dmax_var = tk.DoubleVar(value=self.disc_bounds()[1])
+        disc_note = tk.Label(cal, font=F_UI, bg=COLORS['bg_dark'],
+                             fg=COLORS['text_muted'], anchor='w')
+
+        def apply_disc(_=None):
+            self.cfg['disc_radius'] = float(disc_var.get())
+            self.cfg['disc_min_px'] = float(dmin_var.get())
+            self.cfg['disc_max_px'] = float(dmax_var.get())
+            r_min, r_max = self.disc_bounds()
+            f = (self._frame_view or self.view).focal()
+            rayon = float(disc_var.get())
+            proche = f * rayon / max(1e-6, r_max)     # en deçà : taille plafonnée
+            loin = f * rayon / max(1e-6, r_min)       # au delà : taille plancher
+            disc_note.config(text=f"taille pleinement proportionnelle entre "
+                                  f"{proche:.1f} m et {loin:.0f} m")
+            self._draw_overlay()
+
+        slider(cal, "Rayon des pastilles (m)", disc_var, 0.10, 1.00, 0.01, apply_disc)
+        slider(cal, "Taille mini (px)", dmin_var, DISC_PX_LIMITS[0], 40, 1, apply_disc)
+        slider(cal, "Taille maxi (px)", dmax_var, 12, DISC_PX_LIMITS[1], 1, apply_disc)
+        disc_note.pack(fill='x')
+        apply_disc()
 
         # ── Reseau ──────────────────────────────────────────────────
         net = section("Réseau de navigation")
@@ -4242,14 +4277,25 @@ def selftest(csv_path: str = '') -> int:
     # taille de pastille : décroissance en 1/distance
     view = View(0, -20, 105, 1600, 900)
     f = view.focal()
-    r1 = clamp(f * DISC_RADIUS_M / 4.0, DISC_PX_MIN, DISC_PX_MAX)
-    r2 = clamp(f * DISC_RADIUS_M / 16.0, DISC_PX_MIN, DISC_PX_MAX)
-    check("pastille 4x plus loin = 4x plus petite", abs(r1 / r2 - 4.0) < 1e-6,
-          f"{r1:.1f} px à 4 m, {r2:.1f} px à 16 m")
-    check("écrêtage aux extrêmes",
-          clamp(f * DISC_RADIUS_M / 0.5, DISC_PX_MIN, DISC_PX_MAX) == DISC_PX_MAX
-          and clamp(f * DISC_RADIUS_M / 200.0, DISC_PX_MIN, DISC_PX_MAX) == DISC_PX_MIN,
-          f"{DISC_PX_MIN:.0f} à {DISC_PX_MAX:.0f} px")
+    r1 = clamp(f * DISC_RADIUS_M / 6.0, DISC_PX_MIN, DISC_PX_MAX)
+    r2 = clamp(f * DISC_RADIUS_M / 18.0, DISC_PX_MIN, DISC_PX_MAX)
+    check("pastille 3x plus loin = 3x plus petite (hors bornes)",
+          abs(r1 / r2 - 3.0) < 1e-6, f"{r1:.1f} px à 6 m, {r2:.1f} px à 18 m")
+    tailles = [clamp(f * DISC_RADIUS_M / d, DISC_PX_MIN, DISC_PX_MAX)
+               for d in (0.4, 1.0, 2.0, 5.0, 10.0, 30.0, 200.0)]
+    check("taille bornée à toute distance",
+          all(DISC_PX_MIN <= t <= DISC_PX_MAX for t in tailles),
+          f"{min(tailles):.0f} à {max(tailles):.0f} px de 0,4 m à 200 m")
+    check("bornes utiles : cliquable et non envahissante",
+          DISC_PX_MIN >= 9.0 and DISC_PX_MAX <= 40.0
+          and DISC_PX_MAX >= 3 * DISC_PX_MIN,
+          f"{DISC_PX_MIN:.0f} → {DISC_PX_MAX:.0f} px")
+    check("pastille jamais plus large que 5 % de la vue",
+          DISC_PX_MAX * 2 <= 0.05 * 1600 + 1e-9,
+          f"{DISC_PX_MAX * 2:.0f} px de diamètre sur 1600 px")
+    seuil = f * DISC_RADIUS_M / DISC_PX_MAX
+    check("proportionnalité conservée au-delà de la portée utile", seuil < 6.0,
+          f"plafonnée en deçà de {seuil:.1f} m seulement")
     ratio = View(0, 0, 50, 1600, 900).focal() / View(0, 0, 100, 1600, 900).focal()
     attendu = math.tan(math.radians(50)) / math.tan(math.radians(25))
     check("zoom : la pastille grossit du bon facteur", abs(ratio - attendu) < 1e-9,
