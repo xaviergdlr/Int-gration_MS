@@ -30,9 +30,11 @@ os.environ.setdefault('OPENCV_LOG_LEVEL', 'ERROR')
 
 import argparse
 import csv
+import fnmatch
 import json
 import math
 import queue
+import re
 import sys
 import threading
 import time
@@ -40,7 +42,8 @@ import unicodedata
 from bisect import insort
 from collections import OrderedDict, defaultdict
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 __version__ = "1.0.0"
@@ -84,8 +87,12 @@ EYE_HEIGHT_DEFAULT = 1.65      # m — hauteur de la camera au-dessus du sol
 
 # Pastilles
 DISC_RADIUS_M = 0.42           # m — rayon physique de la pastille au sol
+                               # (le rayon a l'ecran vaut f x rayon / distance)
 DISC_PX_MIN, DISC_PX_MAX = 7.0, 70.0
 HIT_SLACK_PX = 10.0            # tolerance de clic autour de la pastille
+
+PLAN_H = 250                   # hauteur du plan (px)
+PLAN_H_EDIT = 190              # reduite en mode edition, pour loger le panneau
 
 # Couleurs (theme sombre, coherent avec Orientation-XPhase)
 COLORS = {
@@ -199,6 +206,13 @@ DEFAULT_CONFIG = {
     'floor_radius': FLOOR_RADIUS_DEFAULT,
     'show_labels': True,
     'keep_heading': True,
+    'disc_radius': DISC_RADIUS_M,
+    'filter_active': False,
+    'filter_floor': 'tous',
+    'filter_dist': 0.0,
+    'filter_local': '',
+    'filter_inter': True,
+    'filter_hide_missing': False,
     'export_workers': 2,       # panoramas 16000x8000 : ~800 Mo par tache
     'corr_paths': {},          # releve -> fichier de corrections choisi
 }
@@ -243,6 +257,99 @@ def save_config(cfg: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
+class NameParts:
+    """Découpage du nom de fichier photo.
+
+    Convention observée : CP1_GRA_TR6_BK_02_K256_20260416_01
+                          campagne_site_tranche_ouvrage_étage_local_date_index
+    L'analyse s'ancre sur la date (8 chiffres) : elle reste juste même si le
+    nombre de segments de tête change d'un chantier à l'autre.
+    """
+    campagne: str = ''
+    site: str = ''
+    tranche: str = ''
+    ouvrage: str = ''
+    etage: str = ''
+    local: str = ''
+    date: str = ''
+    index: str = ''
+    reste: Tuple[str, ...] = ()
+    reconnu: bool = False
+
+    def date_lisible(self) -> str:
+        d = self.date
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 and d.isdigit() else d
+
+    def locator(self) -> str:
+        return f"{self.local}_{self.index}" if self.local and self.index else self.local
+
+    def anomalies(self) -> List[str]:
+        """Champs attendus mais absents du nom de fichier."""
+        manque = []
+        if not self.local:
+            manque.append('local')
+        if not self.index:
+            manque.append('index')
+        if not self.date:
+            manque.append('date')
+        if not self.etage:
+            manque.append('étage')
+        return manque
+
+    def lignes(self) -> List[Tuple[str, str]]:
+        """Champs renseignés, prêts à afficher (libellé, valeur)."""
+        out = [('campagne', self.campagne), ('site', self.site),
+               ('tranche', self.tranche), ('ouvrage', self.ouvrage),
+               ('étage', self.etage), ('local', self.local),
+               ('index', self.index), ('prise de vue', self.date_lisible())]
+        if self.reste:
+            out.append(('autres', ' '.join(self.reste)))
+        return [(k, v) for k, v in out if v]
+
+
+_DATE_RE = re.compile(r'^(?:19|20)\d{6}$')
+_NUM_RE = re.compile(r'^\d{1,3}$')
+
+
+@lru_cache(maxsize=8192)
+def parse_photo_name(photo: str) -> NameParts:
+    """Extrait étage / local / index / date d'un nom de fichier photo.
+
+    Tolérant : un nom hors convention renvoie ce qui a pu être reconnu, avec
+    `reconnu = False`, sans jamais lever.
+    """
+    toks = [t for t in str(photo or '').split('_') if t]
+    if not toks:
+        return NameParts()
+    date_at = next((i for i in range(len(toks) - 1, -1, -1)
+                    if _DATE_RE.match(toks[i])), -1)
+    if date_at >= 0:
+        date = toks[date_at]
+        after = toks[date_at + 1:]
+        index = after[0] if after and _NUM_RE.match(after[0]) else (after[0] if after else '')
+        before = toks[:date_at]
+        local = before[-1] if before else ''
+        has_etage = len(before) >= 2 and _NUM_RE.match(before[-2])
+        etage = before[-2] if has_etage else ''
+        head = before[:-2] if has_etage else before[:-1]
+        reste = tuple(after[1:])
+    else:                                    # sans date : on se rabat sur la fin
+        index = toks[-1] if _NUM_RE.match(toks[-1]) else ''
+        local = toks[-2] if index and len(toks) >= 2 else (toks[-1] if not index else '')
+        head = toks[:-2] if index and len(toks) >= 2 else toks[:-1]
+        etage = head[-1] if head and _NUM_RE.match(head[-1]) else ''
+        if etage:
+            head = head[:-1]
+        date, reste = '', ()
+    reconnu = bool(local and index)
+    champs = ('campagne', 'site', 'tranche', 'ouvrage')
+    valeurs = {champs[i]: head[i] for i in range(min(len(head), len(champs)))}
+    return NameParts(etage=etage, local=local, date=date, index=index,
+                     reste=tuple(head[len(champs):]) + reste, reconnu=reconnu,
+                     **valeurs)
+
+
+@dataclass
 class Station:
     idx: int
     photo: str          # nom de base du fichier image
@@ -274,6 +381,10 @@ class Station:
     def modified(self) -> bool:
         """Modifiée depuis la lecture du CSV (donc non enregistrée)."""
         return self.moved() or self.turned()
+
+    def parts(self) -> NameParts:
+        """Découpage du nom de fichier (mis en cache)."""
+        return parse_photo_name(self.photo)
 
 
 COL_ALIASES = {
@@ -491,6 +602,69 @@ class Link:
     azimuth: float       # deg, horaire depuis le nord
     dz: float            # denivele (m)
     kind: str = 'same'   # 'same' | 'up' | 'down'
+
+
+@dataclass
+class HotspotFilter:
+    """Filtrage vivant des pastilles (n'affecte jamais le réseau ni les données).
+
+    Désactivé, il laisse tout passer : le rendu retrouve son comportement
+    normal sans qu'aucun réglage ne soit perdu.
+    """
+    active: bool = False
+    floor_mode: str = 'tous'      # 'tous' | 'courant' | nom exact d'un plancher
+    max_dist: float = 0.0         # m — 0 = pas de limite
+    local: str = ''               # motifs séparés par des virgules, * accepté
+    inter_floor: bool = True      # garder les pastilles ▲ / ▼
+    hide_missing: bool = False    # masquer les bulles sans image
+
+    def match_local(self, target: Station) -> bool:
+        motifs = [m.strip().lower()
+                  for m in self.local.replace(';', ',').split(',') if m.strip()]
+        if not motifs:
+            return True
+        name = (target.parts().local or target.locator).lower()
+        for motif in motifs:
+            if not any(c in motif for c in '*?['):
+                motif += '*'          # « K25 » retient K256, K257…
+            if fnmatch.fnmatch(name, motif):
+                return True
+        return False
+
+    def accepts(self, current: Station, target: Station, link: "Link",
+                has_image: bool = True) -> bool:
+        if not self.active:
+            return True
+        if not self.inter_floor and link.kind != 'same':
+            return False
+        if self.floor_mode == 'courant':
+            if target.floor != current.floor:
+                return False
+        elif self.floor_mode != 'tous' and target.floor != self.floor_mode:
+            return False
+        if self.max_dist > 0 and link.dist > self.max_dist:
+            return False
+        if self.hide_missing and not has_image:
+            return False
+        return self.match_local(target)
+
+    def resume(self) -> str:
+        if not self.active:
+            return "inactifs"
+        bits = []
+        if self.floor_mode == 'courant':
+            bits.append("plancher courant")
+        elif self.floor_mode != 'tous':
+            bits.append(self.floor_mode)
+        if self.max_dist > 0:
+            bits.append(f"≤ {self.max_dist:g} m")
+        if self.local.strip():
+            bits.append(f"local {self.local.strip()}")
+        if not self.inter_floor:
+            bits.append("sans ▲▼")
+        if self.hide_missing:
+            bits.append("images présentes")
+        return ' · '.join(bits) if bits else "actifs (tout passe)"
 
 
 @dataclass
@@ -1401,6 +1575,15 @@ class BubbleNavApp(_TkBase):
 
         self.view = View(fov=float(cfg.get('fov', FOV_DEFAULT)))
         self.hotspots: List[Hotspot] = []
+        self.filters = HotspotFilter(
+            active=bool(cfg.get('filter_active', False)),
+            floor_mode=str(cfg.get('filter_floor', 'tous')),
+            max_dist=float(cfg.get('filter_dist', 0.0)),
+            local=str(cfg.get('filter_local', '')),
+            inter_floor=bool(cfg.get('filter_inter', True)),
+            hide_missing=bool(cfg.get('filter_hide_missing', False)))
+        self.hidden_count = 0
+        self.focus_idx: Optional[int] = None      # bulle décrite dans le panneau
         self._hover: Optional[int] = None
         # Edition
         self.corrections = Corrections()
@@ -1589,7 +1772,7 @@ class BubbleNavApp(_TkBase):
 
         tk.Label(side, text="Plan du plancher", font=F_UI_B, bg=COLORS['bg_medium'],
                  fg=COLORS['text']).pack(anchor='w', padx=10, pady=(8, 2))
-        self.plan = tk.Canvas(side, bg='#161616', height=330, highlightthickness=1,
+        self.plan = tk.Canvas(side, bg='#161616', height=PLAN_H, highlightthickness=1,
                               highlightbackground=COLORS['border'])
         self.plan.pack(fill='x', padx=10)
         self.plan.bind('<Configure>', lambda e: self._draw_plan())
@@ -1608,10 +1791,14 @@ class BubbleNavApp(_TkBase):
         self._mk_button(btns, "Recadrer", self._plan_fit).pack(side='left')
         self._mk_button(btns, "◀ Retour", self.go_back).pack(side='left', padx=6)
 
-        tk.Label(side, text="Bulle courante", font=F_UI_B, bg=COLORS['bg_medium'],
-                 fg=COLORS['text']).pack(anchor='w', padx=10, pady=(6, 2))
+        self._build_filter_panel(side)
+
+        self.info_title = tk.Label(side, text="Bulle courante", font=F_UI_B,
+                                   bg=COLORS['bg_medium'], fg=COLORS['text'])
+        self.info_title.pack(anchor='w', padx=10, pady=(6, 2))
         self.info = tk.Label(side, text="—", justify='left', anchor='nw', font=F_MONO,
-                             bg=COLORS['card'], fg=COLORS['text'], padx=8, pady=6)
+                             bg=COLORS['card'], fg=COLORS['text'], padx=8, pady=6,
+                             wraplength=330)
         self.info.pack(fill='x', padx=10)
 
         self._build_edit_panel(side)
@@ -1630,6 +1817,7 @@ class BubbleNavApp(_TkBase):
                                   yscrollcommand=sb.set)
         self.nb_list.pack(side='left', fill='both', expand=True)
         sb.config(command=self.nb_list.yview)
+        self.nb_list.bind('<<ListboxSelect>>', self._on_nb_select)
         self.nb_list.bind('<Double-Button-1>', self._on_nb_activate)
         self.nb_list.bind('<Return>', self._on_nb_activate)
 
@@ -1660,6 +1848,8 @@ class BubbleNavApp(_TkBase):
         self.bind('<BackSpace>', lambda e: self.go_back())
         self.bind('<Home>', lambda e: self._reset_view())
         self.bind('<F11>', lambda e: self._toggle_fullscreen())
+        self.bind('<f>', lambda e: self._toggle_filters())
+        self.bind('<F>', lambda e: self._toggle_filters())
         self.bind('<e>', lambda e: self._toggle_edit())
         self.bind('<E>', lambda e: self._toggle_edit())
         self.bind('<Control-z>', lambda e: self._undo_edit())
@@ -1722,6 +1912,7 @@ class BubbleNavApp(_TkBase):
 
         self.floors = sorted({s.floor for s in stations})
         self.floor_cb.config(values=self.floors)
+        self.f_floor_cb.config(values=['tous', 'courant'] + self.floors)
         self.by_photo = {s.photo: s for s in stations}
         custom = self.cfg.get('corr_paths', {}).get(path, '')
         self.corrections = Corrections(path, custom if isinstance(custom, str) else '')
@@ -1742,6 +1933,9 @@ class BubbleNavApp(_TkBase):
         msg = f"{len(stations)} bulles · {len(self.floors)} planchers · {os.path.basename(path)}"
         if warns:
             msg += f" · {len(warns)} ligne(s) ignorée(s)"
+        anomalies = sum(1 for st in stations if st.parts().anomalies())
+        if anomalies:
+            msg += f" · {anomalies} nom(s) incomplet(s)"
         msg += corr_msg
         self._set_status(msg, COLORS['ok'] if not warns else COLORS['warning'])
 
@@ -1813,6 +2007,7 @@ class BubbleNavApp(_TkBase):
             del self.history[:-200]
         self.current = idx
         self.selected = None
+        self.focus_idx = None
         st = self.stations[idx]
         if self.floor_var.get() != st.floor:
             self.floor_var.set(st.floor)
@@ -1970,9 +2165,12 @@ class BubbleNavApp(_TkBase):
         if st is None or self.current >= len(self.links):
             return []
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        disc = float(self.cfg.get('disc_radius', DISC_RADIUS_M))
         f = view.focal()
+        links = self._visible_links(self.current)
+        self.hidden_count = len(self.links[self.current]) - len(links)
         out: List[Hotspot] = []
-        for lk in self.links[self.current]:
+        for lk in links:
             tgt = self.stations[lk.target]
             dz = (tgt.z - eye) - st.z          # pastille posee au sol de la cible
             dh = lk.dist_h
@@ -1984,7 +2182,9 @@ class BubbleNavApp(_TkBase):
             col, row, _ = pr
             if not (-80 <= col <= view.width + 80 and -80 <= row <= view.height + 80):
                 continue
-            radius = clamp(f * DISC_RADIUS_M / max(lk.dist, 0.35), DISC_PX_MIN, DISC_PX_MAX)
+            # rayon a l'ecran = focale x rayon physique / distance : la pastille
+            # retrecit exactement comme un disque pose au sol s'eloignerait.
+            radius = clamp(f * disc / max(lk.dist, 0.35), DISC_PX_MIN, DISC_PX_MAX)
             out.append(Hotspot(lk, col, row, radius, tgt.locator))
         out.sort(key=lambda h: -h.link.dist)     # les plus lointaines dessinees d'abord
         return out
@@ -2057,6 +2257,13 @@ class BubbleNavApp(_TkBase):
         self.canvas.create_text(14, 12, text=title, anchor='nw',
                                 fill=COLORS['edit'] if st.modified() else COLORS['hot'],
                                 font=('Segoe UI', 12, 'bold'), tags='hs')
+        if self.filters.active:
+            self.canvas.create_text(
+                view.width - 14, 12, anchor='ne', tags='hs', fill=COLORS['sel'],
+                font=F_UI_B,
+                text=f"FILTRES : {self.filters.resume()}\n"
+                     f"{len(self.hotspots)} pastille(s) affichée(s), "
+                     f"{self.hidden_count} masquée(s)", justify='right')
         if self.edit_mode:
             self.canvas.create_text(
                 view.width / 2, view.height - 10, anchor='s', tags='hs',
@@ -2120,9 +2327,13 @@ class BubbleNavApp(_TkBase):
         tgt = self.stations[lk.target]
         sens = {'same': 'même plancher', 'up': 'niveau au-dessus',
                 'down': 'niveau en dessous'}[lk.kind]
+        p = tgt.parts()
         lines = [
             tgt.locator,
             f"photo        {tgt.photo}",
+            f"local        {p.local or '—'}   étage {p.etage or '—'}   "
+            f"index {p.index or '—'}",
+            f"prise de vue {p.date_lisible() or '—'}",
             f"distance 3D  {lk.dist:.2f} m",
             f"horizontale  {lk.dist_h:.2f} m",
             f"Δ altitude   {lk.dz:+.2f} m",
@@ -2243,6 +2454,9 @@ class BubbleNavApp(_TkBase):
         if hit != self._hover:
             self._hover = hit
             self.canvas.config(cursor='hand2' if hit is not None else 'fleur')
+            if hit is not None and not self.edit_mode:
+                self.focus_idx = self.hotspots[hit].link.target
+                self._refresh_side()
             self._draw_overlay()
         self._draw_tooltip(event.x, event.y, hit)
 
@@ -2311,14 +2525,150 @@ class BubbleNavApp(_TkBase):
                 return
         self._draw_plan()
 
+    def _on_nb_select(self, _evt=None) -> None:
+        """Clic simple : décrit la bulle (distance comprise) sans y aller."""
+        sel = self.nb_list.curselection()
+        links = self._visible_links(self.current)
+        if sel and 0 <= sel[0] < len(links):
+            self.focus_idx = links[sel[0]].target
+            self._refresh_side()
+
     def _on_nb_activate(self, _evt=None) -> None:
         sel = self.nb_list.curselection()
         if not sel or self.current < 0:
             return
-        links = self.links[self.current]
+        links = self._visible_links(self.current)
         i = sel[0]
         if 0 <= i < len(links):
             self.goto(links[i].target)
+
+    # ═════════════════════════════════════════════════════════════════
+    # FILTRES DES PASTILLES
+    # ═════════════════════════════════════════════════════════════════
+    def _build_filter_panel(self, side) -> None:
+        head = tk.Frame(side, bg=COLORS['bg_medium'])
+        head.pack(fill='x', padx=10, pady=(8, 0))
+        self.filter_var = tk.BooleanVar(value=self.filters.active)
+        tk.Checkbutton(head, text="Filtres des pastilles  (F)", variable=self.filter_var,
+                       command=self._on_filter_change, font=F_UI_B, bg=COLORS['bg_medium'],
+                       fg=COLORS['text'], selectcolor=COLORS['bg_light'], bd=0,
+                       highlightthickness=0, activebackground=COLORS['bg_medium'],
+                       activeforeground=COLORS['text']).pack(side='left')
+        self.filter_toggle = self._mk_button(head, "▸", self._toggle_filter_panel)
+        self.filter_toggle.pack(side='right')
+        self.filter_lbl = tk.Label(side, text="", font=F_UI, bg=COLORS['bg_medium'],
+                                   fg=COLORS['text_muted'], anchor='w')
+        self.filter_lbl.pack(fill='x', padx=12)
+
+        body = tk.Frame(side, bg=COLORS['card'], padx=8, pady=6)
+        self.filter_body = body      # replié au départ : ouvert par le bouton ▸
+
+        row = tk.Frame(body, bg=COLORS['card'])
+        row.pack(fill='x', pady=1)
+        tk.Label(row, text="Plancher", width=9, anchor='w', font=F_UI,
+                 bg=COLORS['card'], fg=COLORS['text']).pack(side='left')
+        self.f_floor = tk.StringVar(value=self.filters.floor_mode)
+        self.f_floor_cb = ttk.Combobox(row, textvariable=self.f_floor, state='readonly',
+                                       style='BN.TCombobox', width=22,
+                                       values=('tous', 'courant'))
+        self.f_floor_cb.pack(side='left')
+        self.f_floor_cb.bind('<<ComboboxSelected>>', self._on_filter_change)
+
+        row = tk.Frame(body, bg=COLORS['card'])
+        row.pack(fill='x', pady=1)
+        tk.Label(row, text="Distance", width=9, anchor='w', font=F_UI,
+                 bg=COLORS['card'], fg=COLORS['text']).pack(side='left')
+        self.f_dist = tk.DoubleVar(value=self.filters.max_dist)
+        tk.Scale(row, from_=0, to=40, resolution=0.5, orient='horizontal', length=170,
+                 variable=self.f_dist, command=self._on_filter_change, showvalue=False,
+                 bg=COLORS['text_muted'], fg=COLORS['text'], troughcolor=COLORS['bg_dark'],
+                 highlightthickness=0, bd=0, sliderrelief='flat',
+                 activebackground=COLORS['accent']).pack(side='left')
+        self.f_dist_lbl = tk.Label(row, text="", width=7, font=F_MONO,
+                                   bg=COLORS['card'], fg=COLORS['text'])
+        self.f_dist_lbl.pack(side='left')
+
+        row = tk.Frame(body, bg=COLORS['card'])
+        row.pack(fill='x', pady=1)
+        tk.Label(row, text="Local", width=9, anchor='w', font=F_UI,
+                 bg=COLORS['card'], fg=COLORS['text']).pack(side='left')
+        self.f_local = tk.StringVar(value=self.filters.local)
+        ent = tk.Entry(row, textvariable=self.f_local, font=F_MONO, width=20,
+                       bg=COLORS['bg_light'], fg=COLORS['text'], relief='flat',
+                       insertbackground=COLORS['text'])
+        ent.pack(side='left')
+        ent.bind('<KeyRelease>', self._on_filter_change)
+        tk.Label(body, text="ex. K256, W25*  — préfixe suffisant", font=F_UI,
+                 bg=COLORS['card'], fg=COLORS['text_muted'], anchor='w'
+                 ).pack(fill='x', padx=(70, 0))
+
+        row = tk.Frame(body, bg=COLORS['card'])
+        row.pack(fill='x', pady=(2, 0))
+        self.f_inter = tk.BooleanVar(value=self.filters.inter_floor)
+        self.f_missing = tk.BooleanVar(value=self.filters.hide_missing)
+        for text, var in (("liens ▲▼", self.f_inter),
+                          ("masquer images absentes", self.f_missing)):
+            tk.Checkbutton(row, text=text, variable=var, command=self._on_filter_change,
+                           font=F_UI, bg=COLORS['card'], fg=COLORS['text'],
+                           selectcolor=COLORS['bg_light'], bd=0, highlightthickness=0,
+                           activebackground=COLORS['card'], activeforeground=COLORS['text']
+                           ).pack(side='left', padx=(0, 8))
+        self._mk_button(body, "Réinitialiser les filtres",
+                        self._reset_filters).pack(anchor='w', pady=(4, 0))
+
+    def _toggle_filter_panel(self) -> None:
+        """Ouvre/replie les réglages ; le plan cède la place quand ils sont ouverts."""
+        if self.filter_body.winfo_ismapped():
+            self.filter_body.pack_forget()
+            self.filter_toggle.config(text="▸")
+            if not self.edit_mode:
+                self.plan.config(height=PLAN_H)
+        else:
+            self.filter_body.pack(fill='x', padx=10, pady=(2, 4),
+                                  before=self.info_title)
+            self.filter_toggle.config(text="▾")
+            self.plan.config(height=PLAN_H_EDIT)
+
+    def _toggle_filters(self) -> None:
+        self.filter_var.set(not self.filter_var.get())
+        self._on_filter_change()
+
+    def _on_filter_change(self, _evt=None) -> None:
+        """Prise en compte immédiate : seules les pastilles sont redessinées."""
+        self.filters.active = bool(self.filter_var.get())
+        self.filters.floor_mode = self.f_floor.get() or 'tous'
+        self.filters.max_dist = float(self.f_dist.get())
+        self.filters.local = self.f_local.get()
+        self.filters.inter_floor = bool(self.f_inter.get())
+        self.filters.hide_missing = bool(self.f_missing.get())
+        self.cfg.update({
+            'filter_active': self.filters.active, 'filter_floor': self.filters.floor_mode,
+            'filter_dist': self.filters.max_dist, 'filter_local': self.filters.local,
+            'filter_inter': self.filters.inter_floor,
+            'filter_hide_missing': self.filters.hide_missing})
+        self.f_dist_lbl.config(text="illim." if self.filters.max_dist <= 0
+                               else f"{self.filters.max_dist:g} m")
+        self._draw_overlay()
+        self._refresh_side()
+        self._draw_plan()
+
+    def _reset_filters(self) -> None:
+        self.filter_var.set(False)
+        self.f_floor.set('tous')
+        self.f_dist.set(0.0)
+        self.f_local.set('')
+        self.f_inter.set(True)
+        self.f_missing.set(False)
+        self._on_filter_change()
+
+    def _visible_links(self, idx: int) -> List[Link]:
+        """Liens retenus par les filtres pour la bulle `idx`."""
+        if idx < 0 or idx >= len(self.links):
+            return []
+        st = self.stations[idx]
+        return [lk for lk in self.links[idx]
+                if self.filters.accepts(st, self.stations[lk.target], lk,
+                                        self.store.has(self.stations[lk.target].photo))]
 
     # ═════════════════════════════════════════════════════════════════
     # PANNEAU LATERAL
@@ -2327,32 +2677,72 @@ class BubbleNavApp(_TkBase):
         st = self.station()
         if st is None or self.current >= len(self.links):
             return
-        img_state = "présente" if self.store.has(st.photo) else "ABSENTE"
-        etat = ''
-        if st.has_yaw():
-            etat += f"\nΔ nord   {st.yaw_fix:+.3f}°  (à appliquer à l'image)"
-        if st.moved():
-            etat += f"\nDÉPLACÉE de {math.dist((st.x, st.y, st.z), (st.ox, st.oy, st.oz)):.2f} m"
-        applied = self.corrections.applied.get(st.photo) if self.corrections else None
-        if applied:
-            etat += f"\nimage tournée le {applied}"
-        self.info.config(fg=COLORS['edit'] if st.modified() else COLORS['text'], text=(
-            f"{st.locator}\n"
-            f"photo   {st.photo}\n"
-            f"image   {img_state}\n"
-            f"X/Y/Z   {st.x:.2f} / {st.y:.2f} / {st.z:.2f}\n"
-            f"nord    {st.north_pct:g} %\n"
-            f"plancher {st.floor}" + etat
-        ))
-        self._refresh_edit_panel()
+        focus = st
+        if self.edit_mode:
+            focus = self._edit_target() or st
+        elif self.focus_idx is not None and 0 <= self.focus_idx < len(self.stations):
+            focus = self.stations[self.focus_idx]
+        self.info_title.config(
+            text="Bulle courante" if focus is st else f"Cible : {focus.locator}")
+        self.info.config(fg=COLORS['edit'] if focus.modified() else COLORS['text'],
+                         text=self._describe(focus, st))
+
+        links = self._visible_links(self.current)
         self.nb_list.delete(0, 'end')
-        for lk in self.links[self.current]:
+        for lk in links:
             tgt = self.stations[lk.target]
             mark = {'same': ' ', 'up': '▲', 'down': '▼'}[lk.kind]
             flag = '' if self.store.has(tgt.photo) else '  (img?)'
             self.nb_list.insert('end',
                                 f"{mark} {tgt.locator:<12} {lk.dist:5.1f} m  "
                                 f"az {lk.azimuth:+06.1f}°{flag}")
+        hidden = len(self.links[self.current]) - len(links)
+        self.nb_title.config(
+            text=("Voisins (double-clic pour y aller)" if not hidden else
+                  f"Voisins — {hidden} masqué(s) par les filtres"),
+            fg=COLORS['sel'] if hidden else COLORS['text'])
+        self.filter_lbl.config(
+            text=f"{self.filters.resume()} · {len(links)}/{len(self.links[self.current])} "
+                 f"pastille(s)",
+            fg=COLORS['sel'] if self.filters.active else COLORS['text_muted'])
+        self._refresh_edit_panel()
+
+    def _describe(self, st: Station, origin: Optional[Station] = None) -> str:
+        """Fiche d'une bulle : nom analysé, position, état, distance à l'origine."""
+        p = st.parts()
+        lignes = [st.locator, f"photo    {st.photo}"]
+        repere = ' · '.join(v for v in (p.campagne, p.site, p.tranche, p.ouvrage) if v)
+        if repere:
+            lignes.append(f"repère   {repere}")
+        detail = ' · '.join(f"{k} {v}" for k, v in (
+            ('étage', p.etage), ('local', p.local), ('index', p.index)) if v)
+        if detail:
+            lignes.append(detail)
+        if p.date_lisible():
+            lignes.append(f"prise de vue {p.date_lisible()}")
+        manque = p.anomalies()
+        if manque:
+            lignes.append(f"nom      incomplet : {', '.join(manque)} absent(s)")
+        lignes += [
+            f"plancher {st.floor}",
+            f"X/Y/Z    {st.x:.2f} / {st.y:.2f} / {st.z:.2f}",
+            f"nord     {st.north_pct:g} %   ·   image "
+            f"{'présente' if self.store.has(st.photo) else 'ABSENTE'}",
+        ]
+        if origin is not None and origin.idx != st.idx:
+            _, _, d3 = azimuth_elev(st.x - origin.x, st.y - origin.y, st.z - origin.z)
+            dh = math.hypot(st.x - origin.x, st.y - origin.y)
+            lignes.append(f"distance {d3:.2f} m (3D) · {dh:.2f} m (plan)")
+            lignes.append(f"         Δz {st.z - origin.z:+.2f} m depuis {origin.locator}")
+        if st.has_yaw():
+            lignes.append(f"Δ nord   {st.yaw_fix:+.3f}°  (à appliquer à l'image)")
+        if st.moved():
+            lignes.append("DÉPLACÉE de "
+                          f"{math.dist((st.x, st.y, st.z), (st.ox, st.oy, st.oz)):.2f} m")
+        applied = self.corrections.applied.get(st.photo) if self.corrections else None
+        if applied:
+            lignes.append(f"image tournée le {applied}")
+        return '\n'.join(lignes)
 
     # ═════════════════════════════════════════════════════════════════
     # EDITION : POSITION XYZ (CSV) ET ORIENTATION (IMAGE)
@@ -2495,6 +2885,12 @@ class BubbleNavApp(_TkBase):
         state = (not self.edit_mode) if force is None else bool(force)
         self.edit_var.set(state)
         if state:
+            # Le panneau d'édition a besoin de place : plan réduit et filtres
+            # repliés (l'état des filtres est conservé et restitué en sortie).
+            self._filters_were_open = self.filter_body.winfo_ismapped()
+            if self._filters_were_open:
+                self._toggle_filter_panel()
+            self.plan.config(height=PLAN_H_EDIT)
             self.nb_title.pack_forget()
             self.nb_wrap.pack_forget()
             self.edit_host.pack(fill='both', expand=True, padx=10, pady=(8, 10))
@@ -2502,6 +2898,10 @@ class BubbleNavApp(_TkBase):
             self._set_target(None)
         else:
             self.edit_host.pack_forget()
+            self.plan.config(height=PLAN_H)
+            if getattr(self, '_filters_were_open', False) \
+                    and not self.filter_body.winfo_ismapped():
+                self._toggle_filter_panel()
             self.nb_title.pack(anchor='w', padx=10, pady=(10, 2))
             self.nb_wrap.pack(fill='both', expand=True, padx=10, pady=(0, 10))
             self.edit_btn.config(bg=COLORS['bg_light'], fg=COLORS['text'])
@@ -3070,8 +3470,8 @@ class BubbleNavApp(_TkBase):
 
         cur = self.station()
         if cur is not None:
-            # voisins mis en evidence
-            for lk in (self.links[cur.idx] if self.links else []):
+            # voisins mis en evidence (filtres compris)
+            for lk in self._visible_links(cur.idx):
                 tgt = self.stations[lk.target]
                 if tgt.floor != floor:
                     continue
@@ -3255,6 +3655,10 @@ class BubbleNavApp(_TkBase):
                            ).pack(side='left', padx=4)
         slider(cal, "Correction nord (°)", off_var, -180, 180, 0.5, apply_calib)
         slider(cal, "Hauteur caméra (m)", eye_var, 0.0, 3.0, 0.05, apply_calib)
+        disc_var = tk.DoubleVar(value=float(self.cfg.get('disc_radius', DISC_RADIUS_M)))
+        slider(cal, "Rayon des pastilles (m)", disc_var, 0.15, 1.20, 0.01,
+               lambda _=None: (self.cfg.__setitem__('disc_radius', float(disc_var.get())),
+                               self._draw_overlay()))
 
         # ── Reseau ──────────────────────────────────────────────────
         net = section("Réseau de navigation")
@@ -3776,6 +4180,80 @@ def selftest(csv_path: str = '') -> int:
               f"{ok} exportée(s), erreurs : {errors}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # 9. Analyse du nom de fichier et filtres de pastilles
+    print("\n9) Analyse du nom et filtres")
+    p = parse_photo_name('CP1_GRA_TR6_BK_02_K256_20260416_01')
+    check("découpage du nom",
+          (p.campagne, p.site, p.tranche, p.ouvrage, p.etage, p.local, p.index)
+          == ('CP1', 'GRA', 'TR6', 'BK', '02', 'K256', '01') and p.reconnu,
+          f"{p.local} étage {p.etage} index {p.index}")
+    check("date lisible", p.date_lisible() == '2026-04-16', p.date_lisible())
+    check("locator reconstruit", p.locator() == 'K256_01', p.locator())
+    p2 = parse_photo_name('SITE_03_L12_20250101_7_bis')
+    check("segments de tête variables", (p2.etage, p2.local, p2.index, p2.reste)
+          == ('03', 'L12', '7', ('bis',)), str(p2))
+    p3 = parse_photo_name('photo_sans_convention')
+    check("nom hors convention toléré", not p3.reconnu and p3.local == 'convention')
+    check("nom vide toléré", parse_photo_name('') == NameParts())
+
+    if csv_path and os.path.isfile(csv_path):
+        sts, _ = read_survey_csv(csv_path)
+        ok_names = sum(1 for st in sts if st.parts().reconnu)
+        coherent = sum(1 for st in sts
+                       if st.parts().locator() == st.locator
+                       and st.parts().etage in st.floor.replace('PLANCHER ', '')[:2])
+        check("noms reconnus sur le relevé", ok_names == len(sts),
+              f"{ok_names}/{len(sts)}")
+        check("locator et étage cohérents avec le nom", coherent == len(sts),
+              f"{coherent}/{len(sts)}")
+
+        links = build_graph(sts, GraphParams())
+        cur = sts[0]
+        mine = links[cur.idx]
+        flt = HotspotFilter(active=False, floor_mode='courant', max_dist=2.0)
+        check("filtre inactif = tout passe",
+              all(flt.accepts(cur, sts[lk.target], lk) for lk in mine))
+        flt.active = True
+        kept = [lk for lk in mine if flt.accepts(cur, sts[lk.target], lk)]
+        check("filtre distance", all(lk.dist <= 2.0 for lk in kept)
+              and len(kept) < len(mine), f"{len(kept)}/{len(mine)}")
+        flt2 = HotspotFilter(active=True, inter_floor=False)
+        check("filtre liens inter-planchers",
+              all(lk.kind == 'same' for lk in mine
+                  if flt2.accepts(cur, sts[lk.target], lk)))
+        flt3 = HotspotFilter(active=True, floor_mode='courant')
+        check("filtre plancher courant",
+              all(sts[lk.target].floor == cur.floor for lk in mine
+                  if flt3.accepts(cur, sts[lk.target], lk)))
+        motif = cur.parts().local
+        flt4 = HotspotFilter(active=True, local=motif[:3])
+        gardes = [lk for lk in mine if flt4.accepts(cur, sts[lk.target], lk)]
+        check("filtre local par préfixe",
+              gardes and all(sts[lk.target].parts().local.startswith(motif[:3])
+                             for lk in gardes), f"{motif[:3]} → {len(gardes)} pastille(s)")
+        flt5 = HotspotFilter(active=True, local='ZZZ*')
+        check("motif sans correspondance = aucune pastille",
+              not [lk for lk in mine if flt5.accepts(cur, sts[lk.target], lk)])
+        flt6 = HotspotFilter(active=True, hide_missing=True)
+        check("filtre images absentes",
+              not [lk for lk in mine if flt6.accepts(cur, sts[lk.target], lk, False)])
+
+    # taille de pastille : décroissance en 1/distance
+    view = View(0, -20, 105, 1600, 900)
+    f = view.focal()
+    r1 = clamp(f * DISC_RADIUS_M / 4.0, DISC_PX_MIN, DISC_PX_MAX)
+    r2 = clamp(f * DISC_RADIUS_M / 16.0, DISC_PX_MIN, DISC_PX_MAX)
+    check("pastille 4x plus loin = 4x plus petite", abs(r1 / r2 - 4.0) < 1e-6,
+          f"{r1:.1f} px à 4 m, {r2:.1f} px à 16 m")
+    check("écrêtage aux extrêmes",
+          clamp(f * DISC_RADIUS_M / 0.5, DISC_PX_MIN, DISC_PX_MAX) == DISC_PX_MAX
+          and clamp(f * DISC_RADIUS_M / 200.0, DISC_PX_MIN, DISC_PX_MAX) == DISC_PX_MIN,
+          f"{DISC_PX_MIN:.0f} à {DISC_PX_MAX:.0f} px")
+    ratio = View(0, 0, 50, 1600, 900).focal() / View(0, 0, 100, 1600, 900).focal()
+    attendu = math.tan(math.radians(50)) / math.tan(math.radians(25))
+    check("zoom : la pastille grossit du bon facteur", abs(ratio - attendu) < 1e-9,
+          f"champ 100° → 50° : ×{ratio:.2f}")
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))

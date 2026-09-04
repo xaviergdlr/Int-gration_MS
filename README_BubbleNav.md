@@ -68,7 +68,58 @@ molette = zoom, clic droit glissé = déplacer. Le cône jaune montre où vous r
 La liste « Plancher » change de niveau en rejoignant la bulle la plus proche à l'aplomb.
 
 **Couleur des pastilles** : jaune = même plancher · bleu ▲ = niveau au-dessus ·
-violet ▼ = niveau en dessous · rouge sombre = image absente du dossier.
+violet ▼ = niveau en dessous · rouge sombre = image absente du dossier · orange =
+bulle corrigée.
+
+**Taille des pastilles** : rayon à l'écran = focale × rayon physique ÷ distance —
+une pastille quatre fois plus loin est quatre fois plus petite, et zoomer les
+grossit exactement comme un disque posé au sol. Le rayon physique (0,42 m par
+défaut) se règle dans « Réglages… », entre des bornes de 7 et 70 px.
+
+### Fiche de la bulle
+Le panneau de droite décrit la bulle **visée** — celle qu'on survole ou qu'on
+sélectionne dans la liste des voisins — et retombe sur la bulle courante sinon.
+Le **nom de fichier est analysé** selon la convention
+`campagne_site_tranche_ouvrage_étage_local_date_index` :
+
+```
+K256_36
+photo    CP1_GRA_TR6_BK_02_K256_20260326_36
+repère   CP1 · GRA · TR6 · BK
+étage 02 · local K256 · index 36
+prise de vue 2026-03-26
+plancher PLANCHER 02 (+00.00m)
+X/Y/Z    586.48 / 72.63 / 1.65
+nord     50 %   ·   image présente
+distance 2.79 m (3D) · 2.79 m (plan)
+         Δz +0.00 m depuis K256_01
+```
+
+L'analyse s'ancre sur la date (8 chiffres) : elle reste juste si le nombre de
+segments de tête change. Un nom incomplet est signalé (`nom incomplet : date
+absente`) sans jamais bloquer, et le nombre de noms incomplets apparaît dans la
+barre d'état au chargement.
+
+Le survol d'une pastille ajoute une infobulle avec les mêmes attributs plus
+l'azimut et le cap dans l'image.
+
+### Filtres des pastilles  (touche F)
+Un panneau repliable, à droite, restreint ce qui est affiché **en direct** — les
+pastilles sont redessinées immédiatement, sans recharger l'image ni toucher au
+réseau :
+
+| Filtre | Effet |
+|---|---|
+| Plancher | tous · plancher courant · un plancher précis |
+| Distance | pastilles au-delà de N mètres masquées (0 = illimité) |
+| Local | `K256`, `K25`, `W25*` … motifs séparés par des virgules, préfixe suffisant |
+| liens ▲▼ | garder ou non les pastilles vers les autres niveaux |
+| images absentes | masquer les bulles dont le JPEG manque |
+
+La case « Filtres des pastilles » les active ou les désactive d'un coup, sans
+perdre les réglages ; un bandeau en haut à droite de la vue rappelle le filtre en
+cours et le nombre de pastilles masquées, et la liste des voisins suit le même
+filtre. Les réglages sont mémorisés d'une session à l'autre.
 
 Le **cap terrain est conservé** d'une bulle à l'autre : on continue à regarder dans la
 même direction réelle après chaque saut.
@@ -212,7 +263,9 @@ python BubbleNav_XPhase.py --selftest
 Contrôle les angles, la réciprocité azimut ↔ image, la **cohérence entre la position
 calculée des pastilles et le rendu réel** (écart mesuré < 2 px), la lecture du CSV, la
 construction du réseau, les temps de rendu, l'aller-retour **écran ↔ sol** utilisé pour
-déplacer une pastille, l'aller-retour du fichier de corrections (écriture, relecture, ligne orpheline,
+déplacer une pastille, l'analyse des noms de fichiers (convention, variantes, noms incomplets, cohérence
+avec les colonnes du relevé sur les 693 bulles), les filtres de pastilles et la loi de
+taille en 1/distance, l'aller-retour du fichier de corrections (écriture, relecture, ligne orpheline,
 date d'application) avec relevé source inchangé octet pour octet, l'écriture du relevé
 complet corrigé (colonne Δ nord créée puis réutilisée, seules les lignes modifiées
 changent), et l'équivalence **image tournée de Δ ≡ vue décalée de Δ** — autrement dit, ce que vous
