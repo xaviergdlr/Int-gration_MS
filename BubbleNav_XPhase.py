@@ -200,6 +200,7 @@ DEFAULT_CONFIG = {
     'show_labels': True,
     'keep_heading': True,
     'export_workers': 2,       # panoramas 16000x8000 : ~800 Mo par tache
+    'corr_paths': {},          # releve -> fichier de corrections choisi
 }
 
 
@@ -219,6 +220,9 @@ def load_config() -> dict:
                     cfg[k] = type(ref)(v)
                 elif isinstance(ref, str) and isinstance(v, str):
                     cfg[k] = v
+                elif isinstance(ref, dict) and isinstance(v, dict):
+                    cfg[k] = {str(a): str(b) for a, b in v.items()
+                              if isinstance(b, str)}
     except Exception:
         pass
     return cfg
@@ -661,20 +665,32 @@ def ground_from_screen(view: View, col: float, row: float, calib: Calib,
 
 
 class Corrections:
-    """Journal des corrections, annulation, sauvegarde de secours.
+    """Journal des corrections, stocké dans un FICHIER DE CORRECTIONS distinct.
 
-    Deux natures de correction, volontairement distinctes :
-      * position XYZ  -> destinée au CSV corrigé ;
-      * orientation   -> destinée à l'IMAGE (rotation en lacet du panorama),
-                         le CSV conservant son « % NORD » d'origine.
+    Le relevé chargé n'est jamais réécrit : il reste la source. Les corrections
+    (position et orientation) vivent dans leur propre CSV, écrit en continu,
+    relu automatiquement à la réouverture et appliqué par-dessus le relevé.
+    Les images ne sont touchées qu'au moment de l'application par lot.
     """
 
-    SUFFIX = '.corrections.json'
+    SUFFIX = '_corrections.csv'
+    DELIM = ';'
+    HEADER = ('Fichier photo', 'Nom du Locator', 'X', 'Y', 'Z', YAW_COLUMN,
+              'dX', 'dY', 'dZ', 'Orientation appliquee', 'Date')
 
-    def __init__(self, csv_path: str = ''):
+    def __init__(self, csv_path: str = '', path: str = ''):
         self.csv_path = csv_path
+        self.path = path or self.default_path(csv_path)
+        self.applied: Dict[str, str] = {}   # photo -> date de rotation des images
+        self.dirty = False
         self._undo: List[Tuple[str, dict]] = []
         self._lock = threading.RLock()
+
+    @classmethod
+    def default_path(cls, csv_path: str) -> str:
+        if not csv_path:
+            return ''
+        return os.path.splitext(csv_path)[0] + cls.SUFFIX
 
     # ── etat ─────────────────────────────────────────────────────────
     @staticmethod
@@ -687,9 +703,6 @@ class Corrections:
         st.y = float(snap.get('y', st.y))
         st.z = float(snap.get('z', st.z))
         st.yaw_fix = float(snap.get('yaw_fix', st.yaw_fix))
-
-    def sidecar_path(self) -> str:
-        return (self.csv_path + self.SUFFIX) if self.csv_path else ''
 
     # ── modifications ────────────────────────────────────────────────
     def apply(self, st: Station, *, x: float = None, y: float = None,
@@ -707,6 +720,7 @@ class Corrections:
             st.z = float(z)
         if yaw_fix is not None:
             st.yaw_fix = wrap180(float(yaw_fix))
+        self.dirty = True
 
     def undo(self, by_photo: Dict[str, Station]) -> Optional[Station]:
         with self._lock:
@@ -716,13 +730,16 @@ class Corrections:
         st = by_photo.get(photo)
         if st is not None:
             self.restore(st, snap)
+            self.dirty = True
         return st
 
     def can_undo(self) -> bool:
         return bool(self._undo)
 
     def revert(self, st: Station) -> None:
+        """Retour aux valeurs du relevé d'origine."""
         self.apply(st, x=st.ox, y=st.oy, z=st.oz, yaw_fix=st.oyaw)
+        self.applied.pop(st.photo, None)
 
     def revert_all(self, stations: Sequence[Station]) -> int:
         n = 0
@@ -734,50 +751,99 @@ class Corrections:
 
     @staticmethod
     def counts(stations: Sequence[Station]) -> Tuple[int, int]:
-        """(positions modifiées, orientations modifiées) depuis le CSV."""
+        """(positions corrigées, orientations corrigées) au regard du relevé."""
         return (sum(1 for s in stations if s.moved()),
                 sum(1 for s in stations if s.turned()))
 
     @staticmethod
     def pending_images(stations: Sequence[Station]) -> List[Station]:
-        """Bulles dont l'image reste à tourner (Δ nord non nul dans le CSV)."""
+        """Bulles dont l'image reste à tourner (Δ nord non nul)."""
         return [s for s in stations if s.has_yaw()]
 
-    # ── sauvegarde de secours ────────────────────────────────────────
-    def save_sidecar(self, stations: Sequence[Station]) -> str:
-        path = self.sidecar_path()
-        if not path:
-            return ''
-        data = {'csv': os.path.basename(self.csv_path), 'version': __version__,
-                'date': datetime.now().isoformat(timespec='seconds'),
-                'edits': {s.photo: self.snapshot(s) for s in stations if s.modified()}}
-        try:
-            tmp = path + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as fh:
-                json.dump(data, fh, indent=1, ensure_ascii=False)
-            os.replace(tmp, path)
-        except Exception:
-            return ''
-        return path
+    def mark_applied(self, photos: Iterable[str]) -> None:
+        stamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+        for photo in photos:
+            self.applied[photo] = stamp
+        self.dirty = True
 
-    def load_sidecar(self, by_photo: Dict[str, Station]) -> int:
-        path = self.sidecar_path()
-        if not path or not os.path.isfile(path):
-            return 0
+    # ── fichier de corrections ───────────────────────────────────────
+    def save(self, stations: Sequence[Station]) -> str:
+        """Écrit le fichier de corrections (uniquement les bulles corrigées).
+
+        Écriture atomique : le fichier reste exploitable même si l'outil est
+        interrompu en cours d'enregistrement.
+        """
+        if not self.path:
+            return ''
+        rows = [st for st in stations if st.modified() or st.photo in self.applied]
+        stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        lines = [self.DELIM.join(self.HEADER)]
+        for st in rows:
+            lines.append(self.DELIM.join((
+                st.photo, st.locator,
+                f"{st.x:.3f}", f"{st.y:.3f}", f"{st.z:.3f}",
+                f"{st.yaw_fix:.4f}",
+                f"{st.x - st.ox:+.3f}", f"{st.y - st.oy:+.3f}", f"{st.z - st.oz:+.3f}",
+                self.applied.get(st.photo, ''), stamp)))
+        tmp = self.path + '.tmp'
         try:
-            with open(path, 'r', encoding='utf-8') as fh:
-                data = json.load(fh)
-            edits = data.get('edits', {})
+            with open(tmp, 'w', encoding='utf-8-sig', newline='') as fh:
+                fh.write('\r\n'.join(lines) + '\r\n')
+            os.replace(tmp, self.path)
         except Exception:
-            return 0
-        n = 0
-        for photo, snap in edits.items():
-            st = by_photo.get(photo)
-            if st is None or not isinstance(snap, dict):
+            return ''
+        self.dirty = False
+        return self.path
+
+    def load(self, by_photo: Dict[str, Station], path: str = '') -> Tuple[int, int]:
+        """Relit un fichier de corrections et l'applique au relevé en mémoire.
+
+        Retourne (corrections appliquées, lignes sans correspondance).
+        """
+        path = path or self.path
+        if not path or not os.path.isfile(path):
+            return 0, 0
+        text = _read_text(path)
+        rows = [r for r in csv.reader(text.splitlines(),
+                                      delimiter=_sniff_delimiter(text))
+                if any((c or '').strip() for c in r)]
+        if len(rows) < 2:
+            return 0, 0
+        header = [norm_key(c) for c in rows[0]]
+        col: Dict[str, int] = {}
+        for field_name in ('photo', 'x', 'y', 'z', 'dnord'):
+            for alias in COL_ALIASES[field_name]:
+                if alias in header:
+                    col[field_name] = header.index(alias)
+                    break
+        applied_col = header.index('orientationappliquee') if 'orientationappliquee' in header else -1
+        if 'photo' not in col:
+            raise ValueError("Fichier de corrections sans colonne « Fichier photo ».")
+
+        n_ok = n_miss = 0
+        for row in rows[1:]:
+            def cell(key: str) -> str:
+                i = col.get(key, -1)
+                return row[i].strip() if 0 <= i < len(row) else ''
+            st = by_photo.get(base_name(cell('photo')))
+            if st is None:
+                n_miss += 1
                 continue
-            self.restore(st, snap)
-            n += 1
-        return n
+            values = {}
+            for axis in ('x', 'y', 'z'):
+                v = parse_float(cell(axis))
+                if v is not None:
+                    values[axis] = v
+            dn = parse_float(cell('dnord'))
+            if dn is not None:
+                values['yaw_fix'] = dn
+            if values:
+                self.apply(st, record=False, **values)
+                n_ok += 1
+            if 0 <= applied_col < len(row) and row[applied_col].strip():
+                self.applied[st.photo] = row[applied_col].strip()
+        self.dirty = False
+        return n_ok, n_miss
 
 
 def _format_like(sample: str, value: float, default_decimals: int = 3) -> str:
@@ -1657,21 +1723,26 @@ class BubbleNavApp(_TkBase):
         self.floors = sorted({s.floor for s in stations})
         self.floor_cb.config(values=self.floors)
         self.by_photo = {s.photo: s for s in stations}
-        self.corrections = Corrections(path)
+        custom = self.cfg.get('corr_paths', {}).get(path, '')
+        self.corrections = Corrections(path, custom if isinstance(custom, str) else '')
         self.selected = None
-        if os.path.isfile(self.corrections.sidecar_path()):
-            if messagebox.askyesno(
-                    "Corrections en attente",
-                    "Des corrections enregistrées accompagnent ce relevé "
-                    f"({os.path.basename(self.corrections.sidecar_path())}).\n\n"
-                    "Les reprendre ?"):
-                n = self.corrections.load_sidecar(self.by_photo)
-                self._set_status(f"{n} correction(s) reprise(s)", COLORS['edit'])
+        corr_msg = ''
+        if os.path.isfile(self.corrections.path):
+            try:
+                n_ok, n_miss = self.corrections.load(self.by_photo)
+                corr_msg = (f" · {n_ok} correction(s) reprises de "
+                            f"{os.path.basename(self.corrections.path)}")
+                if n_miss:
+                    corr_msg += f" ({n_miss} ligne(s) sans correspondance)"
+            except Exception as exc:
+                messagebox.showwarning("Fichier de corrections",
+                                       f"{self.corrections.path}\n\n{exc}")
         self.rebuild_graph()
 
         msg = f"{len(stations)} bulles · {len(self.floors)} planchers · {os.path.basename(path)}"
         if warns:
             msg += f" · {len(warns)} ligne(s) ignorée(s)"
+        msg += corr_msg
         self._set_status(msg, COLORS['ok'] if not warns else COLORS['warning'])
 
         target = images_dir or self.cfg.get('images_dir', '')
@@ -2259,12 +2330,12 @@ class BubbleNavApp(_TkBase):
         img_state = "présente" if self.store.has(st.photo) else "ABSENTE"
         etat = ''
         if st.has_yaw():
-            etat += (f"\nΔ nord   {st.yaw_fix:+.3f}°  "
-                     + ("(non enregistré)" if st.turned() else "(lu dans le CSV)"))
+            etat += f"\nΔ nord   {st.yaw_fix:+.3f}°  (à appliquer à l'image)"
         if st.moved():
             etat += f"\nDÉPLACÉE de {math.dist((st.x, st.y, st.z), (st.ox, st.oy, st.oz)):.2f} m"
-        if st.turned() and not st.has_yaw():
-            etat += "\nΔ nord remis à zéro (non enregistré)"
+        applied = self.corrections.applied.get(st.photo) if self.corrections else None
+        if applied:
+            etat += f"\nimage tournée le {applied}"
         self.info.config(fg=COLORS['edit'] if st.modified() else COLORS['text'], text=(
             f"{st.locator}\n"
             f"photo   {st.photo}\n"
@@ -2392,6 +2463,15 @@ class BubbleNavApp(_TkBase):
               "moment choisi, par « Appliquer / enregistrer… »."
               ).pack(anchor='w', pady=(2, 6))
 
+        # Fichier de corrections
+        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        row.pack(fill='x', pady=(4, 0))
+        label(row, "Corrections :").pack(side='left')
+        self.corr_lbl = tk.Label(row, text="—", font=F_UI, bg=COLORS['card'],
+                                 fg=COLORS['ok'], anchor='w')
+        self.corr_lbl.pack(side='left', padx=4, fill='x', expand=True)
+        self._mk_button(row, "Fichier…", self._choose_corrections_file).pack(side='right')
+
         # Annulation et sorties
         row = tk.Frame(self.edit_frame, bg=COLORS['card'])
         row.pack(fill='x', pady=2)
@@ -2461,16 +2541,19 @@ class BubbleNavApp(_TkBase):
         self.yaw_lbl.config(text=f"{self.yaw_var.get():+.2f}°".replace('.', ','))
         moved, turned = Corrections.counts(self.stations)
         pending = len(Corrections.pending_images(self.stations))
+        etat = "modifications non enregistrées" if self.corrections.dirty else "enregistré"
+        self.corr_lbl.config(
+            text=f"{os.path.basename(self.corrections.path) or '—'} ({etat})",
+            fg=COLORS['edit'] if self.corrections.dirty else COLORS['ok'])
         if moved or turned:
             self.edit_count.config(
-                text=(f"à enregistrer : {moved} position(s) · {turned} orientation(s)\n"
-                      f"images à tourner au total : {pending}"), fg=COLORS['edit'])
+                text=(f"corrections : {moved} position(s) · {turned} orientation(s)\n"
+                      f"images à tourner : {pending}"), fg=COLORS['edit'])
             self.edit_lbl.config(text=f"✎ {moved} XYZ · {turned} nord")
         else:
             self.edit_count.config(
-                text=("tout est enregistré" if not pending else
-                      f"tout est enregistré · {pending} image(s) à tourner"),
-                fg=COLORS['text_muted'])
+                text=("aucune correction" if not pending else
+                      f"{pending} image(s) à tourner"), fg=COLORS['text_muted'])
             self.edit_lbl.config(text="")
 
     # ── modifications ────────────────────────────────────────────────
@@ -2495,12 +2578,17 @@ class BubbleNavApp(_TkBase):
 
     def _autosave(self) -> None:
         self._autosave_job = None
-        path = self.corrections.save_sidecar(self.stations)
+        if not self.corrections.dirty:
+            return
+        path = self.corrections.save(self.stations)
+        moved, turned = Corrections.counts(self.stations)
         if path:
-            moved, turned = Corrections.counts(self.stations)
-            if moved or turned:
-                self._set_status(f"Corrections enregistrées ({moved} XYZ, {turned} nord) "
-                                 f"→ {os.path.basename(path)}")
+            self._set_status(f"{moved} position(s) et {turned} orientation(s) "
+                             f"enregistrées → {os.path.basename(path)}")
+        else:
+            self._set_status("Enregistrement des corrections impossible : "
+                             f"{self.corrections.path}", COLORS['error'])
+        self._refresh_edit_panel()
 
     def _apply_position_fields(self) -> None:
         st = self._edit_target()
@@ -2647,9 +2735,10 @@ class BubbleNavApp(_TkBase):
 
     # ── application par lot ──────────────────────────────────────────
     def _dlg_apply(self) -> None:
-        """Bilan des corrections et application en une seule passe."""
+        """Bilan des corrections, puis traitements par lot en une passe."""
         if not self.stations:
             return
+        self._autosave()
         moved, turned = Corrections.counts(self.stations)
         pending = Corrections.pending_images(self.stations)
         if not (moved or turned or pending):
@@ -2657,7 +2746,7 @@ class BubbleNavApp(_TkBase):
             return
 
         win = tk.Toplevel(self)
-        win.title("Appliquer les corrections")
+        win.title("Corrections — bilan et application")
         win.configure(bg=COLORS['bg_dark'])
         win.transient(self)
         win.resizable(False, False)
@@ -2666,37 +2755,29 @@ class BubbleNavApp(_TkBase):
                  fg=COLORS['accent']).pack(anchor='w', padx=14, pady=(12, 2))
         tk.Label(win, justify='left', anchor='w', font=F_MONO, bg=COLORS['card'],
                  fg=COLORS['text'], padx=10, pady=8, text=(
-                     f"positions modifiées      {moved:4d}\n"
-                     f"orientations modifiées   {turned:4d}\n"
-                     f"images à tourner au total{len(pending):4d}  (Δ nord du CSV ≠ 0)")
+                     f"positions corrigées      {moved:4d}\n"
+                     f"orientations corrigées   {turned:4d}\n"
+                     f"images à tourner         {len(pending):4d}\n\n"
+                     f"relevé chargé (intact)   {os.path.basename(self.csv_path)}\n"
+                     f"fichier de corrections   {os.path.basename(self.corrections.path)}")
                  ).pack(fill='x', padx=14)
 
-        base, ext = os.path.splitext(os.path.basename(self.csv_path))
-        suggestion = os.path.join(
-            os.path.dirname(self.csv_path),
-            f"{base}_corrige_{datetime.now():%Y%m%d_%Hh%M}{ext or '.csv'}")
-        csv_var = tk.StringVar(value=suggestion)
-        img_var = tk.StringVar(value=os.path.join(self.images_dir or '', '_oriente')
+        img_var = tk.StringVar(value=os.path.join(self.images_dir, '_oriente')
                                if self.images_dir else '')
-        do_csv = tk.BooleanVar(value=True)
-        do_img = tk.BooleanVar(value=False)
+        base, ext = os.path.splitext(os.path.basename(self.csv_path))
+        merged_var = tk.StringVar(value=os.path.join(
+            os.path.dirname(self.csv_path),
+            f"{base}_corrige_{datetime.now():%Y%m%d_%Hh%M}{ext or '.csv'}"))
+        do_img = tk.BooleanVar(value=bool(pending))
+        do_merged = tk.BooleanVar(value=False)
 
-        def path_row(parent, var, browse):
-            row = tk.Frame(parent, bg=COLORS['bg_dark'])
+        def path_row(var, browse):
+            row = tk.Frame(win, bg=COLORS['bg_dark'])
             row.pack(fill='x', padx=30, pady=(0, 6))
             tk.Entry(row, textvariable=var, font=F_UI, bg=COLORS['bg_light'],
                      fg=COLORS['text'], relief='flat', width=52,
                      insertbackground=COLORS['text']).pack(side='left', fill='x', expand=True)
             self._mk_button(row, "Parcourir…", browse).pack(side='left', padx=4)
-
-        def pick_csv():
-            path = filedialog.asksaveasfilename(
-                title="CSV corrigé", initialdir=os.path.dirname(csv_var.get()),
-                initialfile=os.path.basename(csv_var.get()),
-                defaultextension=ext or '.csv',
-                filetypes=[("Fichiers CSV", "*.csv *.txt"), ("Tous les fichiers", "*.*")])
-            if path:
-                csv_var.set(path)
 
         def pick_dir():
             path = filedialog.askdirectory(title="Dossier des images orientées",
@@ -2704,50 +2785,52 @@ class BubbleNavApp(_TkBase):
             if path:
                 img_var.set(path)
 
-        def check(parent, text, var, **kw):
-            return tk.Checkbutton(parent, text=text, variable=var, font=F_UI_B,
-                                  anchor='w', bg=COLORS['bg_dark'], fg=COLORS['text'],
-                                  selectcolor=COLORS['bg_light'], bd=0,
-                                  highlightthickness=0, activebackground=COLORS['bg_dark'],
-                                  activeforeground=COLORS['text'], **kw)
+        def pick_merged():
+            path = filedialog.asksaveasfilename(
+                title="Relevé complet corrigé", defaultextension=ext or '.csv',
+                initialdir=os.path.dirname(merged_var.get()),
+                initialfile=os.path.basename(merged_var.get()),
+                filetypes=[("Fichiers CSV", "*.csv *.txt"), ("Tous les fichiers", "*.*")])
+            if path:
+                merged_var.set(path)
 
-        check(win, "Écrire le CSV corrigé  (positions + colonne Δ nord)", do_csv
-              ).pack(fill='x', padx=14, pady=(12, 2))
-        tk.Label(win, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
-                 anchor='w', justify='left', text=(
-                     "Copie du relevé : le fichier d'origine n'est pas touché, la "
-                     "colonne « % NORD » non plus.")
-                 ).pack(fill='x', padx=30, pady=(0, 4))
-        path_row(win, csv_var, pick_csv)
+        def check(text, var):
+            return tk.Checkbutton(win, text=text, variable=var, font=F_UI_B, anchor='w',
+                                  bg=COLORS['bg_dark'], fg=COLORS['text'],
+                                  selectcolor=COLORS['bg_light'], bd=0, highlightthickness=0,
+                                  activebackground=COLORS['bg_dark'],
+                                  activeforeground=COLORS['text'])
 
         workers = max(1, int(self.cfg.get('export_workers', 2)))
-        check(win, "Appliquer l'orientation aux images  (copie dans un autre dossier)",
-              do_img).pack(fill='x', padx=14, pady=(8, 2))
+        check("Appliquer l'orientation aux images  (copie dans un autre dossier)",
+              do_img).pack(fill='x', padx=14, pady=(12, 2))
         tk.Label(win, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
                  anchor='w', justify='left', text=(
-                     f"{len(pending)} image(s) à écrire, images d'origine intactes. "
-                     f"Sur des panoramas 16000×8000 : ~{len(pending) * 7 / workers / 60:.0f} min, "
+                     f"{len(pending)} image(s) à écrire, originaux intacts. Panoramas "
+                     f"16000×8000 : ~{len(pending) * 7 / workers / 60:.0f} min, "
                      f"~{workers * 0.8:.1f} Go.\n"
                      "Rotation au pixel entier, tables JPEG de la source réutilisées.\n"
-                     "Une fois appliquée, la colonne Δ nord est remise à 0 dans le CSV écrit.")
+                     "Une fois appliqué, le Δ nord repasse à 0 dans le fichier de "
+                     "corrections (date d'application conservée).")
                  ).pack(fill='x', padx=30, pady=(0, 4))
-        path_row(win, img_var, pick_dir)
+        path_row(img_var, pick_dir)
+
+        check("Écrire aussi un relevé complet corrigé  (copie du CSV chargé)",
+              do_merged).pack(fill='x', padx=14, pady=(8, 2))
+        tk.Label(win, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
+                 anchor='w', justify='left', text=(
+                     "Facultatif : relevé d'origine + corrections fusionnés, pour une "
+                     "chaîne qui attend un CSV unique.\n"
+                     "Le relevé chargé et le fichier de corrections restent inchangés.")
+                 ).pack(fill='x', padx=30, pady=(0, 4))
+        path_row(merged_var, pick_merged)
 
         foot = tk.Frame(win, bg=COLORS['bg_dark'])
         foot.pack(fill='x', padx=14, pady=12)
 
         def run():
-            csv_path = csv_var.get().strip()
             out_dir = img_var.get().strip()
-            if do_csv.get():
-                if not csv_path:
-                    messagebox.showwarning("Appliquer", "Indiquez le CSV à écrire.")
-                    return
-                if os.path.abspath(csv_path) == os.path.abspath(self.csv_path):
-                    messagebox.showerror("Appliquer",
-                                         "Choisissez un autre nom : le relevé d'origine "
-                                         "doit rester intact.")
-                    return
+            merged = merged_var.get().strip()
             if do_img.get():
                 if not out_dir:
                     messagebox.showwarning("Appliquer", "Indiquez le dossier de destination.")
@@ -2757,52 +2840,84 @@ class BubbleNavApp(_TkBase):
                                          "Ce dossier contient les images source : "
                                          "elles seraient écrasées.")
                     return
-            if not (do_csv.get() or do_img.get()):
-                return
+            if do_merged.get():
+                if not merged:
+                    messagebox.showwarning("Appliquer", "Indiquez le CSV à écrire.")
+                    return
+                for reserved in (self.csv_path, self.corrections.path):
+                    if reserved and os.path.abspath(merged) == os.path.abspath(reserved):
+                        messagebox.showerror("Appliquer",
+                                             "Choisissez un autre nom : ce fichier ne "
+                                             "doit pas être écrasé.")
+                        return
             win.destroy()
             if do_img.get():
-                self._run_export(out_dir, csv_path if do_csv.get() else '')
-            else:
-                self._write_csv(csv_path)
+                self._run_export(out_dir, merged if do_merged.get() else '')
+            elif do_merged.get():
+                self._export_merged(merged)
 
         self._mk_button(foot, "Appliquer", run, bg=COLORS['accent']).pack(side='right')
         self._mk_button(foot, "Fermer", win.destroy).pack(side='right', padx=6)
+        self._mk_button(foot, "Enregistrer les corrections maintenant",
+                        lambda: (self.corrections.__setattr__('dirty', True),
+                                 self._autosave())).pack(side='left')
         win.bind('<Escape>', lambda e: win.destroy())
 
-    def _write_csv(self, path: str) -> bool:
-        """Écrit le CSV corrigé et l'adopte comme nouvelle référence."""
+    def _choose_corrections_file(self) -> None:
+        """Change de fichier de corrections (ou en reprend un existant)."""
+        path = filedialog.asksaveasfilename(
+            title="Fichier de corrections (créé ou repris)",
+            initialdir=os.path.dirname(self.corrections.path or self.csv_path),
+            initialfile=os.path.basename(self.corrections.path or ''),
+            defaultextension='.csv',
+            filetypes=[("Fichiers CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+            confirmoverwrite=False)
+        if not path:
+            return
+        if self.csv_path and os.path.abspath(path) == os.path.abspath(self.csv_path):
+            messagebox.showerror("Fichier de corrections",
+                                 "Ce fichier est le relevé chargé : il doit rester intact.")
+            return
+        self.corrections.path = path
+        paths = dict(self.cfg.get('corr_paths', {}))
+        paths[self.csv_path] = path
+        self.cfg['corr_paths'] = dict(list(paths.items())[-20:])
+        save_config(self.cfg)
+        if os.path.isfile(path) and messagebox.askyesno(
+                "Fichier de corrections",
+                f"{os.path.basename(path)} existe déjà.\n\n"
+                "Reprendre les corrections qu'il contient ?"):
+            try:
+                n_ok, n_miss = self.corrections.load(self.by_photo)
+                self._set_status(f"{n_ok} correction(s) reprises"
+                                 + (f", {n_miss} sans correspondance" if n_miss else ''),
+                                 COLORS['edit'])
+                self.rebuild_graph()
+            except Exception as exc:
+                messagebox.showerror("Fichier de corrections", str(exc))
+        else:
+            self.corrections.dirty = True
+            self._autosave()
+        self._refresh_edit_panel()
+
+    def _export_merged(self, path: str) -> bool:
+        """Écrit un relevé complet corrigé, sans rien changer aux fichiers de travail."""
         try:
             n_mod, n_keep, added = write_corrected_csv(self.csv_path, path, self.stations)
         except Exception as exc:
-            messagebox.showerror("CSV corrigé", f"Écriture impossible :\n{exc}")
+            messagebox.showerror("Relevé corrigé", f"Écriture impossible :\n{exc}")
             return False
-        old_side = self.corrections.sidecar_path()
-        for st in self.stations:                     # le fichier écrit fait foi
-            st.ox, st.oy, st.oz, st.oyaw = st.x, st.y, st.z, st.yaw_fix
-        self.csv_path = path
-        self.cfg['csv_path'] = path
-        self.corrections.csv_path = path
-        try:
-            if old_side and os.path.isfile(old_side):
-                os.remove(old_side)                  # corrections désormais dans le CSV
-        except Exception:
-            pass
-        save_config(self.cfg)
-        self._refresh_side()
-        self._draw_overlay()
-        self._draw_plan()
-        self._set_status(f"CSV corrigé écrit : {n_mod} ligne(s) modifiée(s), "
+        self._set_status(f"Relevé corrigé écrit : {n_mod} ligne(s) modifiée(s), "
                          f"{n_keep} recopiée(s) → {path}", COLORS['ok'])
-        messagebox.showinfo("CSV corrigé", (
+        messagebox.showinfo("Relevé corrigé", (
             f"{n_mod} ligne(s) corrigée(s), {n_keep} recopiée(s) à l'identique.\n\n{path}\n\n"
-            + ("Colonne « " + YAW_COLUMN + " » ajoutée : elle porte l'orientation, "
-               "la colonne « % NORD » reste inchangée.\n\n" if added else "")
-            + "Ce fichier devient la référence de l'outil ; le relevé d'origine "
-              "est intact."))
+            + ("Colonne « " + YAW_COLUMN + " » ajoutée pour l'orientation ; "
+               "« % NORD » reste inchangée.\n\n" if added else "")
+            + "Le relevé chargé et le fichier de corrections ne sont pas modifiés."))
         return True
 
-    def _run_export(self, out_dir: str, csv_after: str = '') -> None:
-        """Applique les Δ nord aux images (copies), puis écrit le CSV remis à 0."""
+    def _run_export(self, out_dir: str, merged_after: str = '') -> None:
+        """Applique les Δ nord aux images (copies), puis met à jour les fichiers."""
         todo = [s for s in self.stations if s.has_yaw() and self.store.has(s.photo)]
         absent = len(Corrections.pending_images(self.stations)) - len(todo)
         win = tk.Toplevel(self)
@@ -2832,14 +2947,15 @@ class BubbleNavApp(_TkBase):
             except Exception as exc:
                 self._post(lambda: (win.destroy(), messagebox.showerror("Export", str(exc))))
                 return
-            done_ok = {s.photo for s in todo} if not errors and not skipped else set()
+            failed = {e.split(' : ')[0] for e in errors}
+            applied = {s.photo for s in todo if s.photo not in failed} if not cancel.is_set() else set()
             self._post(self._export_done, win, out_dir, ok, skipped + absent,
-                       errors, done_ok, csv_after)
+                       errors, applied, merged_after)
 
         threading.Thread(target=work, name='bubblenav-export', daemon=True).start()
 
     def _export_done(self, win, out_dir: str, ok: int, skipped: int, errors: List[str],
-                     applied: set, csv_after: str) -> None:
+                     applied: set, merged_after: str) -> None:
         try:
             win.destroy()
         except Exception:
@@ -2852,16 +2968,21 @@ class BubbleNavApp(_TkBase):
         self._set_status(f"Orientation appliquée : {ok} image(s) → {out_dir}",
                          COLORS['ok'] if not errors else COLORS['warning'])
         if applied:
-            # Les images portent l'angle : le CSV écrit doit repartir de zéro.
+            # Les images portent l'angle : la correction est consommée.
             for st in self.stations:
                 if st.photo in applied:
                     self.corrections.apply(st, yaw_fix=0.0, record=False)
-            msg += "\n\nΔ nord remis à 0 pour ces bulles."
-        if csv_after:
-            if self._write_csv(csv_after):
-                msg += "\nCSV corrigé écrit."
+            self.corrections.mark_applied(applied)
+            self._autosave()
+            msg += ("\n\nΔ nord remis à 0 et date d'application inscrite dans "
+                    f"{os.path.basename(self.corrections.path)}.")
+        if merged_after:
+            if self._export_merged(merged_after):
+                msg += "\nRelevé complet corrigé écrit."
         else:
             messagebox.showinfo("Orientation appliquée", msg)
+        self._refresh_side()
+        self._draw_overlay()
         if applied and messagebox.askyesno(
                 "Orientation appliquée",
                 msg + "\n\nBasculer le visualiseur sur le dossier des images "
@@ -3231,17 +3352,19 @@ class BubbleNavApp(_TkBase):
             "ÉDITION  (touche E) — rien n'est modifié sur le disque en direct\n"
             "  • Cible = bulle active, ou pastille cliquée\n"
             "  • Maj + glisser dans la vue : tourner l'image sous les pastilles.\n"
-            "    L'angle est une DONNÉE : colonne « Delta Nord (deg) » du CSV,\n"
-            "    appliquée à l'affichage. « % NORD » reste à 50, les images\n"
-            "    d'origine ne sont jamais écrasées.\n"
+            "    L'angle est une DONNÉE, écrite dans le FICHIER DE CORRECTIONS\n"
+            "    (relevé_corrections.csv) et appliquée à l'affichage. Le relevé\n"
+            "    chargé et les images d'origine ne sont jamais modifiés.\n"
             "  • Glisser une pastille : la déplacer au sol (azimut + éloignement)\n"
             "  • Ctrl + glisser : déplacer la bulle active elle-même\n"
             "  • Glisser un point du plan : position X/Y en vue de dessus\n"
             "  • Champs X/Y/Z, pas réglable, Page haut/bas pour l'altitude\n"
-            "  • Ctrl+Z annule · « Réinit. » revient aux valeurs du CSV\n"
-            "  • « Appliquer / enregistrer… » (Ctrl+S) : bilan puis traitement par\n"
-            "    lot — copie corrigée du CSV, et si vous le demandez, rotation des\n"
-            "    images dans un NOUVEAU dossier (Δ nord alors remis à 0)\n"
+            "  • Corrections enregistrées en continu dans leur propre fichier ;\n"
+            "    « Fichier… » permet d'en reprendre un autre\n"
+            "  • Ctrl+Z annule · « Réinit. » revient aux valeurs du relevé\n"
+            "  • « Appliquer / enregistrer… » (Ctrl+S) : bilan, puis rotation des\n"
+            "    images dans un NOUVEAU dossier (Δ nord alors remis à 0) et, en\n"
+            "    option, écriture d'un relevé complet corrigé\n"
             "  • Les croix bleues sont les bulles voisines non retenues comme\n"
             "    pastilles : elles servent de repères pour juger l'orientation\n\n"
             "Si les pastilles ne tombent pas au bon endroit, ouvrez « Réglages… »\n"
@@ -3253,8 +3376,8 @@ class BubbleNavApp(_TkBase):
     # ═════════════════════════════════════════════════════════════════
     def _on_close(self) -> None:
         try:
-            if self.stations and any(s.modified() for s in self.stations):
-                self.corrections.save_sidecar(self.stations)
+            if self.stations and self.corrections.dirty:
+                self.corrections.save(self.stations)
         except Exception:
             pass
         try:
@@ -3493,7 +3616,7 @@ def selftest(csv_path: str = '') -> int:
     check("regard horizontal : pas de point au sol", flat is None)
 
     # 7. Corrections : application, annulation, CSV corrige
-    print("\n7) Corrections de position et écriture du CSV")
+    print("\n7) Fichier de corrections et relevé complet")
     import shutil
     import tempfile
     tmp = tempfile.mkdtemp(prefix='bubblenav_')
@@ -3519,12 +3642,48 @@ def selftest(csv_path: str = '') -> int:
             check("annulation (Ctrl+Z)", not sts[9].turned())
             corr.apply(sts[9], yaw_fix=1.25)
 
-            side = corr.save_sidecar(sts)
+            before = open(work_csv, 'rb').read()
+            side = corr.save(sts)
+            check("fichier de corrections écrit",
+                  bool(side) and side.endswith(Corrections.SUFFIX)
+                  and os.path.isfile(side), os.path.basename(side or ''))
+            corr_lines = _read_text(side).splitlines()
+            check("une ligne par bulle corrigée seulement", len(corr_lines) == 4,
+                  f"{len(corr_lines) - 1} ligne(s)")
+            check("en-tête du fichier de corrections",
+                  corr_lines[0].split(';')[:6] ==
+                  ['Fichier photo', 'Nom du Locator', 'X', 'Y', 'Z', YAW_COLUMN],
+                  corr_lines[0][:60])
+            check("le relevé chargé n'est pas touché",
+                  open(work_csv, 'rb').read() == before)
+
             sts2, _ = read_survey_csv(work_csv)
-            n = Corrections(work_csv).load_sidecar({s.photo: s for s in sts2})
-            check("sauvegarde de secours relue", n == 3
-                  and abs(sts2[0].x - sts[0].x) < 1e-9
-                  and abs(sts2[9].yaw_fix - 1.25) < 1e-9, f"{n} correction(s)")
+            by2 = {s.photo: s for s in sts2}
+            n_ok, n_miss = Corrections(work_csv).load(by2)
+            check("corrections relues et appliquées",
+                  n_ok == 3 and n_miss == 0
+                  and abs(by2[sts[0].photo].x - sts[0].x) < 5e-4
+                  and abs(by2[sts[9].photo].yaw_fix - 1.25) < 5e-5,
+                  f"{n_ok} appliquées, {n_miss} sans correspondance")
+            check("corrections relues = état modifié",
+                  by2[sts[0].photo].moved() and by2[sts[9].photo].turned()
+                  and Corrections.counts(sts2) == (2, 1))
+
+            with open(side, 'a', encoding='utf-8') as fh:
+                fh.write("PHOTO_INCONNUE;X;1.0;2.0;3.0;0.0;;;;;\r\n")
+            n_ok2, n_miss2 = Corrections(work_csv).load({s.photo: s for s in
+                                                         read_survey_csv(work_csv)[0]})
+            check("ligne sans correspondance signalée, pas fatale",
+                  n_ok2 == 3 and n_miss2 == 1, f"{n_ok2}/{n_miss2}")
+
+            corr.mark_applied([sts[9].photo])
+            corr.apply(sts[9], yaw_fix=0.0, record=False)
+            corr.save(sts)
+            reread = Corrections(work_csv)
+            reread.load({s.photo: s for s in read_survey_csv(work_csv)[0]})
+            check("date d'application conservée",
+                  sts[9].photo in reread.applied, str(reread.applied)[:60])
+            corr.apply(sts[9], yaw_fix=1.25, record=False)
 
             out_csv = os.path.join(tmp, 'corrige.csv')
             n_mod, n_keep, added = write_corrected_csv(work_csv, out_csv, sts)

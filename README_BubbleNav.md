@@ -91,18 +91,32 @@ portée des liaisons entre planchers.
 
 ## 5. Corriger le relevé depuis la vue (mode Édition)
 
-Touche **E** ou bouton « Édition ». Principe : **rien n'est modifié sur le disque
-pendant la vérification**. Toutes les corrections — position *et* orientation —
-sont des **données du CSV**, appliquées en direct à l'affichage. Les images
-d'origine ne sont jamais écrasées.
+Touche **E** ou bouton « Édition ». Trois fichiers, trois rôles :
 
-| Correction | Où elle vit | Effet immédiat |
+| Fichier | Rôle | Modifié par l'outil |
 |---|---|---|
-| Position X / Y / Z | colonnes `X` `Y` `Z` | la pastille se déplace |
-| Orientation | colonne **`Delta Nord (deg)`**, créée si absente | l'image tourne à l'écran |
+| Relevé chargé (`…MySurvey….csv`) | source, référence | **jamais** |
+| Images bulles (JPEG) | source | **jamais** (sauf lot final, vers un autre dossier) |
+| **`…_corrections.csv`** | corrections en cours | en continu |
 
-La colonne `% NORD` n'est **jamais** touchée : elle reste à 50 (nord au centre de
-l'image), conformément à votre chaîne de production.
+Toutes les corrections — position **et** orientation — vont dans le **fichier de
+corrections**, un CSV distinct écrit à côté du relevé. Elles s'appliquent en
+direct à l'affichage, sont relues automatiquement à la réouverture du relevé, et
+ne touchent ni le relevé ni les images.
+
+### Le fichier de corrections
+```
+Fichier photo;Nom du Locator;X;Y;Z;Delta Nord (deg);dX;dY;dZ;Orientation appliquee;Date
+CP1_GRA_TR6_BK_02_K256_20260416_01;K256_01;589.150;73.450;1.650;6.1077;+0.000;+0.000;+0.000;;2026-09-04 17:53
+```
+* une ligne par bulle corrigée, rien d'autre ;
+* `X` `Y` `Z` sont les valeurs **corrigées**, `dX` `dY` `dZ` l'écart au relevé —
+  relisible à l'œil pour contrôler une passe de correction ;
+* `Delta Nord (deg)` est l'angle **restant à appliquer** à l'image ;
+* `Orientation appliquee` porte la date une fois les images tournées ;
+* écriture atomique et continue : rien n'est perdu si l'outil se ferme ;
+* bouton « Fichier… » pour créer ou reprendre un autre fichier de corrections
+  (le choix est mémorisé pour ce relevé).
 
 ### Cible d'édition
 Le panneau affiche en permanence sur quoi vous travaillez : **bulle active**
@@ -117,9 +131,7 @@ cible). Le bouton « Bulle active » revient à la première.
   elles élargissent le jeu de repères pour juger la cohérence avec le réseau ;
 * « appliquer à ce plancher / tout le relevé » propage la même valeur si le
   décalage est systématique ;
-* à la réouverture du CSV corrigé, l'angle est relu et **réappliqué à
-  l'affichage** : on peut vérifier, ajuster, refermer, revenir — sans jamais
-  toucher aux JPEG.
+* la colonne `% NORD` du relevé n'est jamais touchée : elle reste à 50.
 
 ### Position X / Y / Z
 Trois gestes, au choix :
@@ -138,34 +150,30 @@ positionnée sur le décor qu'elle voit.
 > déplacer une pastille pour la faire coïncider avec ce qu'on voit reporterait
 > l'erreur d'angle dans les coordonnées.
 
-### Appliquer en fin de vérification  (bouton « Appliquer / enregistrer… », Ctrl+S)
-Une seule boîte, avec le bilan (positions modifiées, orientations modifiées,
-images portant un Δ nord) et deux traitements par lot, indépendants :
+### Appliquer en fin de vérification  (« Appliquer / enregistrer… », Ctrl+S)
+Une boîte donne le bilan (positions corrigées, orientations corrigées, images à
+tourner, fichiers concernés) et propose deux traitements par lot :
 
-1. **Écrire le CSV corrigé** (coché par défaut) — copie horodatée : mêmes
-   colonnes, séparateur, encodage et décimales, **seules les cellules modifiées
-   changent**, plus la colonne `Delta Nord (deg)` si elle manquait. Le relevé
-   d'origine n'est jamais touché ; le fichier écrit devient la référence de
-   l'outil.
-2. **Appliquer l'orientation aux images** (décoché par défaut) — écrit les JPEG
-   tournés dans un **autre dossier**, les originaux restant intacts. Rotation
-   cyclique **arrondie au pixel entier** (0,0225° de pas sur 16000 px) : aucune
+1. **Appliquer l'orientation aux images** — écrit les JPEG tournés dans un
+   **autre dossier**, les originaux restant intacts. Rotation cyclique
+   **arrondie au pixel entier** (0,0225° de pas sur 16000 px) : aucune
    interpolation, aucun flou ; tables de quantification et EXIF de la source
-   réutilisés, donc ré-encodage quasi transparent (écart mesuré 0,14/255,
-   taille de fichier inchangée). Comptez ~7 s et ~0,8 Go de mémoire par image
-   16000×8000 et par tâche (nombre de tâches réglable). Une fois les images
-   tournées, le CSV écrit dans la foulée porte **Δ nord = 0** pour ces bulles —
-   l'angle est passé dans les pixels, il ne doit plus être appliqué deux fois.
+   réutilisés, donc ré-encodage quasi transparent (écart mesuré 0,14/255, taille
+   de fichier inchangée). Comptez ~7 s et ~0,8 Go de mémoire par image
+   16000×8000 et par tâche (nombre de tâches réglable). Les angles appliqués
+   repassent alors à 0 dans le fichier de corrections, avec la date
+   d'application — impossible de les appliquer deux fois.
+2. **Écrire aussi un relevé complet corrigé** (facultatif) — relevé d'origine +
+   corrections fusionnés en un CSV unique, pour une chaîne qui n'accepte qu'un
+   seul fichier. Le relevé chargé et le fichier de corrections ne bougent pas.
 
-Tant que l'étape 2 n'est pas lancée, le relevé reste entièrement réversible.
+Tant que le lot n'est pas lancé, tout reste réversible.
 
 ### Filet de sécurité
 * **Ctrl+Z** annule ; un glisser complet compte pour une seule étape ;
-* « Réinit. cible » et « Réinit. tout » ramènent aux valeurs du CSV ;
-* chaque correction est **auto-enregistrée** dans un fichier compagnon
-  `<relevé>.csv.corrections.json` — rien n'est perdu si l'outil est fermé, et il
-  propose de les reprendre à la réouverture ; ce fichier est supprimé une fois
-  les corrections écrites dans le CSV.
+* « Réinit. cible » et « Réinit. tout » ramènent aux valeurs du relevé ;
+* une ligne du fichier de corrections dont la photo n'existe pas dans le relevé
+  est signalée et ignorée, jamais bloquante.
 
 ### Survol d'une pastille
 Une infobulle donne le nom, le fichier photo, la **distance 3D**, la distance
@@ -204,8 +212,10 @@ python BubbleNav_XPhase.py --selftest
 Contrôle les angles, la réciprocité azimut ↔ image, la **cohérence entre la position
 calculée des pastilles et le rendu réel** (écart mesuré < 2 px), la lecture du CSV, la
 construction du réseau, les temps de rendu, l'aller-retour **écran ↔ sol** utilisé pour
-déplacer une pastille, l'écriture du CSV corrigé (colonne Δ nord créée puis réutilisée,
-seules les lignes modifiées changent), et l'équivalence **image tournée de Δ ≡ vue décalée de Δ** — autrement dit, ce que vous
+déplacer une pastille, l'aller-retour du fichier de corrections (écriture, relecture, ligne orpheline,
+date d'application) avec relevé source inchangé octet pour octet, l'écriture du relevé
+complet corrigé (colonne Δ nord créée puis réutilisée, seules les lignes modifiées
+changent), et l'équivalence **image tournée de Δ ≡ vue décalée de Δ** — autrement dit, ce que vous
 voyez en réglant l'orientation est exactement ce que l'application par lot écrira dans
 le JPEG.
 
