@@ -39,6 +39,7 @@ import time
 import unicodedata
 from bisect import insort
 from collections import OrderedDict, defaultdict
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -69,6 +70,8 @@ RAY_CACHE_SIZE = 8             # LRU des grilles de rayons (par fov/taille)
 SRC_WIDTH_CHOICES = (2048, 4096, 8192)
 SRC_WIDTH_DEFAULT = 4096
 IMG_CACHE_DEFAULT = 12         # bulles decodees gardees en memoire
+MEMORY_BUDGET_MB = 1100        # enveloppe memoire visee pour le cache
+JPEG_QUALITY_FALLBACK = 95     # si les tables de la source sont illisibles
 PREFETCH_WORKERS = 4
 
 # Reseau
@@ -106,6 +109,9 @@ COLORS = {
     'plan_missing': '#5a4040',
     'plan_here': '#ffd24a',
     'plan_cone': '#ffd24a',
+    'edit': '#ff9f43',         # mode edition / bulle modifiee
+    'sel': '#00e5ff',          # cible d'edition
+    'tip_bg': '#0d0d0d',
 }
 
 F_UI = ('Segoe UI', 9)
@@ -193,6 +199,7 @@ DEFAULT_CONFIG = {
     'floor_radius': FLOOR_RADIUS_DEFAULT,
     'show_labels': True,
     'keep_heading': True,
+    'export_workers': 2,       # panoramas 16000x8000 : ~800 Mo par tache
 }
 
 
@@ -241,6 +248,20 @@ class Station:
     z: float            # Altitude camera (m)
     north_pct: float    # colonne du nord dans l'image, en % de la largeur
     floor: str
+    yaw_fix: float = 0.0   # correction d'orientation A APPLIQUER A L'IMAGE (deg)
+    ox: float = 0.0        # valeurs lues dans le CSV (reference pour annuler)
+    oy: float = 0.0
+    oz: float = 0.0
+
+    def moved(self, tol: float = 1e-4) -> bool:
+        return (abs(self.x - self.ox) > tol or abs(self.y - self.oy) > tol
+                or abs(self.z - self.oz) > tol)
+
+    def turned(self, tol: float = 1e-4) -> bool:
+        return abs(self.yaw_fix) > tol
+
+    def modified(self) -> bool:
+        return self.moved() or self.turned()
 
 
 COL_ALIASES = {
@@ -265,15 +286,20 @@ def _sniff_delimiter(sample: str) -> str:
     return best if counts[best] > 0 else ';'
 
 
-def _read_text(path: str) -> str:
+def _read_text_enc(path: str) -> Tuple[str, str]:
+    """Lit un fichier texte et retourne (contenu, encodage retenu)."""
     for enc in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
         try:
             with open(path, 'r', encoding=enc, newline='') as fh:
-                return fh.read()
+                return fh.read(), enc
         except UnicodeDecodeError:
             continue
     with open(path, 'r', encoding='latin-1', errors='replace', newline='') as fh:
-        return fh.read()
+        return fh.read(), 'latin-1'
+
+
+def _read_text(path: str) -> str:
+    return _read_text_enc(path)[0]
 
 
 def read_survey_csv(path: str) -> Tuple[List[Station], List[str]]:
@@ -337,13 +363,15 @@ def read_survey_csv(path: str) -> Tuple[List[Station], List[str]]:
             warns.append(f"ligne {lineno} : doublon de « {photo} » — ignoree")
             continue
         seen[key] = len(stations)
+        zv = 0.0 if z is None else z
         stations.append(Station(
             idx=len(stations),
             photo=photo,
             locator=cell(row, 'locator') or photo,
-            x=x, y=y, z=(0.0 if z is None else z),
+            x=x, y=y, z=zv,
             north_pct=north,
             floor=cell(row, 'floor') or '—',
+            ox=x, oy=y, oz=zv,
         ))
 
     if not stations:
@@ -572,6 +600,351 @@ def nearest_station(stations: Sequence[Station], x: float, y: float,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CORRECTIONS : POSITION XYZ (CSV) ET ORIENTATION (IMAGE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ground_from_screen(view: View, col: float, row: float, calib: Calib,
+                       north_pct: float, dz: float,
+                       max_dist: float = 80.0) -> Optional[Tuple[float, float]]:
+    """Point du sol visé à l'écran : (azimut deg, distance horizontale m).
+
+    `dz` est l'altitude du plan visé par rapport à la caméra (négatif = sous
+    l'observateur). Calcul exact : intersection du rayon caméra avec ce plan.
+    Retourne None si le rayon ne rencontre pas le plan (regard trop horizontal).
+    """
+    f = view.focal()
+    xg = col - view.width / 2.0
+    yg = row - view.height / 2.0
+    norm = math.sqrt(f * f + xg * xg + yg * yg)
+    xc, yc, zc = f / norm, xg / norm, -yg / norm
+
+    yr, pr = math.radians(view.yaw), math.radians(view.pitch)
+    cy, sy = math.cos(yr), math.sin(yr)
+    cp, sp = math.cos(pr), math.sin(pr)
+    # monde = Rz(yaw) . Ry(-pitch) . camera   (même convention que le rendu)
+    wx = cy * cp * xc - sy * yc - cy * sp * zc
+    wy = sy * cp * xc + cy * yc - sy * sp * zc
+    wz = sp * xc + cp * zc
+
+    dh_unit = math.hypot(wx, wy)
+    if dh_unit < 1e-9:
+        return None
+    tan_elev = wz / dh_unit
+    if dz < 0:
+        if tan_elev > -1e-3:
+            return None
+    elif dz > 0:
+        if tan_elev < 1e-3:
+            return None
+    else:
+        return None
+    dist = dz / tan_elev
+    if not (0.05 <= dist <= max_dist):
+        return None
+    psi = math.degrees(math.atan2(wy, wx))
+    return calib.azimuth(psi, north_pct), dist
+
+
+class Corrections:
+    """Journal des corrections, annulation, sauvegarde de secours.
+
+    Deux natures de correction, volontairement distinctes :
+      * position XYZ  -> destinée au CSV corrigé ;
+      * orientation   -> destinée à l'IMAGE (rotation en lacet du panorama),
+                         le CSV conservant son « % NORD » d'origine.
+    """
+
+    SUFFIX = '.corrections.json'
+
+    def __init__(self, csv_path: str = ''):
+        self.csv_path = csv_path
+        self._undo: List[Tuple[str, dict]] = []
+        self._lock = threading.RLock()
+
+    # ── etat ─────────────────────────────────────────────────────────
+    @staticmethod
+    def snapshot(st: Station) -> dict:
+        return {'x': st.x, 'y': st.y, 'z': st.z, 'yaw_fix': st.yaw_fix}
+
+    @staticmethod
+    def restore(st: Station, snap: dict) -> None:
+        st.x = float(snap.get('x', st.x))
+        st.y = float(snap.get('y', st.y))
+        st.z = float(snap.get('z', st.z))
+        st.yaw_fix = float(snap.get('yaw_fix', st.yaw_fix))
+
+    def sidecar_path(self) -> str:
+        return (self.csv_path + self.SUFFIX) if self.csv_path else ''
+
+    # ── modifications ────────────────────────────────────────────────
+    def apply(self, st: Station, *, x: float = None, y: float = None,
+              z: float = None, yaw_fix: float = None, record: bool = True) -> None:
+        """Applique une correction, en empilant l'état précédent (annulation)."""
+        if record:
+            with self._lock:
+                self._undo.append((st.photo, self.snapshot(st)))
+                del self._undo[:-500]
+        if x is not None:
+            st.x = float(x)
+        if y is not None:
+            st.y = float(y)
+        if z is not None:
+            st.z = float(z)
+        if yaw_fix is not None:
+            st.yaw_fix = wrap180(float(yaw_fix))
+
+    def undo(self, by_photo: Dict[str, Station]) -> Optional[Station]:
+        with self._lock:
+            if not self._undo:
+                return None
+            photo, snap = self._undo.pop()
+        st = by_photo.get(photo)
+        if st is not None:
+            self.restore(st, snap)
+        return st
+
+    def can_undo(self) -> bool:
+        return bool(self._undo)
+
+    def revert(self, st: Station) -> None:
+        self.apply(st, x=st.ox, y=st.oy, z=st.oz, yaw_fix=0.0)
+
+    def revert_all(self, stations: Sequence[Station]) -> int:
+        n = 0
+        for st in stations:
+            if st.modified():
+                self.revert(st)
+                n += 1
+        return n
+
+    @staticmethod
+    def counts(stations: Sequence[Station]) -> Tuple[int, int]:
+        """(bulles déplacées, bulles réorientées)."""
+        return (sum(1 for s in stations if s.moved()),
+                sum(1 for s in stations if s.turned()))
+
+    # ── sauvegarde de secours ────────────────────────────────────────
+    def save_sidecar(self, stations: Sequence[Station]) -> str:
+        path = self.sidecar_path()
+        if not path:
+            return ''
+        data = {'csv': os.path.basename(self.csv_path), 'version': __version__,
+                'date': datetime.now().isoformat(timespec='seconds'),
+                'edits': {s.photo: self.snapshot(s) for s in stations if s.modified()}}
+        try:
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(data, fh, indent=1, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            return ''
+        return path
+
+    def load_sidecar(self, by_photo: Dict[str, Station]) -> int:
+        path = self.sidecar_path()
+        if not path or not os.path.isfile(path):
+            return 0
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            edits = data.get('edits', {})
+        except Exception:
+            return 0
+        n = 0
+        for photo, snap in edits.items():
+            st = by_photo.get(photo)
+            if st is None or not isinstance(snap, dict):
+                continue
+            self.restore(st, snap)
+            n += 1
+        return n
+
+
+def _format_like(sample: str, value: float, default_decimals: int = 3) -> str:
+    """Formate un nombre comme la cellule d'origine (décimales, séparateur)."""
+    sample = (sample or '').strip()
+    sep = ',' if (',' in sample and '.' not in sample) else '.'
+    frac = 0
+    for ch in ('.', ','):
+        if ch in sample:
+            frac = len(sample.rsplit(ch, 1)[1])
+            break
+    else:
+        frac = default_decimals
+    frac = min(max(frac, 1), 6)
+    out = f"{value:.{frac}f}"
+    return out.replace('.', sep) if sep == ',' else out
+
+
+def write_corrected_csv(src_csv: str, dst_csv: str,
+                        stations: Sequence[Station]) -> Tuple[int, int]:
+    """Écrit une copie du CSV où seules les cellules X/Y/Z modifiées changent.
+
+    Tout le reste est recopié à l'identique : colonnes, ordre, séparateur,
+    encodage, fins de ligne, décimales et lignes non modifiées. La colonne
+    « % NORD » n'est jamais touchée (l'orientation part dans l'image).
+
+    Retourne (lignes réécrites, lignes recopiées).
+    """
+    text, enc = _read_text_enc(src_csv)
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        raise ValueError("CSV source vide.")
+
+    delim = _sniff_delimiter(text)
+    header = [norm_key(c) for c in next(csv.reader([lines[0]], delimiter=delim))]
+    col: Dict[str, int] = {}
+    for field_name in ('photo', 'x', 'y', 'z'):
+        for alias in COL_ALIASES[field_name]:
+            if alias in header:
+                col[field_name] = header.index(alias)
+                break
+    if 'photo' not in col:
+        raise ValueError("Colonne « Fichier photo » introuvable dans le CSV source.")
+
+    changed = {s.photo.lower(): s for s in stations if s.moved()}
+    out: List[str] = [lines[0]]
+    n_mod = n_keep = 0
+    for raw in lines[1:]:
+        body = raw.rstrip('\r\n')
+        eol = raw[len(body):]
+        if not body.strip():
+            out.append(raw)
+            continue
+        try:
+            fields = next(csv.reader([body], delimiter=delim))
+        except Exception:
+            out.append(raw)
+            n_keep += 1
+            continue
+        key = base_name(fields[col['photo']]).lower() if col['photo'] < len(fields) else ''
+        st = changed.get(key)
+        if st is None:
+            out.append(raw)
+            n_keep += 1
+            continue
+        if '"' in body:                       # ligne avec guillemets : réécriture csv
+            for name, value in (('x', st.x), ('y', st.y), ('z', st.z)):
+                i = col.get(name, -1)
+                if 0 <= i < len(fields):
+                    fields[i] = _format_like(fields[i], value)
+            import io
+            buf = io.StringIO()
+            csv.writer(buf, delimiter=delim, lineterminator='').writerow(fields)
+            out.append(buf.getvalue() + eol)
+        else:                                  # cas courant : substitution en place
+            parts = body.split(delim)
+            for name, value in (('x', st.x), ('y', st.y), ('z', st.z)):
+                i = col.get(name, -1)
+                if 0 <= i < len(parts):
+                    parts[i] = _format_like(parts[i], value)
+            out.append(delim.join(parts) + eol)
+        n_mod += 1
+
+    tmp = dst_csv + '.tmp'
+    with open(tmp, 'w', encoding=enc, newline='') as fh:
+        fh.write(''.join(out))
+    os.replace(tmp, dst_csv)
+    return n_mod, n_keep
+
+
+def rotate_pano_file(src_path: str, dst_path: str, delta_deg: float) -> Tuple[int, int]:
+    """Écrit l'image tournée en lacet de `delta_deg` (rotation cyclique).
+
+    Le décalage est arrondi au pixel : sur un panorama 16000 px de large, le
+    pas vaut 0,0225° — aucune interpolation, donc aucun flou introduit. Les
+    tables de quantification JPEG et l'EXIF de la source sont conservés pour
+    limiter la perte au seul ré-encodage.
+
+    Retourne (largeur, décalage appliqué en pixels).
+    """
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(src_path) as im:
+        im.load()
+        w, h = im.size
+        shift = int(round(delta_deg / 360.0 * w)) % w
+        if shift == 0:
+            out = im.copy()
+        else:
+            out = Image.new(im.mode, (w, h))
+            out.paste(im.crop((w - shift, 0, w, h)), (0, 0))
+            out.paste(im.crop((0, 0, w - shift, h)), (shift, 0))
+        params = {}
+        ext = os.path.splitext(dst_path)[1].lower()
+        fmt = 'JPEG' if ext in ('.jpg', '.jpeg') else (im.format or 'PNG')
+        if ext in ('.jpg', '.jpeg'):
+            params['quality'] = JPEG_QUALITY_FALLBACK
+            qt = getattr(im, 'quantization', None)
+            if qt:
+                params['qtables'] = qt
+                params.pop('quality', None)
+            try:
+                from PIL import JpegImagePlugin
+                sub = JpegImagePlugin.get_sampling(im)
+                if sub in (0, 1, 2):
+                    params['subsampling'] = sub
+            except Exception:
+                pass
+            if im.info.get('progressive'):
+                params['progressive'] = True
+            params['optimize'] = False
+        exif = im.info.get('exif')
+        if exif:
+            params['exif'] = exif
+        icc = im.info.get('icc_profile')
+        if icc:
+            params['icc_profile'] = icc
+        tmp = dst_path + '.tmp'
+        out.save(tmp, format=fmt, **params)
+        out.close()
+    os.replace(tmp, dst_path)
+    return w, shift
+
+
+def export_rotated_images(stations: Sequence[Station], paths: Dict[str, str],
+                          out_dir: str, workers: int = 2,
+                          progress=None, cancel: "threading.Event" = None
+                          ) -> Tuple[int, int, List[str]]:
+    """Exporte les images dont l'orientation a été corrigée.
+
+    `workers` reste bas par défaut : un panorama 16000×8000 mobilise environ
+    800 Mo par tâche (source + destination décompressées).
+
+    Retourne (exportées, ignorées, erreurs).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    todo = [s for s in stations if s.turned() and s.photo.lower() in paths]
+    os.makedirs(out_dir, exist_ok=True)
+    errors: List[str] = []
+    done = 0
+
+    def one(st: Station) -> None:
+        src = paths[st.photo.lower()]
+        dst = os.path.join(out_dir, os.path.basename(src))
+        if os.path.abspath(dst) == os.path.abspath(src):
+            raise ValueError("destination identique à la source")
+        rotate_pano_file(src, dst, st.yaw_fix)
+
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        futures = {pool.submit(one, st): st for st in todo}
+        for fut in as_completed(futures):
+            st = futures[fut]
+            done += 1
+            try:
+                fut.result()
+            except Exception as exc:
+                errors.append(f"{st.photo} : {exc}")
+            if progress:
+                progress(done, len(todo), st.photo)
+            if cancel is not None and cancel.is_set():
+                for f in futures:
+                    f.cancel()
+                break
+    return done - len(errors), len(todo) - done, errors
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CHARGEMENT DES IMAGES (cache LRU + prechargement)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -630,6 +1003,18 @@ class ImageStore:
         with self._lock:
             self.cache_size = max(2, int(size))
             self._trim()
+
+    def frame_mb(self) -> float:
+        """Mémoire occupée par une bulle décodée (équirectangulaire 2:1)."""
+        w = self.src_width
+        return w * (w / 2.0) * 3 / (1024.0 * 1024.0)
+
+    def effective_cache(self) -> int:
+        """Nombre de bulles réellement gardées : le réglage, plafonné par
+        l'enveloppe mémoire (une source 8192 pèse 96 Mo, une 16384 en pèserait
+        384 — le plafond évite de saturer la machine)."""
+        budget = max(1, int(MEMORY_BUDGET_MB / max(1.0, self.frame_mb())))
+        return max(2, min(self.cache_size, budget))
 
     def has(self, photo: str) -> bool:
         return photo.lower() in self._paths
@@ -712,7 +1097,8 @@ class ImageStore:
                 self._loading.discard(photo.lower())
 
     def _trim(self) -> None:
-        while len(self._cache) > self.cache_size:
+        limit = self.effective_cache()
+        while len(self._cache) > limit:
             self._cache.popitem(last=False)
 
     def _decode(self, path: str):
@@ -898,6 +1284,16 @@ class BubbleNavApp(_TkBase):
         self.view = View(fov=float(cfg.get('fov', FOV_DEFAULT)))
         self.hotspots: List[Hotspot] = []
         self._hover: Optional[int] = None
+        # Edition
+        self.corrections = Corrections()
+        self.by_photo: Dict[str, Station] = {}
+        self.selected: Optional[int] = None      # bulle en cours de modification
+        self._hs_drag = None                     # (idx station, dz, mode)
+        self._sync_ui = False                    # garde anti-boucle des widgets
+        self._hover_xy = None
+        self._plan_hit = None                    # deplacement sur le plan
+        self._autosave_job = None
+        self._graph_job = None
         self._frame_view: Optional[View] = None
         self._tk_img = None
         self._drag: Optional[Tuple[int, int, float, float]] = None
@@ -1055,6 +1451,15 @@ class BubbleNavApp(_TkBase):
                        activeforeground=COLORS['text'], bd=0, highlightthickness=0
                        ).pack(side='left', padx=8)
 
+        tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
+                                                         padx=8, pady=6)
+        self.edit_var = tk.BooleanVar(value=False)
+        self.edit_btn = self._mk_button(bar, "Édition  (E)", self._toggle_edit)
+        self.edit_btn.pack(side='left', padx=3, pady=4)
+        self.edit_lbl = tk.Label(bar, text="", bg=COLORS['bg_medium'],
+                                 fg=COLORS['edit'], font=F_UI_B)
+        self.edit_lbl.pack(side='left', padx=6)
+
         self._mk_button(bar, "Aide", self._dlg_help).pack(side='right', padx=(3, 10), pady=4)
         self._mk_button(bar, "Réglages…", self._dlg_settings).pack(side='right', padx=3, pady=4)
 
@@ -1069,7 +1474,10 @@ class BubbleNavApp(_TkBase):
                               highlightbackground=COLORS['border'])
         self.plan.pack(fill='x', padx=10)
         self.plan.bind('<Configure>', lambda e: self._draw_plan())
-        self.plan.bind('<Button-1>', self._on_plan_click)
+        self.plan.bind('<ButtonPress-1>', self._on_plan_press_left)
+        self.plan.bind('<B1-Motion>', self._on_plan_drag_left)
+        self.plan.bind('<ButtonRelease-1>', self._on_plan_release_left)
+        self.plan.bind('<Double-Button-1>', self._on_plan_double)
         self.plan.bind('<ButtonPress-3>', self._on_plan_press)
         self.plan.bind('<B3-Motion>', self._on_plan_drag)
         self.plan.bind('<MouseWheel>', self._on_plan_wheel)
@@ -1087,11 +1495,14 @@ class BubbleNavApp(_TkBase):
                              bg=COLORS['card'], fg=COLORS['text'], padx=8, pady=6)
         self.info.pack(fill='x', padx=10)
 
-        tk.Label(side, text="Voisins (double-clic pour y aller)", font=F_UI_B,
-                 bg=COLORS['bg_medium'], fg=COLORS['text']
-                 ).pack(anchor='w', padx=10, pady=(10, 2))
+        self._build_edit_panel(side)
+
+        self.nb_title = tk.Label(side, text="Voisins (double-clic pour y aller)",
+                                 font=F_UI_B, bg=COLORS['bg_medium'], fg=COLORS['text'])
+        self.nb_title.pack(anchor='w', padx=10, pady=(10, 2))
         wrap = tk.Frame(side, bg=COLORS['bg_medium'])
         wrap.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+        self.nb_wrap = wrap
         sb = tk.Scrollbar(wrap, orient='vertical')
         sb.pack(side='right', fill='y')
         self.nb_list = tk.Listbox(wrap, bg=COLORS['card'], fg=COLORS['text'],
@@ -1130,6 +1541,12 @@ class BubbleNavApp(_TkBase):
         self.bind('<BackSpace>', lambda e: self.go_back())
         self.bind('<Home>', lambda e: self._reset_view())
         self.bind('<F11>', lambda e: self._toggle_fullscreen())
+        self.bind('<e>', lambda e: self._toggle_edit())
+        self.bind('<E>', lambda e: self._toggle_edit())
+        self.bind('<Control-z>', lambda e: self._undo_edit())
+        self.bind('<Control-s>', lambda e: self._dlg_save_csv())
+        self.bind('<Prior>', lambda e: self._bump('z', +1))
+        self.bind('<Next>', lambda e: self._bump('z', -1))
         self.bind('<Escape>', lambda e: self.attributes('-fullscreen', False))
 
     # ═════════════════════════════════════════════════════════════════
@@ -1185,6 +1602,17 @@ class BubbleNavApp(_TkBase):
 
         self.floors = sorted({s.floor for s in stations})
         self.floor_cb.config(values=self.floors)
+        self.by_photo = {s.photo: s for s in stations}
+        self.corrections = Corrections(path)
+        self.selected = None
+        if os.path.isfile(self.corrections.sidecar_path()):
+            if messagebox.askyesno(
+                    "Corrections en attente",
+                    "Des corrections enregistrées accompagnent ce relevé "
+                    f"({os.path.basename(self.corrections.sidecar_path())}).\n\n"
+                    "Les reprendre ?"):
+                n = self.corrections.load_sidecar(self.by_photo)
+                self._set_status(f"{n} correction(s) reprise(s)", COLORS['edit'])
         self.rebuild_graph()
 
         msg = f"{len(stations)} bulles · {len(self.floors)} planchers · {os.path.basename(path)}"
@@ -1259,6 +1687,7 @@ class BubbleNavApp(_TkBase):
             self.history.append(self.current)
             del self.history[:-200]
         self.current = idx
+        self.selected = None
         st = self.stations[idx]
         if self.floor_var.get() != st.floor:
             self.floor_var.set(st.floor)
@@ -1305,10 +1734,16 @@ class BubbleNavApp(_TkBase):
         scale = DRAG_SCALE if interactive else 1.0
         w = max(64, int(self.view.width * scale))
         h = max(64, int(self.view.height * scale))
-        rv = View(self.view.yaw, self.view.pitch, self.view.fov, w, h)
+        # La correction d'orientation fait tourner l'image sous les pastilles :
+        # on echantillonne la source a (cap - correction), les pastilles
+        # (georeferencees, donc de reference) restant a leur place.
+        fix = self.stations[self.current].yaw_fix if self.current < len(self.stations) else 0.0
+        rv = View(wrap180(self.view.yaw - fix), self.view.pitch, self.view.fov, w, h)
+        dv = View(self.view.yaw, self.view.pitch, self.view.fov,
+                  self.view.width, self.view.height)
         with self._cv:
             self._req_seq += 1
-            self._req = (self._req_seq, self.current, rv, scale)
+            self._req = (self._req_seq, self.current, rv, dv, scale)
             self._cv.notify()
         if interactive:
             if self._idle_job:
@@ -1330,7 +1765,7 @@ class BubbleNavApp(_TkBase):
                 req, self._req = self._req, None
             if req is None or self._stop.is_set():
                 continue
-            seq, idx, rv, scale = req
+            seq, idx, rv, dv, scale = req
             try:
                 st = self.stations[idx]
             except Exception:
@@ -1355,9 +1790,9 @@ class BubbleNavApp(_TkBase):
             except Exception as exc:
                 self._post(self._set_status, f"Erreur de rendu : {exc}", COLORS['error'])
                 continue
-            self._post(self._publish, img, seq, rv, idx, scale)
+            self._post(self._publish, img, seq, rv, dv, idx, scale)
 
-    def _publish(self, img, seq: int, rv: View, idx: int, scale: float) -> None:
+    def _publish(self, img, seq: int, rv: View, dv: View, idx: int, scale: float) -> None:
         """Affiche une image rendue (thread principal uniquement)."""
         if self._stop.is_set() or seq <= self._shown_seq or idx != self.current:
             return
@@ -1367,7 +1802,7 @@ class BubbleNavApp(_TkBase):
                 img = img.resize((max(1, self.view.width), max(1, self.view.height)),
                                  Image.BILINEAR)
             self._shown_seq = seq
-            self._frame_view = View(rv.yaw, rv.pitch, rv.fov,
+            self._frame_view = View(dv.yaw, dv.pitch, dv.fov,
                                     self.view.width, self.view.height)
             self._tk_img = ImageTk.PhotoImage(img)
             self.canvas.delete('frame')
@@ -1377,9 +1812,10 @@ class BubbleNavApp(_TkBase):
             if scale == 1.0:
                 st = self.stations[idx]
                 n = len(self.links[idx]) if idx < len(self.links) else 0
+                fix = f" · Δnord {st.yaw_fix:+.2f}°" if st.turned() else ""
                 self._set_status(f"{st.locator} · {n} voisin(s) · "
                                  f"{len(self.hotspots)} pastille(s) en vue · "
-                                 f"{rv.width}×{rv.height}")
+                                 f"{rv.width}×{rv.height}{fix}")
         except Exception as exc:
             self._set_status(f"Affichage impossible : {exc}", COLORS['error'])
 
@@ -1431,19 +1867,29 @@ class BubbleNavApp(_TkBase):
     def _draw_overlay(self) -> None:
         view = self._frame_view
         self.canvas.delete('hs')
+        self.canvas.delete('tip')
         if view is None or self.current < 0:
             return
         self.hotspots = self._compute_hotspots(view)
         show_lbl = bool(self.labels_var.get())
+        if self.edit_mode:
+            self._draw_edit_refs(view)
         for i, hs in enumerate(self.hotspots):
             lk = hs.link
+            tgt = self.stations[lk.target]
             color = {'same': COLORS['hot'], 'up': COLORS['hot_up'],
                      'down': COLORS['hot_down']}[lk.kind]
-            missing = not self.store.has(self.stations[lk.target].photo)
+            missing = not self.store.has(tgt.photo)
             if missing:
                 color = COLORS['plan_missing']
+            if tgt.modified():
+                color = COLORS['edit']
             hovered = (i == self._hover)
             r = hs.radius * (1.25 if hovered else 1.0)
+            if self.edit_mode and self.selected == tgt.idx:
+                self.canvas.create_oval(hs.col - r * 1.6, hs.row - r * 0.95,
+                                        hs.col + r * 1.6, hs.row + r * 0.95,
+                                        outline=COLORS['sel'], width=2, tags='hs')
             self.canvas.create_oval(hs.col - r, hs.row - r * 0.55,
                                     hs.col + r, hs.row + r * 0.55,
                                     fill=color, outline=COLORS['hot_edge'],
@@ -1468,6 +1914,8 @@ class BubbleNavApp(_TkBase):
                                         fill='white' if hovered else '#e8e8e8',
                                         font=F_UI_B if hovered else F_UI, tags='hs')
         self._draw_hud(view)
+        if self._hover is not None and getattr(self, '_hover_xy', None):
+            self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
 
     def _draw_hud(self, view: View) -> None:
         st = self.station()
@@ -1477,10 +1925,19 @@ class BubbleNavApp(_TkBase):
         self.heading_lbl.config(
             text=f"cap {az:+07.1f}°  |  site {view.pitch:+05.1f}°  |  champ {view.fov:.0f}°")
         title = f"{st.locator}   ({st.floor})"
+        if st.turned():
+            title += f"   Δnord {st.yaw_fix:+.2f}°"
         self.canvas.create_text(15, 13, text=title, anchor='nw', fill='#000000',
                                 font=('Segoe UI', 12, 'bold'), tags='hs')
-        self.canvas.create_text(14, 12, text=title, anchor='nw', fill=COLORS['hot'],
+        self.canvas.create_text(14, 12, text=title, anchor='nw',
+                                fill=COLORS['edit'] if st.modified() else COLORS['hot'],
                                 font=('Segoe UI', 12, 'bold'), tags='hs')
+        if self.edit_mode:
+            self.canvas.create_text(
+                view.width / 2, view.height - 10, anchor='s', tags='hs',
+                fill=COLORS['edit'], font=('Segoe UI', 10, 'bold'),
+                text="MODE ÉDITION — Maj+glisser : tourner l'image · "
+                     "glisser une pastille : la déplacer · Ctrl+glisser : bulle active")
         # rose des vents : direction du nord dans la vue
         pr = project(view, self.calib.pano_yaw(0.0, st.north_pct), 0.0)
         if pr is not None:
@@ -1489,6 +1946,97 @@ class BubbleNavApp(_TkBase):
                 self.canvas.create_text(col, 34, text="N", fill='#ff6b6b',
                                         font=('Segoe UI', 12, 'bold'), tags='hs')
                 self.canvas.create_line(col, 44, col, 56, fill='#ff6b6b', width=2, tags='hs')
+
+    def _draw_edit_refs(self, view: View) -> None:
+        """Repères d'alignement : toutes les bulles proches, même non liées.
+
+        Elles servent à juger la cohérence de l'orientation de l'image avec
+        l'ensemble du réseau, et pas seulement avec les 8 pastilles retenues.
+        """
+        st = self.station()
+        if st is None:
+            return
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        linked = {lk.target for lk in self.links[self.current]} if self.current < len(self.links) else set()
+        radius = self.params.radius
+        for other in self.stations:
+            if other.idx == st.idx or other.idx in linked or other.floor != st.floor:
+                continue
+            dx, dy = other.x - st.x, other.y - st.y
+            if abs(dx) > radius or abs(dy) > radius:
+                continue
+            dh = math.hypot(dx, dy)
+            if dh > radius or dh < 1e-6:
+                continue
+            dz = (other.z - eye) - st.z
+            az = math.degrees(math.atan2(dx, dy))
+            elev = math.degrees(math.atan2(dz, dh))
+            pr = project(view, self.calib.pano_yaw(az, st.north_pct), elev)
+            if pr is None:
+                continue
+            col, row, _ = pr
+            if not (0 <= col <= view.width and 0 <= row <= view.height):
+                continue
+            self.canvas.create_line(col - 6, row, col + 6, row,
+                                    fill=COLORS['sel'], tags='hs')
+            self.canvas.create_line(col, row - 4, col, row + 4,
+                                    fill=COLORS['sel'], tags='hs')
+            self.canvas.create_text(col + 8, row - 7, anchor='w', text=other.locator,
+                                    fill=COLORS['sel'], font=F_UI, tags='hs')
+
+    def _draw_tooltip(self, x: int, y: int, hit: Optional[int]) -> None:
+        """Infobulle au survol : nom et attributs de la bulle visée."""
+        self.canvas.delete('tip')
+        if hit is None or hit >= len(self.hotspots):
+            return
+        hs = self.hotspots[hit]
+        lk = hs.link
+        st = self.station()
+        tgt = self.stations[lk.target]
+        sens = {'same': 'même plancher', 'up': 'niveau au-dessus',
+                'down': 'niveau en dessous'}[lk.kind]
+        lines = [
+            tgt.locator,
+            f"photo        {tgt.photo}",
+            f"distance 3D  {lk.dist:.2f} m",
+            f"horizontale  {lk.dist_h:.2f} m",
+            f"Δ altitude   {lk.dz:+.2f} m",
+            f"azimut       {lk.azimuth:+.1f}°",
+            f"X / Y / Z    {tgt.x:.2f} / {tgt.y:.2f} / {tgt.z:.2f}",
+            f"plancher     {tgt.floor}  ({sens})",
+            f"image        {'présente' if self.store.has(tgt.photo) else 'ABSENTE'}",
+        ]
+        if st is not None and st.idx != tgt.idx:
+            lines.append(f"cap depuis   {self.calib.pano_yaw(lk.azimuth, st.north_pct):+.1f}°"
+                         " dans l'image")
+        if tgt.modified():
+            marks = []
+            if tgt.moved():
+                marks.append(f"XYZ déplacé de {math.dist((tgt.x, tgt.y, tgt.z), (tgt.ox, tgt.oy, tgt.oz)):.2f} m")
+            if tgt.turned():
+                marks.append(f"image tournée de {tgt.yaw_fix:+.2f}°")
+            lines.append("modifié      " + ' · '.join(marks))
+
+        text = '\n'.join(lines)
+        item = self.canvas.create_text(x + 16, y + 16, anchor='nw', text=text,
+                                       fill=COLORS['text'], font=F_MONO, tags='tip')
+        bbox = self.canvas.bbox(item)
+        if not bbox:
+            return
+        x1, y1, x2, y2 = bbox
+        dx = dy = 0
+        if x2 + 8 > self.view.width:
+            dx = -(x2 - x1) - 32
+        if y2 + 8 > self.view.height:
+            dy = -(y2 - y1) - 32
+        if dx or dy:
+            self.canvas.move(item, dx, dy)
+            x1, y1, x2, y2 = self.canvas.bbox(item)
+        rect = self.canvas.create_rectangle(x1 - 8, y1 - 6, x2 + 8, y2 + 6,
+                                            fill=COLORS['tip_bg'],
+                                            outline=COLORS['edit'] if tgt.modified()
+                                            else COLORS['border'], tags='tip')
+        self.canvas.tag_lower(rect, item)
 
     def _hotspot_at(self, x: float, y: float) -> Optional[int]:
         best, best_d = None, float('inf')
@@ -1506,10 +2054,38 @@ class BubbleNavApp(_TkBase):
     # ═════════════════════════════════════════════════════════════════
     def _on_press(self, event) -> None:
         self.focus_set()
-        self._drag = (event.x, event.y, self.view.yaw, self.view.pitch)
         self._press_xy = (event.x, event.y)
+        self._hs_drag = None
+        if self.edit_mode and self.current >= 0:
+            eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+            st = self.station()
+            ctrl = bool(event.state & 0x0004)
+            shift = bool(event.state & 0x0001)
+            if shift:                                    # tourner l'image
+                self.corrections.apply(st)               # état avant le geste
+                self._hs_drag = ('yaw', self.current, st.yaw_fix, event.x)
+                return
+            if ctrl:                                     # deplacer la bulle active
+                pos = self._ground_target(event.x, event.y, -eye)
+                if pos is not None:
+                    self._set_target(None)
+                    self.corrections.apply(st)           # état avant le geste
+                    self._hs_drag = ('active', self.current, -eye,
+                                     pos[0], pos[1], st.x, st.y)
+                    return
+            hit = self._hotspot_at(event.x, event.y)
+            if hit is not None:
+                tgt = self.stations[self.hotspots[hit].link.target]
+                self._set_target(tgt.idx)
+                self.corrections.apply(tgt)              # état avant le geste
+                self._hs_drag = ('pastille', tgt.idx, (tgt.z - eye) - st.z)
+                return
+        self._drag = (event.x, event.y, self.view.yaw, self.view.pitch)
 
     def _on_drag(self, event) -> None:
+        if self._hs_drag is not None:
+            self._drag_edit(event)
+            return
         if self._drag is None:
             return
         x0, y0, yaw0, pitch0 = self._drag
@@ -1524,8 +2100,11 @@ class BubbleNavApp(_TkBase):
         moved = 0
         if getattr(self, '_press_xy', None):
             moved = abs(event.x - self._press_xy[0]) + abs(event.y - self._press_xy[1])
+        if self._hs_drag is not None:
+            self._end_edit_drag()
+            return
         self._drag = None
-        if moved <= 4:
+        if moved <= 4 and not self.edit_mode:
             hit = self._hotspot_at(event.x, event.y)
             if hit is not None:
                 self.goto(self.hotspots[hit].link.target)
@@ -1534,19 +2113,24 @@ class BubbleNavApp(_TkBase):
             self._render_full()
 
     def _on_motion(self, event) -> None:
+        self._hover_xy = (event.x, event.y)
         hit = self._hotspot_at(event.x, event.y)
         if hit != self._hover:
             self._hover = hit
             self.canvas.config(cursor='hand2' if hit is not None else 'fleur')
             self._draw_overlay()
+        self._draw_tooltip(event.x, event.y, hit)
 
     def _on_wheel(self, event, direction: int = 0) -> None:
         step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
         self._zoom(-6 * step)
 
     def _on_double(self, event) -> None:
-        """Double-clic dans le vide : recentre la vue sur ce point."""
-        if self._hotspot_at(event.x, event.y) is not None:
+        """Double-clic : rejoint la pastille visée, sinon recentre la vue."""
+        hit = self._hotspot_at(event.x, event.y)
+        if hit is not None:
+            if self.edit_mode:
+                self.goto(self.hotspots[hit].link.target)
             return
         view = self._frame_view or self.view
         f = view.focal()
@@ -1619,14 +2203,20 @@ class BubbleNavApp(_TkBase):
         if st is None or self.current >= len(self.links):
             return
         img_state = "présente" if self.store.has(st.photo) else "ABSENTE"
-        self.info.config(text=(
+        etat = ''
+        if st.moved():
+            etat += f"\nDÉPLACÉE de {math.dist((st.x, st.y, st.z), (st.ox, st.oy, st.oz)):.2f} m"
+        if st.turned():
+            etat += f"\nIMAGE À TOURNER de {st.yaw_fix:+.2f}°"
+        self.info.config(fg=COLORS['edit'] if st.modified() else COLORS['text'], text=(
             f"{st.locator}\n"
             f"photo   {st.photo}\n"
             f"image   {img_state}\n"
             f"X/Y/Z   {st.x:.2f} / {st.y:.2f} / {st.z:.2f}\n"
             f"nord    {st.north_pct:g} %\n"
-            f"plancher {st.floor}"
+            f"plancher {st.floor}" + etat
         ))
+        self._refresh_edit_panel()
         self.nb_list.delete(0, 'end')
         for lk in self.links[self.current]:
             tgt = self.stations[lk.target]
@@ -1635,6 +2225,496 @@ class BubbleNavApp(_TkBase):
             self.nb_list.insert('end',
                                 f"{mark} {tgt.locator:<12} {lk.dist:5.1f} m  "
                                 f"az {lk.azimuth:+06.1f}°{flag}")
+
+    # ═════════════════════════════════════════════════════════════════
+    # EDITION : POSITION XYZ (CSV) ET ORIENTATION (IMAGE)
+    # ═════════════════════════════════════════════════════════════════
+    def _build_edit_panel(self, side) -> None:
+        # Hôte défilant : le panneau reste utilisable sur un écran peu haut.
+        self.edit_host = tk.Frame(side, bg=COLORS['card'])
+        vsb = tk.Scrollbar(self.edit_host, orient='vertical')
+        vsb.pack(side='right', fill='y')
+        holder = tk.Canvas(self.edit_host, bg=COLORS['card'], highlightthickness=0,
+                           yscrollcommand=vsb.set)
+        holder.pack(side='left', fill='both', expand=True)
+        vsb.config(command=holder.yview)
+        self.edit_frame = tk.Frame(holder, bg=COLORS['card'], padx=8, pady=6)
+        win = holder.create_window((0, 0), window=self.edit_frame, anchor='nw')
+        self.edit_frame.bind('<Configure>',
+                             lambda e: holder.config(scrollregion=holder.bbox('all')))
+        holder.bind('<Configure>', lambda e: holder.itemconfigure(win, width=e.width))
+
+        def wheel(event, direction=0):
+            step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
+            holder.yview_scroll(-step, 'units')
+        for widget in (holder, self.edit_frame):
+            widget.bind('<MouseWheel>', wheel)
+            widget.bind('<Button-4>', lambda e: wheel(e, +1))
+            widget.bind('<Button-5>', lambda e: wheel(e, -1))
+
+        def label(parent, text, **kw):
+            return tk.Label(parent, text=text, font=F_UI, bg=COLORS['card'],
+                            fg=COLORS['text'], **kw)
+
+        # Cible d'edition
+        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        row.pack(fill='x')
+        label(row, "Cible :").pack(side='left')
+        self._mk_button(row, "Bulle active", lambda: self._set_target(None),
+                        bg=COLORS['bg_light']).pack(side='left', padx=4)
+        self.target_lbl = tk.Label(row, text="—", font=F_UI_B, bg=COLORS['card'],
+                                   fg=COLORS['sel'])
+        self.target_lbl.pack(side='left', padx=4)
+        label(self.edit_frame,
+              "clic sur une pastille = la prendre pour cible"
+              ).pack(anchor='w', pady=(0, 4))
+
+        # Position XYZ
+        tk.Label(self.edit_frame, text="Position (CSV corrigé)", font=F_UI_B,
+                 bg=COLORS['card'], fg=COLORS['accent']).pack(anchor='w')
+        grid = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        grid.pack(fill='x', pady=2)
+        self.pos_vars = {}
+        for i, axis in enumerate(('x', 'y', 'z')):
+            tk.Label(grid, text=axis.upper(), font=F_MONO, width=2, bg=COLORS['card'],
+                     fg=COLORS['text']).grid(row=i, column=0)
+            var = tk.StringVar(value='—')
+            self.pos_vars[axis] = var
+            ent = tk.Entry(grid, textvariable=var, width=11, font=F_MONO,
+                           bg=COLORS['bg_light'], fg=COLORS['text'], relief='flat',
+                           insertbackground=COLORS['text'])
+            ent.grid(row=i, column=1, padx=3, pady=1)
+            ent.bind('<Return>', lambda e: self._apply_position_fields())
+            self._mk_button(grid, "−", lambda a=axis: self._bump(a, -1)).grid(row=i, column=2)
+            self._mk_button(grid, "+", lambda a=axis: self._bump(a, +1)).grid(row=i, column=3, padx=2)
+        tk.Label(grid, text="pas", font=F_UI, bg=COLORS['card'],
+                 fg=COLORS['text_muted']).grid(row=0, column=4, padx=(8, 2))
+        self.step_var = tk.StringVar(value='0.05')
+        ttk.Combobox(grid, textvariable=self.step_var, width=5, state='readonly',
+                     style='BN.TCombobox', values=('0.01', '0.05', '0.10', '0.50')
+                     ).grid(row=1, column=4, padx=(8, 2))
+        self._mk_button(grid, "Appliquer", self._apply_position_fields,
+                        bg=COLORS['bg_light']).grid(row=2, column=4, padx=(8, 2))
+
+        # Orientation image
+        tk.Label(self.edit_frame, text="Orientation de l'image (Δ nord)", font=F_UI_B,
+                 bg=COLORS['card'], fg=COLORS['accent']).pack(anchor='w', pady=(8, 0))
+        self.yaw_var = tk.DoubleVar(value=0.0)
+        self.yaw_scale = tk.Scale(self.edit_frame, from_=-30, to=30, resolution=0.05,
+                                  orient='horizontal', variable=self.yaw_var,
+                                  command=self._on_yaw_slider, length=300,
+                                  showvalue=False, bg=COLORS['text_muted'],
+                                  fg=COLORS['text'], troughcolor=COLORS['bg_dark'],
+                                  highlightthickness=0, bd=0, sliderrelief='flat',
+                                  activebackground=COLORS['edit'])
+        self.yaw_scale.pack(fill='x')
+        # une manipulation du curseur = une seule étape annulable
+        self.yaw_scale.bind('<ButtonPress-1>',
+                            lambda e: self.station() and self.corrections.apply(self.station()))
+        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        row.pack(fill='x', pady=2)
+        for txt, d in (("−0,5°", -0.5), ("−0,05°", -0.05), ("+0,05°", 0.05), ("+0,5°", 0.5)):
+            self._mk_button(row, txt, lambda dd=d: self._nudge_yaw(dd)).pack(side='left', padx=2)
+        self.yaw_lbl = tk.Label(row, text="0,00°", font=F_MONO, bg=COLORS['card'],
+                                fg=COLORS['edit'])
+        self.yaw_lbl.pack(side='right')
+        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        row.pack(fill='x', pady=(0, 2))
+        label(row, "appliquer à :").pack(side='left')
+        self._mk_button(row, "ce plancher",
+                        lambda: self._spread_yaw('plancher')).pack(side='left', padx=3)
+        self._mk_button(row, "tout le relevé",
+                        lambda: self._spread_yaw('tout')).pack(side='left', padx=3)
+        label(self.edit_frame,
+              "Maj + glisser dans la vue = tourner l'image ;\n"
+              "glisser une pastille = la déplacer au sol ;\n"
+              "Ctrl + glisser = déplacer la bulle active."
+              ).pack(anchor='w', pady=(2, 6))
+
+        # Annulation et sorties
+        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        row.pack(fill='x', pady=2)
+        self._mk_button(row, "Annuler (Ctrl+Z)", self._undo_edit).pack(side='left')
+        self._mk_button(row, "Réinit. cible", self._revert_target).pack(side='left', padx=4)
+        self._mk_button(row, "Réinit. tout", self._revert_all).pack(side='left')
+        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        row.pack(fill='x', pady=4)
+        self._mk_button(row, "CSV corrigé…", self._dlg_save_csv,
+                        bg=COLORS['accent']).pack(side='left')
+        self._mk_button(row, "Images orientées…", self._dlg_export_images,
+                        bg=COLORS['accent']).pack(side='left', padx=6)
+        self.edit_count = tk.Label(self.edit_frame, text="aucune modification",
+                                   font=F_UI, bg=COLORS['card'], fg=COLORS['text_muted'])
+        self.edit_count.pack(anchor='w')
+
+    # ── bascule ──────────────────────────────────────────────────────
+    @property
+    def edit_mode(self) -> bool:
+        return bool(getattr(self, 'edit_var', None) and self.edit_var.get())
+
+    def _toggle_edit(self, force: Optional[bool] = None) -> None:
+        state = (not self.edit_mode) if force is None else bool(force)
+        self.edit_var.set(state)
+        if state:
+            self.nb_title.pack_forget()
+            self.nb_wrap.pack_forget()
+            self.edit_host.pack(fill='both', expand=True, padx=10, pady=(8, 10))
+            self.edit_btn.config(bg=COLORS['edit'], fg='#101010')
+            self._set_target(None)
+        else:
+            self.edit_host.pack_forget()
+            self.nb_title.pack(anchor='w', padx=10, pady=(10, 2))
+            self.nb_wrap.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+            self.edit_btn.config(bg=COLORS['bg_light'], fg=COLORS['text'])
+            self.selected = None
+        self._refresh_edit_panel()
+        self._draw_overlay()
+        self._draw_plan()
+
+    # ── cible ────────────────────────────────────────────────────────
+    def _edit_target(self) -> Optional[Station]:
+        if self.selected is not None and 0 <= self.selected < len(self.stations):
+            return self.stations[self.selected]
+        return self.station()
+
+    def _set_target(self, idx: Optional[int]) -> None:
+        self.selected = idx
+        self._refresh_edit_panel()
+        self._draw_overlay()
+        self._draw_plan()
+
+    def _refresh_edit_panel(self) -> None:
+        if not hasattr(self, 'target_lbl'):
+            return
+        st = self._edit_target()
+        if st is None:
+            return
+        who = "bulle active" if self.selected is None else "pastille"
+        self.target_lbl.config(text=f"{st.locator}  ({who})")
+        for axis in ('x', 'y', 'z'):
+            self.pos_vars[axis].set(f"{getattr(st, axis):.3f}")
+        self._sync_ui = True
+        try:
+            self.yaw_var.set(round(self.stations[self.current].yaw_fix, 2)
+                             if self.current >= 0 else 0.0)
+        finally:
+            self._sync_ui = False
+        self.yaw_lbl.config(text=f"{self.yaw_var.get():+.2f}°".replace('.', ','))
+        moved, turned = Corrections.counts(self.stations)
+        if moved or turned:
+            self.edit_count.config(
+                text=f"{moved} bulle(s) déplacée(s) · {turned} image(s) réorientée(s)",
+                fg=COLORS['edit'])
+            self.edit_lbl.config(text=f"✎ {moved} XYZ · {turned} nord")
+        else:
+            self.edit_count.config(text="aucune modification", fg=COLORS['text_muted'])
+            self.edit_lbl.config(text="")
+
+    # ── modifications ────────────────────────────────────────────────
+    def _after_edit(self, moved: bool = False, turned: bool = False) -> None:
+        """Suites d'une correction : rendu, réseau, panneau, sauvegarde."""
+        if turned:
+            self._request_render(force=True)
+        if moved:
+            if self._graph_job:
+                self.after_cancel(self._graph_job)
+            self._graph_job = self.after(300, self._rebuild_after_move)
+        self._refresh_side()
+        self._draw_overlay()
+        self._draw_plan()
+        if self._autosave_job:
+            self.after_cancel(self._autosave_job)
+        self._autosave_job = self.after(1200, self._autosave)
+
+    def _rebuild_after_move(self) -> None:
+        self._graph_job = None
+        self.rebuild_graph()
+
+    def _autosave(self) -> None:
+        self._autosave_job = None
+        path = self.corrections.save_sidecar(self.stations)
+        if path:
+            moved, turned = Corrections.counts(self.stations)
+            if moved or turned:
+                self._set_status(f"Corrections enregistrées ({moved} XYZ, {turned} nord) "
+                                 f"→ {os.path.basename(path)}")
+
+    def _apply_position_fields(self) -> None:
+        st = self._edit_target()
+        if st is None:
+            return
+        vals = {}
+        for axis in ('x', 'y', 'z'):
+            v = parse_float(self.pos_vars[axis].get())
+            if v is None:
+                messagebox.showwarning("Position", f"Valeur {axis.upper()} illisible.")
+                self._refresh_edit_panel()
+                return
+            vals[axis] = v
+        self.corrections.apply(st, **vals)
+        self._after_edit(moved=True)
+
+    def _bump(self, axis: str, sign: int) -> None:
+        st = self._edit_target()
+        if st is None:
+            return
+        step = parse_float(self.step_var.get()) or 0.05
+        self.corrections.apply(st, **{axis: getattr(st, axis) + sign * step})
+        self._after_edit(moved=True)
+
+    def _nudge_yaw(self, delta: float) -> None:
+        st = self.station()
+        if st is None:
+            return
+        self.corrections.apply(st, yaw_fix=st.yaw_fix + delta)
+        self.yaw_var.set(round(st.yaw_fix, 2))
+        self._after_edit(turned=True)
+
+    def _on_yaw_slider(self, _val=None) -> None:
+        st = self.station()
+        if st is None or getattr(self, '_sync_ui', False):
+            return
+        value = round(float(self.yaw_var.get()), 2)
+        if abs(value - st.yaw_fix) < 5e-3:
+            return
+        self.corrections.apply(st, yaw_fix=value, record=False)
+        self.yaw_lbl.config(text=f"{value:+.2f}°".replace('.', ','))
+        self._request_render(interactive=True)
+        self._refresh_edit_panel()
+        if self._autosave_job:
+            self.after_cancel(self._autosave_job)
+        self._autosave_job = self.after(1200, self._autosave)
+
+    def _spread_yaw(self, scope: str) -> None:
+        st = self.station()
+        if st is None:
+            return
+        value = st.yaw_fix
+        targets = [s for s in self.stations
+                   if scope == 'tout' or s.floor == st.floor]
+        if not messagebox.askyesno(
+                "Appliquer la correction d'orientation",
+                f"Appliquer Δ nord = {value:+.2f}° à {len(targets)} bulle(s) "
+                f"({'tout le relevé' if scope == 'tout' else st.floor}) ?\n\n"
+                "Les corrections déjà saisies sur ces bulles seront remplacées."):
+            return
+        for s in targets:
+            self.corrections.apply(s, yaw_fix=value)
+        self._after_edit(turned=True)
+        self._set_status(f"Δ nord {value:+.2f}° appliqué à {len(targets)} bulle(s)",
+                         COLORS['edit'])
+
+    def _undo_edit(self) -> None:
+        st = self.corrections.undo(self.by_photo)
+        if st is None:
+            self._set_status("Rien à annuler")
+            return
+        self._after_edit(moved=True, turned=True)
+        self._set_status(f"Annulation sur {st.locator}", COLORS['edit'])
+
+    def _revert_target(self) -> None:
+        st = self._edit_target()
+        if st is None or not st.modified():
+            return
+        self.corrections.revert(st)
+        self._after_edit(moved=True, turned=True)
+
+    def _revert_all(self) -> None:
+        moved, turned = Corrections.counts(self.stations)
+        if not (moved or turned):
+            return
+        if not messagebox.askyesno("Tout réinitialiser",
+                                   f"Annuler les {moved + turned} correction(s) ?"):
+            return
+        n = self.corrections.revert_all(self.stations)
+        self._after_edit(moved=True, turned=True)
+        self._set_status(f"{n} bulle(s) réinitialisée(s)", COLORS['edit'])
+
+    # ── deplacements a la souris ─────────────────────────────────────
+    def _ground_target(self, x: float, y: float, dz: float
+                       ) -> Optional[Tuple[float, float]]:
+        """Point du sol visé, exprimé en (Est, Nord) absolus."""
+        view = self._frame_view or self.view
+        st = self.station()
+        if st is None:
+            return None
+        res = ground_from_screen(view, x, y, self.calib, st.north_pct, dz)
+        if res is None:
+            return None
+        az, dist = res
+        a = math.radians(az)
+        return st.x + dist * math.sin(a), st.y + dist * math.cos(a)
+
+    def _drag_edit(self, event) -> None:
+        kind = self._hs_drag[0]
+        if kind == 'yaw':
+            _, idx, start, x0 = self._hs_drag
+            st = self.stations[idx]
+            deg_per_px = self.view.fov / max(1, self.view.width)
+            self.corrections.apply(st, yaw_fix=start + (event.x - x0) * deg_per_px,
+                                   record=False)
+            self.yaw_var.set(round(st.yaw_fix, 2))
+            self.yaw_lbl.config(text=f"{st.yaw_fix:+.2f}°".replace('.', ','))
+            self._request_render(interactive=True)
+            return
+        if kind == 'pastille':
+            _, idx, dz = self._hs_drag
+            pos = self._ground_target(event.x, event.y, dz)
+            if pos is None:
+                return
+            self.corrections.apply(self.stations[idx], x=pos[0], y=pos[1], record=False)
+        elif kind == 'active':
+            _, idx, dz, wx0, wy0, sx0, sy0 = self._hs_drag
+            pos = self._ground_target(event.x, event.y, dz)
+            if pos is None:
+                return
+            st = self.stations[idx]
+            self.corrections.apply(st, x=sx0 + (wx0 - pos[0]), y=sy0 + (wy0 - pos[1]),
+                                   record=False)
+        self._refresh_edit_panel()
+        self._draw_overlay()
+        self._draw_plan()
+
+    def _end_edit_drag(self) -> None:
+        kind = self._hs_drag[0] if self._hs_drag else None
+        self._hs_drag = None
+        if kind is None:
+            return
+        self._after_edit(moved=kind in ('pastille', 'active'), turned=kind == 'yaw')
+
+    # ── sorties ──────────────────────────────────────────────────────
+    def _dlg_save_csv(self) -> None:
+        moved, _ = Corrections.counts(self.stations)
+        if not moved:
+            messagebox.showinfo("CSV corrigé", "Aucune position modifiée.")
+            return
+        base, ext = os.path.splitext(os.path.basename(self.csv_path))
+        default = f"{base}_corrige_{datetime.now():%Y%m%d_%Hh%M}{ext or '.csv'}"
+        path = filedialog.asksaveasfilename(
+            title="Enregistrer le CSV corrigé (l'original n'est pas modifié)",
+            initialdir=os.path.dirname(self.csv_path), initialfile=default,
+            defaultextension=ext or '.csv',
+            filetypes=[("Fichiers CSV", "*.csv *.txt"), ("Tous les fichiers", "*.*")])
+        if not path:
+            return
+        if os.path.abspath(path) == os.path.abspath(self.csv_path):
+            messagebox.showerror("CSV corrigé",
+                                 "Choisissez un autre nom : le relevé d'origine "
+                                 "doit rester intact.")
+            return
+        try:
+            n_mod, n_keep = write_corrected_csv(self.csv_path, path, self.stations)
+        except Exception as exc:
+            messagebox.showerror("CSV corrigé", f"Écriture impossible :\n{exc}")
+            return
+        self._set_status(f"CSV corrigé écrit : {n_mod} ligne(s) modifiée(s), "
+                         f"{n_keep} recopiée(s) → {path}", COLORS['ok'])
+        messagebox.showinfo("CSV corrigé",
+                            f"{n_mod} ligne(s) corrigée(s), {n_keep} recopiée(s) "
+                            f"à l'identique.\n\n{path}\n\n"
+                            "La colonne « % NORD » n'a pas été touchée : "
+                            "l'orientation part dans les images.")
+
+    def _dlg_export_images(self) -> None:
+        _, turned = Corrections.counts(self.stations)
+        if not turned:
+            messagebox.showinfo("Images orientées", "Aucune orientation modifiée.")
+            return
+        missing = [s.photo for s in self.stations if s.turned() and not self.store.has(s.photo)]
+        if missing:
+            messagebox.showwarning("Images orientées",
+                                   f"{len(missing)} image(s) réorientée(s) sont "
+                                   "introuvables dans le dossier et seront ignorées.")
+        default = os.path.join(self.images_dir or os.path.expanduser('~'), '_oriente')
+        out_dir = filedialog.askdirectory(
+            title="Dossier de destination des images orientées",
+            initialdir=self.images_dir or None)
+        if not out_dir:
+            return
+        if os.path.abspath(out_dir) == os.path.abspath(self.images_dir or ''):
+            if not messagebox.askyesno(
+                    "Images orientées",
+                    "Le dossier choisi est celui des images source : les fichiers "
+                    "d'origine seraient écrasés.\n\nUtiliser plutôt "
+                    f"« {os.path.basename(default)} » à l'intérieur ?"):
+                return
+            out_dir = default
+        todo = [s for s in self.stations if s.turned() and self.store.has(s.photo)]
+        workers = max(1, int(self.cfg.get('export_workers', 2)))
+        minutes = len(todo) * 7.0 / workers / 60.0
+        if not messagebox.askyesno(
+                "Images orientées",
+                f"{len(todo)} image(s) à écrire dans :\n{out_dir}\n\n"
+                f"Sur des panoramas 16000×8000, comptez environ "
+                f"{minutes:.0f} min ({workers} tâche(s) en parallèle, "
+                f"~{workers * 0.8:.1f} Go de mémoire).\n\n"
+                "La rotation est faite au pixel entier et les tables JPEG de la "
+                "source sont réutilisées : aucun flou ajouté, ré-encodage minimal.\n\n"
+                "Lancer l'export ?"):
+            return
+        self._run_export(out_dir)
+
+    def _run_export(self, out_dir: str) -> None:
+        todo = [s for s in self.stations if s.turned() and self.store.has(s.photo)]
+        win = tk.Toplevel(self)
+        win.title("Export des images orientées")
+        win.configure(bg=COLORS['bg_dark'])
+        win.transient(self)
+        win.resizable(False, False)
+        lbl = tk.Label(win, text=f"0 / {len(todo)}", font=F_UI, bg=COLORS['bg_dark'],
+                       fg=COLORS['text'], padx=24, pady=10)
+        lbl.pack()
+        bar = ttk.Progressbar(win, length=380, maximum=max(1, len(todo)))
+        bar.pack(padx=24, pady=4)
+        cancel = threading.Event()
+        self._mk_button(win, "Interrompre", cancel.set).pack(pady=8)
+
+        def progress(done, total, photo):
+            self._post(lambda: (bar.config(value=done),
+                                lbl.config(text=f"{done} / {total} — {photo}")))
+
+        def work():
+            paths = {s.photo.lower(): self.store.path_of(s.photo) for s in todo}
+            try:
+                ok, skipped, errors = export_rotated_images(
+                    self.stations, paths, out_dir,
+                    workers=int(self.cfg.get('export_workers', 2)),
+                    progress=progress, cancel=cancel)
+            except Exception as exc:
+                self._post(lambda: (win.destroy(),
+                                    messagebox.showerror("Export", str(exc))))
+                return
+            self._post(self._export_done, win, out_dir, ok, skipped, errors)
+
+        threading.Thread(target=work, name='bubblenav-export', daemon=True).start()
+
+    def _export_done(self, win, out_dir: str, ok: int, skipped: int,
+                     errors: List[str]) -> None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        msg = f"{ok} image(s) écrite(s) dans :\n{out_dir}"
+        if skipped:
+            msg += f"\n{skipped} ignorée(s) (interruption)."
+        if errors:
+            msg += "\n\nErreurs :\n" + '\n'.join(errors[:10])
+        self._set_status(f"Export terminé : {ok} image(s) → {out_dir}",
+                         COLORS['ok'] if not errors else COLORS['warning'])
+        if ok and not errors and not skipped and messagebox.askyesno(
+                "Export terminé",
+                msg + "\n\nLes images exportées portent maintenant la correction.\n"
+                      "Basculer le visualiseur sur ce dossier et remettre les "
+                      "corrections d'orientation à zéro ?"):
+            for st in self.stations:
+                if st.turned():
+                    self.corrections.apply(st, yaw_fix=0.0, record=False)
+            self._refresh_edit_panel()
+            self._autosave()
+            self.set_images_dir(out_dir)
+            self._request_render(force=True)
+        else:
+            messagebox.showinfo("Export terminé", msg)
 
     # ═════════════════════════════════════════════════════════════════
     # PLAN (mini-carte)
@@ -1703,8 +2783,16 @@ class BubbleNavApp(_TkBase):
             x, y = to_screen(st.x, st.y)
             if -10 <= x <= w + 10 and -10 <= y <= h + 10:
                 col = COLORS['plan_pt'] if self.store.has(st.photo) else COLORS['plan_missing']
-                self.plan.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5,
-                                      fill=col, outline='')
+                r = 2.5
+                if st.modified():
+                    col, r = COLORS['edit'], 3.5
+                self.plan.create_oval(x - r, y - r, x + r, y + r, fill=col, outline='')
+                if st.modified() and st.moved():
+                    ox, oy = to_screen(st.ox, st.oy)
+                    self.plan.create_line(ox, oy, x, y, fill=COLORS['edit'], width=1)
+                if self.edit_mode and self.selected == st.idx:
+                    self.plan.create_oval(x - 7, y - 7, x + 7, y + 7,
+                                          outline=COLORS['sel'], width=2)
 
         cur = self.station()
         if cur is not None:
@@ -1736,21 +2824,62 @@ class BubbleNavApp(_TkBase):
         self.plan.create_text(8, h - 10, anchor='w', font=F_UI, fill=COLORS['text_muted'],
                               text=f"{len(pts)} bulles · molette: zoom · clic droit: déplacer")
 
-    def _on_plan_click(self, event) -> None:
+    def _plan_nearest(self, event, max_px: float = 20.0) -> Optional[int]:
         pts = self._plan_stations()
         if not pts:
-            return
+            return None
         w = max(50, int(self.plan.winfo_width()))
         h = max(50, int(self.plan.winfo_height()))
         to_screen, _ = self._plan_transform(pts, w, h)
-        best, best_d = None, 400.0
+        best, best_d = None, max_px * max_px
         for st in pts:
             x, y = to_screen(st.x, st.y)
             d = (x - event.x) ** 2 + (y - event.y) ** 2
             if d < best_d:
                 best, best_d = st.idx, d
-        if best is not None:
-            self.goto(best)
+        return best
+
+    def _on_plan_press_left(self, event) -> None:
+        self._plan_press = (event.x, event.y)
+        self._plan_hit = None
+        if not self.edit_mode:
+            return
+        idx = self._plan_nearest(event, 12.0)
+        if idx is not None:
+            self._set_target(idx)
+            self.corrections.apply(self.stations[idx])   # état avant le geste
+            self._plan_hit = idx
+
+    def _on_plan_drag_left(self, event) -> None:
+        """Vue de dessus : positionnement X/Y direct de la cible."""
+        if self._plan_hit is None:
+            return
+        pts = self._plan_stations()
+        w = max(50, int(self.plan.winfo_width()))
+        h = max(50, int(self.plan.winfo_height()))
+        _, to_world = self._plan_transform(pts, w, h)
+        wx, wy = to_world(event.x, event.y)
+        self.corrections.apply(self.stations[self._plan_hit], x=wx, y=wy, record=False)
+        self._refresh_edit_panel()
+        self._draw_plan()
+        self._draw_overlay()
+
+    def _on_plan_release_left(self, event) -> None:
+        if self._plan_hit is not None:
+            self._plan_hit = None
+            self._after_edit(moved=True)
+            return
+        press = getattr(self, '_plan_press', None)
+        if press and abs(event.x - press[0]) + abs(event.y - press[1]) <= 3 \
+                and not self.edit_mode:
+            idx = self._plan_nearest(event, 22.0)
+            if idx is not None:
+                self.goto(idx)
+
+    def _on_plan_double(self, event) -> None:
+        idx = self._plan_nearest(event, 22.0)
+        if idx is not None:
+            self.goto(idx)
 
     def _on_plan_press(self, event) -> None:
         self._plan_drag = (event.x, event.y, self._plan_view['ox'], self._plan_view['oy'])
@@ -1892,6 +3021,14 @@ class BubbleNavApp(_TkBase):
             self.cfg['cache_size'] = int(cache_var.get())
 
         slider(perf, "Bulles en mémoire", cache_var, 3, 60, 1, apply_cache)
+        tk.Label(perf, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
+                 anchor='w', text=(
+                     f"source {self.store.src_width} px : {self.store.frame_mb():.0f} Mo "
+                     f"par bulle, {self.store.effective_cache()} gardée(s) en mémoire")
+                 ).pack(fill='x')
+        exp_var = tk.IntVar(value=int(self.cfg.get('export_workers', 2)))
+        slider(perf, "Tâches d'export d'images", exp_var, 1, 8, 1,
+               lambda _=None: self.cfg.__setitem__('export_workers', int(exp_var.get())))
         keep_var = tk.BooleanVar(value=bool(self.cfg.get('keep_heading', True)))
         tk.Checkbutton(perf, text="Conserver le cap en changeant de bulle",
                        variable=keep_var, font=F_UI, anchor='w',
@@ -1938,6 +3075,19 @@ class BubbleNavApp(_TkBase):
             "PASTILLES\n"
             "  jaune = même plancher · bleu ▲ = niveau au-dessus\n"
             "  violet ▼ = niveau en dessous · rouge sombre = image absente\n\n"
+            "ÉDITION  (touche E)\n"
+            "  • Cible = bulle active, ou pastille cliquée\n"
+            "  • Maj + glisser dans la vue : tourner l'image sous les pastilles\n"
+            "    (la correction part dans l'IMAGE, le CSV reste à 50 %)\n"
+            "  • Glisser une pastille : la déplacer au sol (azimut + éloignement)\n"
+            "  • Ctrl + glisser : déplacer la bulle active elle-même\n"
+            "  • Glisser un point du plan : position X/Y en vue de dessus\n"
+            "  • Champs X/Y/Z, pas réglable, Page haut/bas pour l'altitude\n"
+            "  • Ctrl+Z annule · « Réinit. » revient aux valeurs du CSV\n"
+            "  • « CSV corrigé… » écrit une copie (X/Y/Z seuls)\n"
+            "  • « Images orientées… » écrit les JPEG tournés dans un autre dossier\n"
+            "  • Les croix bleues sont les bulles voisines non retenues comme\n"
+            "    pastilles : elles servent de repères pour juger l'orientation\n\n"
             "Si les pastilles ne tombent pas au bon endroit, ouvrez « Réglages… »\n"
             "et ajustez la calibration de l'azimut (effet immédiat)."
         ))
@@ -1946,6 +3096,11 @@ class BubbleNavApp(_TkBase):
     # FERMETURE
     # ═════════════════════════════════════════════════════════════════
     def _on_close(self) -> None:
+        try:
+            if self.stations and any(s.modified() for s in self.stations):
+                self.corrections.save_sidecar(self.stations)
+        except Exception:
+            pass
         try:
             self.cfg['fov'] = self.view.fov
             self.cfg['show_labels'] = bool(self.labels_var.get())
@@ -2150,6 +3305,129 @@ def selftest(csv_path: str = '') -> int:
             renderer.render(src, View(10.0 + k * 1.3, -10.0, FOV_DEFAULT, w, h))
         dt = (time.perf_counter() - t0) / n * 1000
         check(f"rendu {w}×{h} ({label})", dt < 120.0, f"{dt:.1f} ms/image ≈ {1000/dt:.0f} i/s")
+
+    # 6. Deplacement d'une pastille : ecran -> sol -> ecran
+    print("\n6) Déplacement d'une pastille (écran ↔ sol)")
+    cal = Calib('colonne', 1, 0.0)
+    worst_az = worst_d = 0.0
+    for view in (View(35.0, -22.0, 100.0, 1280, 720), View(-140.0, -35.0, 70.0, 900, 900)):
+        for az, dh, dz in ((10.0, 3.0, -1.65), (-40.0, 8.0, -1.65),
+                           (95.0, 5.0, -0.50), (150.0, 12.0, -1.65)):
+            elev = math.degrees(math.atan2(dz, dh))
+            pr = project(view, cal.pano_yaw(az, 50.0), elev)
+            if pr is None:
+                continue
+            back = ground_from_screen(view, pr[0], pr[1], cal, 50.0, dz)
+            if back is None:
+                check(f"sol visé (az={az}, d={dh})", False, "aucune intersection")
+                continue
+            worst_az = max(worst_az, abs(wrap180(back[0] - az)))
+            worst_d = max(worst_d, abs(back[1] - dh))
+    check("azimut retrouvé au pixel près", worst_az < 1e-6, f"écart max {worst_az:.2e}°")
+    check("distance retrouvée au pixel près", worst_d < 1e-6, f"écart max {worst_d:.2e} m")
+    flat = ground_from_screen(View(0, 0, 90, 640, 400), 320, 200, cal, 50.0, -1.65)
+    check("regard horizontal : pas de point au sol", flat is None)
+
+    # 7. Corrections : application, annulation, CSV corrige
+    print("\n7) Corrections de position et écriture du CSV")
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix='bubblenav_')
+    try:
+        if csv_path and os.path.isfile(csv_path):
+            work_csv = os.path.join(tmp, os.path.basename(csv_path))
+            shutil.copy2(csv_path, work_csv)
+            sts, _ = read_survey_csv(work_csv)
+            by_photo = {s.photo: s for s in sts}
+            corr = Corrections(work_csv)
+
+            corr.apply(sts[0], x=sts[0].x + 0.123, z=sts[0].z - 0.05)
+            corr.apply(sts[5], y=sts[5].y - 1.5)
+            corr.apply(sts[9], yaw_fix=1.25)
+            check("état modifié détecté", sts[0].moved() and sts[9].turned()
+                  and not sts[9].moved())
+            check("comptage des corrections", Corrections.counts(sts) == (2, 1),
+                  str(Corrections.counts(sts)))
+
+            corr.undo(by_photo)
+            check("annulation (Ctrl+Z)", not sts[9].turned())
+            corr.apply(sts[9], yaw_fix=1.25)
+
+            side = corr.save_sidecar(sts)
+            sts2, _ = read_survey_csv(work_csv)
+            n = Corrections(work_csv).load_sidecar({s.photo: s for s in sts2})
+            check("sauvegarde de secours relue", n == 3
+                  and abs(sts2[0].x - sts[0].x) < 1e-9
+                  and abs(sts2[9].yaw_fix - 1.25) < 1e-9, f"{n} correction(s)")
+
+            out_csv = os.path.join(tmp, 'corrige.csv')
+            n_mod, n_keep = write_corrected_csv(work_csv, out_csv, sts)
+            check("lignes réécrites", n_mod == 2 and n_keep == len(sts) - 2,
+                  f"{n_mod} modifiées, {n_keep} recopiées")
+
+            src_lines = _read_text(work_csv).splitlines()
+            dst_lines = _read_text(out_csv).splitlines()
+            diff = [i for i, (a, b) in enumerate(zip(src_lines, dst_lines)) if a != b]
+            check("seules les lignes corrigées changent",
+                  len(src_lines) == len(dst_lines) and len(diff) == 2, f"{len(diff)} ligne(s)")
+
+            sts3, _ = read_survey_csv(out_csv)
+            check("valeurs X/Y/Z relues",
+                  abs(sts3[0].x - sts[0].x) < 5e-4 and abs(sts3[0].z - sts[0].z) < 5e-4
+                  and abs(sts3[5].y - sts[5].y) < 5e-4)
+            check("colonne % NORD intacte",
+                  all(abs(a.north_pct - b.north_pct) < 1e-9 for a, b in zip(sts, sts3)))
+            check("décimales d'origine conservées",
+                  dst_lines[1].split(';')[2].count('.') == 1
+                  and len(dst_lines[1].split(';')[2].split('.')[1]) ==
+                  len(src_lines[1].split(';')[2].split('.')[1]),
+                  dst_lines[1].split(';')[2])
+
+            corr.revert_all(sts)
+            check("réinitialisation complète", Corrections.counts(sts) == (0, 0))
+
+        # 8. Rotation d'image : semantique et coherence avec le rendu
+        print("\n8) Rotation d'image (correction d'orientation)")
+        from PIL import Image
+        w, h = 1024, 512
+        rng = np.random.default_rng(3)
+        base = (rng.random((h, w, 3)) * 60).astype(np.uint8)
+        base[:, 300:316] = 250                      # bande repère
+        src_img = os.path.join(tmp, 'pano.jpg')
+        Image.fromarray(base).save(src_img, quality=95)
+
+        delta = 360.0 * 40 / w                      # 40 px pile
+        dst_img = os.path.join(tmp, 'pano_tourne.jpg')
+        wid, shift = rotate_pano_file(src_img, dst_img, delta)
+        check("décalage arrondi au pixel", (wid, shift) == (w, 40), f"{shift} px")
+
+        rot = np.asarray(Image.open(dst_img).convert('RGB'))
+        band = rot[:, :, 0].mean(axis=0)
+        peak = int(np.argmax(np.convolve(band, np.ones(16) / 16, mode='same')))
+        check("la bande repère se décale vers la droite", abs(peak - (308 + 40)) <= 2,
+              f"colonne {peak} au lieu de {308 + 40}")
+
+        renderer2 = PanoRenderer()
+        v1 = View(25.0, -10.0, 90.0, 480, 320)
+        a = renderer2.render(rot, v1).astype(float)
+        b = renderer2.render(np.asarray(Image.open(src_img).convert('RGB')),
+                             View(v1.yaw - delta, v1.pitch, v1.fov, v1.width, v1.height)
+                             ).astype(float)
+        ecart = float(np.abs(a - b).mean())
+        check("image tournée ≡ vue décalée du même angle", ecart < 6.0,
+              f"écart moyen {ecart:.2f}/255")
+
+        # export selectif
+        st_a = Station(0, 'pano', 'A', 0, 0, 0, 50, 'P0', yaw_fix=delta)
+        st_b = Station(1, 'autre', 'B', 1, 1, 0, 50, 'P0')
+        out_dir = os.path.join(tmp, 'sortie')
+        ok, skipped, errors = export_rotated_images(
+            [st_a, st_b], {'pano': src_img, 'autre': src_img}, out_dir, workers=1)
+        check("export limité aux images réorientées",
+              ok == 1 and not errors and os.listdir(out_dir) == ['pano.jpg'],
+              f"{ok} exportée(s), erreurs : {errors}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))

@@ -89,7 +89,72 @@ Section *Réseau* : portée des liens, nombre maximal de pastilles, séparation 
 minimale (une seule pastille par direction, pour ne pas empiler les bulles alignées) et
 portée des liaisons entre planchers.
 
-## 5. Performance
+## 5. Corriger le relevé depuis la vue (mode Édition)
+
+Touche **E** ou bouton « Édition ». Deux natures de correction, volontairement
+séparées :
+
+| Correction | Destination | Le CSV « % NORD » |
+|---|---|---|
+| Orientation de l'image | le **fichier JPEG**, tourné en lacet | reste à 50 % |
+| Position X / Y / Z | un **CSV corrigé** (copie) | inchangé |
+
+### Cible d'édition
+Le panneau affiche en permanence sur quoi vous travaillez : **bulle active**
+(celle d'où vous regardez) ou **pastille** (cliquez-en une pour la prendre pour
+cible). Le bouton « Bulle active » revient à la première.
+
+### Orientation de l'image
+* **Maj + glisser** dans la vue, ou le curseur Δ nord, ou les pas ±0,05° / ±0,5° ;
+* l'**image tourne sous les pastilles** — les pastilles, géoréférencées, sont la
+  référence : on aligne le décor sur elles ;
+* les **croix bleues** sont les bulles voisines non retenues comme pastilles :
+  elles élargissent le jeu de repères pour juger la cohérence avec le réseau ;
+* « appliquer à ce plancher / tout le relevé » propage la même valeur si le
+  décalage est systématique ;
+* « **Images orientées…** » écrit les JPEG tournés dans un **autre dossier**. La
+  rotation est cyclique et **arrondie au pixel entier** (0,0225° de pas sur
+  16000 px) : aucune interpolation, aucun flou ; les tables de quantification et
+  l'EXIF de la source sont réutilisés, donc le ré-encodage est quasi transparent
+  (écart mesuré 0,14/255 en moyenne, taille de fichier inchangée).
+  Comptez ~7 s et ~0,8 Go de mémoire par image 16000×8000 et par tâche ; le
+  nombre de tâches se règle dans « Réglages… → Performance ».
+  L'export terminé, l'outil propose de basculer sur le dossier exporté et de
+  remettre les corrections à zéro — les images portent désormais l'angle.
+
+### Position X / Y / Z
+Trois gestes, au choix :
+* **glisser une pastille** dans la vue : elle se déplace au sol, gauche/droite =
+  azimut, haut/bas = éloignement (intersection exacte du rayon avec le plan du
+  sol, vérifiée au pixel près) ;
+* **glisser un point sur le plan** : positionnement X/Y en vue de dessus ;
+* **saisie numérique** X/Y/Z, avec pas réglable (1 cm à 50 cm) et Page haut/bas
+  pour l'altitude.
+
+**Ctrl + glisser** dans la vue déplace la **bulle active** elle-même : tout le
+réseau de pastilles suit le curseur, ce qui permet de recaler une bulle mal
+positionnée sur le décor qu'elle voit.
+
+> Corrigez l'orientation **avant** les positions : sur une image mal orientée,
+> déplacer une pastille pour la faire coïncider avec ce qu'on voit reporterait
+> l'erreur d'angle dans les coordonnées.
+
+### Filet de sécurité
+* **Ctrl+Z** annule ; un glisser complet compte pour une seule étape ;
+* « Réinit. cible » et « Réinit. tout » ramènent aux valeurs du CSV ;
+* chaque correction est **auto-enregistrée** dans un fichier compagnon
+  `<relevé>.csv.corrections.json` — rien n'est perdu si l'outil est fermé, et il
+  propose de les reprendre à la réouverture ;
+* « **CSV corrigé…** » écrit une copie horodatée : mêmes colonnes, même
+  séparateur, même encodage, mêmes décimales, **seules les cellules X/Y/Z
+  modifiées changent** — le relevé d'origine n'est jamais touché.
+
+### Survol d'une pastille
+Une infobulle donne le nom, le fichier photo, la **distance 3D**, la distance
+horizontale, le Δ altitude, l'azimut, les coordonnées, le plancher, la présence
+de l'image et, le cas échéant, la correction déjà appliquée.
+
+## 6. Performance
 
 * Décodage JPEG réduit à la volée (`draft`) à 2048 / 4096 / 8192 px de large — réglable
   dans « Qualité » ;
@@ -99,9 +164,20 @@ portée des liaisons entre planchers.
   exécuté hors du thread d'interface ; résolution réduite pendant la rotation, pleine
   résolution au repos.
 
-Mesures sur source 4096×2048 : ~16 ms par image en 1600×900, ~4 ms pendant la rotation.
+Mesures sur un panorama **16000×8000** réel :
 
-## 6. Vérifier l'installation
+| Qualité | Décodage d'une bulle | Mémoire par bulle | Rendu 1600×900 |
+|---|---|---|---|
+| 2048 | 0,17 s | 6 Mo | 46 ms |
+| **4096** (défaut) | 0,51 s | 25 Mo | 24 ms |
+| 8192 | 6,2 s | 101 Mo | 11 ms |
+
+Le nombre de bulles gardées en mémoire est **plafonné automatiquement** par une
+enveloppe d'environ 1,1 Go : inutile de surveiller le réglage en montant la
+qualité. Pendant une rotation de vue, le rendu passe en demi-résolution
+(~4 ms), la pleine résolution revenant dès l'arrêt du geste.
+
+## 7. Vérifier l'installation
 
 ```
 python BubbleNav_XPhase.py --selftest
@@ -109,9 +185,12 @@ python BubbleNav_XPhase.py --selftest
 
 Contrôle les angles, la réciprocité azimut ↔ image, la **cohérence entre la position
 calculée des pastilles et le rendu réel** (écart mesuré < 2 px), la lecture du CSV, la
-construction du réseau et les temps de rendu.
+construction du réseau, les temps de rendu, l'aller-retour **écran ↔ sol** utilisé pour
+déplacer une pastille, l'écriture du CSV corrigé (seules les lignes modifiées changent)
+et l'équivalence **image tournée de Δ ≡ vue décalée de Δ** — autrement dit, ce que vous
+voyez en réglant l'orientation est exactement ce que l'export écrira dans le JPEG.
 
-## 7. Dépendances
+## 8. Dépendances
 
 `Pillow`, `opencv-python`, `numpy` — installées automatiquement au premier lancement si
 elles manquent. Python 3.9 ou plus, avec Tkinter (inclus dans l'installateur Windows
