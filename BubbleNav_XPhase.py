@@ -2133,6 +2133,7 @@ class BubbleNavApp(_TkBase):
             self.canvas.create_image(0, 0, anchor='nw', image=self._tk_img, tags='frame')
             self.canvas.tag_lower('frame')
             self._draw_overlay()
+            self._draw_plan_cone()
             if scale == 1.0:
                 st = self.stations[idx]
                 n = len(self.links[idx]) if idx < len(self.links) else 0
@@ -2160,6 +2161,7 @@ class BubbleNavApp(_TkBase):
                                 fill=COLORS['warning'], font=('Segoe UI', 13), tags='frame')
         self.canvas.tag_lower('frame')
         self._draw_overlay()
+        self._draw_plan_cone()
 
     # ═════════════════════════════════════════════════════════════════
     # PASTILLES
@@ -3493,25 +3495,49 @@ class BubbleNavApp(_TkBase):
                 x, y = to_screen(tgt.x, tgt.y)
                 self.plan.create_oval(x - 4, y - 4, x + 4, y + 4,
                                       outline=COLORS['hot'], width=1)
-            if cur.floor == floor:
-                x, y = to_screen(cur.x, cur.y)
-                view = self._frame_view or self.view
-                az = self.calib.azimuth(view.yaw, cur.north_pct)
-                half = view.fov / 2.0
-                rad = 34.0
-                plist = [x, y]
-                for k in range(9):
-                    a = math.radians(az - half + k * (2 * half / 8))
-                    plist += [x + rad * math.sin(a), y - rad * math.cos(a)]
-                self.plan.create_polygon(plist, fill=COLORS['plan_cone'], outline='',
-                                         stipple='gray25')
-                self.plan.create_oval(x - 5, y - 5, x + 5, y + 5,
-                                      fill=COLORS['plan_here'], outline='#000000')
+        self._draw_plan_cone()
 
         self.plan.create_text(w - 16, 16, text="N", fill='#ff6b6b', font=F_UI_B)
         self.plan.create_line(w - 16, 26, w - 16, 40, fill='#ff6b6b', width=2)
         self.plan.create_text(8, h - 10, anchor='w', font=F_UI, fill=COLORS['text_muted'],
                               text=f"{len(pts)} bulles · molette: zoom · clic droit: déplacer")
+
+    def _draw_plan_cone(self) -> None:
+        """Position et champ de vision sur le plan.
+
+        Calque séparé (étiquette « cone ») redessiné à chaque image affichée :
+        le camembert suit donc la rotation de la vue et le zoom en direct, sans
+        avoir à retracer tout le réseau.
+        """
+        self.plan.delete('cone')
+        cur = self.station()
+        if cur is None or not self.stations:
+            return
+        floor = self.floor_var.get()
+        if floor and cur.floor != floor:
+            return                       # le plan montre un autre niveau
+        pts = self._plan_stations()
+        if not pts:
+            return
+        w = max(50, int(self.plan.winfo_width()))
+        h = max(50, int(self.plan.winfo_height()))
+        to_screen, _ = self._plan_transform(pts, w, h)
+        x, y = to_screen(cur.x, cur.y)
+        view = self._frame_view or self.view
+        az = self.calib.azimuth(view.yaw, cur.north_pct)
+        half = view.fov / 2.0
+        rad = 34.0
+        plist = [x, y]
+        for k in range(9):
+            a = math.radians(az - half + k * (2 * half / 8))
+            plist += [x + rad * math.sin(a), y - rad * math.cos(a)]
+        self.plan.create_polygon(plist, fill=COLORS['plan_cone'], outline='',
+                                 stipple='gray25', tags='cone')
+        a = math.radians(az)             # axe de visée
+        self.plan.create_line(x, y, x + rad * math.sin(a), y - rad * math.cos(a),
+                              fill=COLORS['plan_cone'], width=1, tags='cone')
+        self.plan.create_oval(x - 5, y - 5, x + 5, y + 5, fill=COLORS['plan_here'],
+                              outline='#000000', tags='cone')
 
     def _plan_nearest(self, event, max_px: float = 20.0) -> Optional[int]:
         pts = self._plan_stations()

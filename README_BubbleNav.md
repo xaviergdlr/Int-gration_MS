@@ -64,7 +64,11 @@ avertissements CSV » — jamais bloquantes.
 | `F11` / `Échap` | plein écran |
 
 **Plan du plancher** (à droite) : clic gauche = aller à la bulle la plus proche,
-molette = zoom, clic droit glissé = déplacer. Le cône jaune montre où vous regardez.
+molette = zoom, clic droit glissé = déplacer. Le **camembert jaune** donne la
+position, la direction de visée et l'ouverture du champ ; il est redessiné à
+chaque image affichée, donc il suit la rotation, le zoom, le changement de bulle
+et les corrections de position **en direct**. Les cercles jaunes marquent les
+bulles retenues comme pastilles, filtres compris.
 La liste « Plancher » change de niveau en rejoignant la bulle la plus proche à l'aplomb.
 
 **Couleur des pastilles** : jaune = même plancher · bleu ▲ = niveau au-dessus ·
