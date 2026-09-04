@@ -1596,6 +1596,7 @@ class BubbleNavApp(_TkBase):
         self._hs_drag = None                     # (idx station, dz, mode)
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
+        self._cone_sig = None                    # état du camembert du plan
         self._plan_hit = None                    # deplacement sur le plan
         self._autosave_job = None
         self._graph_job = None
@@ -1890,6 +1891,10 @@ class BubbleNavApp(_TkBase):
         self._pump_job = None
         if not self._stop.is_set():
             try:
+                self._sync_plan_cone()
+            except Exception:
+                pass
+            try:
                 self._pump_job = self.after(UI_PUMP_MS, self._pump_ui)
             except Exception:
                 pass
@@ -2133,7 +2138,7 @@ class BubbleNavApp(_TkBase):
             self.canvas.create_image(0, 0, anchor='nw', image=self._tk_img, tags='frame')
             self.canvas.tag_lower('frame')
             self._draw_overlay()
-            self._draw_plan_cone()
+            self._sync_plan_cone()
             if scale == 1.0:
                 st = self.stations[idx]
                 n = len(self.links[idx]) if idx < len(self.links) else 0
@@ -2161,7 +2166,7 @@ class BubbleNavApp(_TkBase):
                                 fill=COLORS['warning'], font=('Segoe UI', 13), tags='frame')
         self.canvas.tag_lower('frame')
         self._draw_overlay()
-        self._draw_plan_cone()
+        self._sync_plan_cone()
 
     # ═════════════════════════════════════════════════════════════════
     # PASTILLES
@@ -3502,6 +3507,35 @@ class BubbleNavApp(_TkBase):
         self.plan.create_text(8, h - 10, anchor='w', font=F_UI, fill=COLORS['text_muted'],
                               text=f"{len(pts)} bulles · molette: zoom · clic droit: déplacer")
 
+    def _cone_signature(self) -> Optional[tuple]:
+        """Tout ce dont dépend le camembert : point de vue, cap, champ, plan."""
+        cur = self.station()
+        if cur is None:
+            return None
+        pv = self._plan_view
+        try:
+            taille = (self.plan.winfo_width(), self.plan.winfo_height())
+        except Exception:
+            return None
+        return (cur.idx, round(self.view.yaw, 2), round(self.view.fov, 2),
+                self.floor_var.get(), round(cur.x, 3), round(cur.y, 3),
+                round(cur.north_pct, 4), round(float(pv.get('scale', 1.0)), 4),
+                round(float(pv.get('ox', 0.0)), 1), round(float(pv.get('oy', 0.0)), 1),
+                round(float(pv.get('cx', 0.0)), 3), round(float(pv.get('cy', 0.0)), 3),
+                taille, self.calib.mode, self.calib.sense, round(self.calib.offset, 3))
+
+    def _sync_plan_cone(self) -> None:
+        """Redessine le camembert dès que quelque chose a bougé.
+
+        Appelée à chaque battement d'interface (~60 Hz) : rotation, zoom,
+        changement de bulle, correction de position, recadrage du plan ou
+        calibration sont couverts sans dépendre du pipeline de rendu — une
+        image lente à décoder ne fige plus l'indicateur.
+        """
+        sig = self._cone_signature()
+        if sig is not None and sig != self._cone_sig:
+            self._draw_plan_cone()
+
     def _draw_plan_cone(self) -> None:
         """Position et champ de vision sur le plan.
 
@@ -3510,6 +3544,7 @@ class BubbleNavApp(_TkBase):
         avoir à retracer tout le réseau.
         """
         self.plan.delete('cone')
+        self._cone_sig = self._cone_signature()
         cur = self.station()
         if cur is None or not self.stations:
             return
@@ -3523,7 +3558,7 @@ class BubbleNavApp(_TkBase):
         h = max(50, int(self.plan.winfo_height()))
         to_screen, _ = self._plan_transform(pts, w, h)
         x, y = to_screen(cur.x, cur.y)
-        view = self._frame_view or self.view
+        view = self.view              # état courant : le cône ne suit pas le rendu
         az = self.calib.azimuth(view.yaw, cur.north_pct)
         half = view.fov / 2.0
         rad = 34.0
@@ -3538,6 +3573,7 @@ class BubbleNavApp(_TkBase):
                               fill=COLORS['plan_cone'], width=1, tags='cone')
         self.plan.create_oval(x - 5, y - 5, x + 5, y + 5, fill=COLORS['plan_here'],
                               outline='#000000', tags='cone')
+        self._cone_sig = self._cone_signature()
 
     def _plan_nearest(self, event, max_px: float = 20.0) -> Optional[int]:
         pts = self._plan_stations()
