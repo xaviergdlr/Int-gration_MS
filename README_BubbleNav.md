@@ -49,6 +49,32 @@ quel ordre, accents indifférents :
 Les lignes inexploitables sont ignorées et listées dans « Réglages… → Voir les
 avertissements CSV » — jamais bloquantes.
 
+### Travailler avant renommage (mode « num scan »)
+
+Quand les photos ne portent encore que leur **numéro de scan** (`0347.jpg`), le
+CSV peut fournir trois colonnes facultatives :
+
+| Colonne | Rôle |
+|---|---|
+| `Num scan` (ou `Cle`, `Scan`, `Numero`) | **clé immuable** : identifie la bulle quel que soit le nom du fichier, aujourd'hui et après renommage |
+| `Nom projeté` (ou `Projection`, `Nom final`, `Nouveau nom`) | nom selon la convention, analysé pour obtenir local, étage, index, date |
+| `Local`, `Étage`, `Date`, `Index` | attributs explicites, prioritaires sur l'analyse du nom |
+
+Conséquences :
+
+* les **filtres** (local, plancher…) et la **fiche** restent complets même avec
+  des photos numérotées ;
+* la photo est retrouvée sur disque sous le nom de la colonne « Fichier photo »,
+  sinon sous son numéro de scan (`347`, `0347`, `00347`), sinon sous son nom
+  projeté — le nombre de rattachements est indiqué au chargement ;
+* le **fichier de corrections est écrit par clé** (colonne `Cle` en tête) : après
+  renommage, on rouvre le relevé renommé avec le même fichier de corrections et
+  tout est retrouvé, positions, orientations et dates d'application comprises ;
+* une clé dupliquée est signalée et la ligne ignorée, jamais bloquante.
+
+Sans colonne de clé, la clé est le nom de la photo : rien ne change pour un
+relevé déjà renommé.
+
 ## 3. Naviguer
 
 | Action | Effet |
@@ -196,10 +222,11 @@ ne touchent ni le relevé ni les images.
 
 ### Le fichier de corrections
 ```
-Fichier photo;Nom du Locator;X;Y;Z;Delta Nord (deg);dX;dY;dZ;Orientation appliquee;Date
-CP1_GRA_TR6_BK_02_K256_20260416_01;K256_01;589.150;73.450;1.650;6.1077;+0.000;+0.000;+0.000;;2026-09-04 17:53
+Cle;Fichier photo;Nom du Locator;X;Y;Z;Delta Nord (deg);dX;dY;dZ;Orientation appliquee;Date
+0347;0347;K256_01;589.150;73.450;1.650;6.1077;+0.000;+0.000;+0.000;;2026-09-04 17:53
 ```
-* une ligne par bulle corrigée, rien d'autre ;
+* une ligne par bulle corrigée, rien d'autre, identifiée par sa **clé immuable**
+  (numéro de scan, ou nom de photo à défaut) puis par son nom de photo ;
 * `X` `Y` `Z` sont les valeurs **corrigées**, `dX` `dY` `dZ` l'écart au relevé —
   relisible à l'œil pour contrôler une passe de correction ;
 * `Delta Nord (deg)` est l'angle **restant à appliquer** à l'image ;
@@ -305,7 +332,9 @@ construction du réseau, les temps de rendu, l'aller-retour **écran ↔ sol** u
 déplacer une pastille, l'analyse des noms de fichiers (convention, variantes, noms incomplets, cohérence
 avec les colonnes du relevé sur les 693 bulles), les filtres de pastilles (également
 appliqués à la vue de comparaison), la loi de taille en 1/distance et ses bornes (taille toujours comprise entre 10 et 36 px, de
-0,4 m à 200 m), l'aller-retour du fichier de corrections (écriture, relecture, ligne orpheline,
+0,4 m à 200 m), le mode num scan (clé immuable, nom projeté, attributs explicites, rattachement des
+photos par numéro, corrections retrouvées après renommage), l'aller-retour du fichier
+de corrections (écriture, relecture, ligne orpheline,
 date d'application) avec relevé source inchangé octet pour octet, l'écriture du relevé
 complet corrigé (colonne Δ nord créée puis réutilisée, seules les lignes modifiées
 changent), et l'équivalence **image tournée de Δ ≡ vue décalée de Δ** — autrement dit, ce que vous

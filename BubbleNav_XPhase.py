@@ -345,6 +345,8 @@ def parse_photo_name(photo: str) -> NameParts:
         if etage:
             head = head[:-1]
         date, reste = '', ()
+    if local and local.isdigit():                # « 0349 » n'est pas un local
+        local = ''
     reconnu = bool(local and index)
     champs = ('campagne', 'site', 'tranche', 'ouvrage')
     valeurs = {champs[i]: head[i] for i in range(min(len(head), len(champs)))}
@@ -368,6 +370,11 @@ class Station:
     oy: float = 0.0
     oz: float = 0.0
     oyaw: float = 0.0
+    key: str = ''          # cle immuable (numero de scan) ; = photo si absente
+    key_explicit: bool = False   # True si la cle vient d'une colonne du CSV
+    target: str = ''       # nom projete selon la convention, s'il est fourni
+    attrs: Dict[str, str] = field(default_factory=dict)   # local/etage/date/index
+    _parts: Optional[NameParts] = field(default=None, repr=False, compare=False)
 
     def moved(self, tol: float = 1e-4) -> bool:
         """Position différente de celle lue dans le CSV."""
@@ -387,8 +394,39 @@ class Station:
         return self.moved() or self.turned()
 
     def parts(self) -> NameParts:
-        """Découpage du nom de fichier (mis en cache)."""
-        return parse_photo_name(self.photo)
+        """Attributs de la bulle : nom projeté s'il existe, sinon nom de la
+        photo ; les colonnes explicites du CSV l'emportent sur l'analyse."""
+        if self._parts is None:
+            base = parse_photo_name(self.target or self.photo)
+            if self.attrs:
+                import dataclasses
+                base = dataclasses.replace(base, **{k: v for k, v in self.attrs.items()
+                                                    if v and hasattr(base, k)})
+                if base.local and base.index:
+                    base.reconnu = True
+            self._parts = base
+        return self._parts
+
+    def label(self) -> str:
+        """Nom lisible : locator, ou nom projeté, ou clé."""
+        return self.locator or self.target or self.key or self.photo
+
+    def name_candidates(self) -> List[str]:
+        """Noms de fichier plausibles sur disque, du plus sûr au moins sûr."""
+        out: List[str] = []
+        for n in (self.photo, self.key, self.target):
+            n = (n or '').strip()
+            if not n:
+                continue
+            out.append(n)
+            if n.isdigit():                      # 347 / 0347 / 00347
+                out += [n.zfill(4), n.zfill(5), n.lstrip('0') or '0']
+        seen, uniq = set(), []
+        for n in out:
+            if n.lower() not in seen:
+                seen.add(n.lower())
+                uniq.append(n)
+        return uniq
 
 
 COL_ALIASES = {
@@ -405,6 +443,19 @@ COL_ALIASES = {
     # Correction d'orientation : colonne dediee, ajoutee par l'outil si absente.
     'dnord': ('deltanorddeg', 'deltanord', 'dnord', 'correctionnord',
               'rotationimage', 'nordcorrection', 'deltanordo'),
+    # Cle immuable (numero de scan) : survit au renommage des photos.
+    'key': ('numscan', 'numeroscan', 'nscan', 'scan', 'numero', 'num', 'cle',
+            'clef', 'uid', 'identifiant', 'idscan'),
+    # Nom projete (nom final selon la convention) : porte local/etage/date
+    # quand la photo sur disque ne s'appelle encore que par son numero.
+    'target': ('nomprojete', 'projection', 'nomfinal', 'nomcible', 'nouveaunom',
+               'renommage', 'fichierfinal', 'nomconvention', 'fichierprojete',
+               'photoprojetee', 'nomphotoprojete'),
+    # Attributs explicites, prioritaires sur l'analyse du nom.
+    'local': ('local', 'piece', 'salle', 'zone', 'room'),
+    'etage': ('etage', 'etg', 'stage'),
+    'date': ('date', 'datepdv', 'dateprisedevue', 'prisedevue', 'datephoto'),
+    'index': ('index', 'indice', 'numimage', 'numphoto'),
 }
 
 YAW_COLUMN = 'Delta Nord (deg)'   # intitule ecrit si la colonne n'existe pas
@@ -491,21 +542,35 @@ def read_survey_csv(path: str) -> Tuple[List[Station], List[str]]:
         if north is None:
             north = 50.0
         dnord = parse_float(cell(row, 'dnord')) or 0.0
-        key = photo.lower()
+        cle = cell(row, 'key') or photo
+        target = base_name(cell(row, 'target')) if cell(row, 'target') else ''
+        attrs = {k: cell(row, k) for k in ('local', 'etage', 'date', 'index')
+                 if cell(row, k)}
+        if 'date' in attrs:
+            attrs['date'] = re.sub(r'\D', '', attrs['date'])[:8]   # 2026-04-16 -> 20260416
+        key = cle.lower()
         if key in seen:
-            warns.append(f"ligne {lineno} : doublon de « {photo} » — ignoree")
+            warns.append(f"ligne {lineno} : clé « {cle} » déjà utilisée — ignoree")
+            continue
+        if photo.lower() != key and photo.lower() in {s.photo.lower() for s in stations}:
+            warns.append(f"ligne {lineno} : photo « {photo} » déjà utilisée — ignoree")
             continue
         seen[key] = len(stations)
         zv = 0.0 if z is None else z
         stations.append(Station(
             idx=len(stations),
             photo=photo,
-            locator=cell(row, 'locator') or photo,
+            locator=(cell(row, 'locator')
+                     or (parse_photo_name(target).locator() if target else '')
+                     or (parse_photo_name(photo).locator()
+                         if parse_photo_name(photo).reconnu else '')
+                     or photo),
             x=x, y=y, z=zv,
             north_pct=north,
             floor=cell(row, 'floor') or '—',
             yaw_fix=wrap180(dnord),
             ox=x, oy=y, oz=zv, oyaw=wrap180(dnord),
+            key=cle, target=target, attrs=attrs, key_explicit='key' in col,
         ))
 
     if not stations:
@@ -853,7 +918,7 @@ class Corrections:
 
     SUFFIX = '_corrections.csv'
     DELIM = ';'
-    HEADER = ('Fichier photo', 'Nom du Locator', 'X', 'Y', 'Z', YAW_COLUMN,
+    HEADER = ('Cle', 'Fichier photo', 'Nom du Locator', 'X', 'Y', 'Z', YAW_COLUMN,
               'dX', 'dY', 'dZ', 'Orientation appliquee', 'Date')
 
     def __init__(self, csv_path: str = '', path: str = ''):
@@ -917,7 +982,7 @@ class Corrections:
     def revert(self, st: Station) -> None:
         """Retour aux valeurs du relevé d'origine."""
         self.apply(st, x=st.ox, y=st.oy, z=st.oz, yaw_fix=st.oyaw)
-        self.applied.pop(st.photo, None)
+        self.applied.pop(st.key, None)
 
     def revert_all(self, stations: Sequence[Station]) -> int:
         n = 0
@@ -938,10 +1003,10 @@ class Corrections:
         """Bulles dont l'image reste à tourner (Δ nord non nul)."""
         return [s for s in stations if s.has_yaw()]
 
-    def mark_applied(self, photos: Iterable[str]) -> None:
+    def mark_applied(self, keys: Iterable[str]) -> None:
         stamp = datetime.now().strftime('%Y-%m-%d %H:%M')
-        for photo in photos:
-            self.applied[photo] = stamp
+        for key in keys:
+            self.applied[key] = stamp
         self.dirty = True
 
     # ── fichier de corrections ───────────────────────────────────────
@@ -953,16 +1018,16 @@ class Corrections:
         """
         if not self.path:
             return ''
-        rows = [st for st in stations if st.modified() or st.photo in self.applied]
+        rows = [st for st in stations if st.modified() or st.key in self.applied]
         stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         lines = [self.DELIM.join(self.HEADER)]
         for st in rows:
             lines.append(self.DELIM.join((
-                st.photo, st.locator,
+                st.key, st.photo, st.locator,
                 f"{st.x:.3f}", f"{st.y:.3f}", f"{st.z:.3f}",
                 f"{st.yaw_fix:.4f}",
                 f"{st.x - st.ox:+.3f}", f"{st.y - st.oy:+.3f}", f"{st.z - st.oz:+.3f}",
-                self.applied.get(st.photo, ''), stamp)))
+                self.applied.get(st.key, ''), stamp)))
         tmp = self.path + '.tmp'
         try:
             with open(tmp, 'w', encoding='utf-8-sig', newline='') as fh:
@@ -973,9 +1038,12 @@ class Corrections:
         self.dirty = False
         return self.path
 
-    def load(self, by_photo: Dict[str, Station], path: str = '') -> Tuple[int, int]:
+    def load(self, by_photo: Dict[str, Station], path: str = '',
+             by_key: Optional[Dict[str, Station]] = None) -> Tuple[int, int]:
         """Relit un fichier de corrections et l'applique au relevé en mémoire.
 
+        La correspondance se fait d'abord par la clé immuable (numéro de scan),
+        puis par le nom de photo : les corrections survivent au renommage.
         Retourne (corrections appliquées, lignes sans correspondance).
         """
         path = path or self.path
@@ -989,21 +1057,27 @@ class Corrections:
             return 0, 0
         header = [norm_key(c) for c in rows[0]]
         col: Dict[str, int] = {}
-        for field_name in ('photo', 'x', 'y', 'z', 'dnord'):
+        for field_name in ('photo', 'x', 'y', 'z', 'dnord', 'key'):
             for alias in COL_ALIASES[field_name]:
                 if alias in header:
                     col[field_name] = header.index(alias)
                     break
         applied_col = header.index('orientationappliquee') if 'orientationappliquee' in header else -1
-        if 'photo' not in col:
-            raise ValueError("Fichier de corrections sans colonne « Fichier photo ».")
+        if 'photo' not in col and 'key' not in col:
+            raise ValueError("Fichier de corrections sans colonne « Cle » ni « Fichier photo ».")
+        by_key = by_key or {}
+        by_photo_l = {k.lower(): v for k, v in by_photo.items()}
 
         n_ok = n_miss = 0
         for row in rows[1:]:
             def cell(key: str) -> str:
                 i = col.get(key, -1)
                 return row[i].strip() if 0 <= i < len(row) else ''
-            st = by_photo.get(base_name(cell('photo')))
+            st = None
+            if cell('key'):
+                st = by_key.get(cell('key').lower())
+            if st is None and cell('photo'):
+                st = by_photo_l.get(base_name(cell('photo')).lower())
             if st is None:
                 n_miss += 1
                 continue
@@ -1019,7 +1093,7 @@ class Corrections:
                 self.apply(st, record=False, **values)
                 n_ok += 1
             if 0 <= applied_col < len(row) and row[applied_col].strip():
-                self.applied[st.photo] = row[applied_col].strip()
+                self.applied[st.key] = row[applied_col].strip()
         self.dirty = False
         return n_ok, n_miss
 
@@ -1064,13 +1138,14 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
     head_eol = lines[0][len(head_body):]
     header = [norm_key(c) for c in next(csv.reader([head_body], delimiter=delim))]
     col: Dict[str, int] = {}
-    for field_name in ('photo', 'x', 'y', 'z', 'dnord'):
+    for field_name in ('photo', 'x', 'y', 'z', 'dnord', 'key'):
         for alias in COL_ALIASES[field_name]:
             if alias in header:
                 col[field_name] = header.index(alias)
                 break
     if 'photo' not in col:
         raise ValueError("Colonne « Fichier photo » introuvable dans le CSV source.")
+    by_key = {st.key.lower(): st for st in stations}
 
     need_yaw = (any(st.has_yaw() or st.turned() for st in stations)
                 if write_yaw is None else bool(write_yaw))
@@ -1091,8 +1166,11 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
             out.append(body + (delim if add_col else '') + eol)
             n_keep += 1
             continue
-        key = base_name(fields[col['photo']]).lower() if col['photo'] < len(fields) else ''
-        st = by_photo.get(key)
+        st = None
+        if 'key' in col and col['key'] < len(fields) and fields[col['key']].strip():
+            st = by_key.get(fields[col['key']].strip().lower())
+        if st is None and col['photo'] < len(fields):
+            st = by_photo.get(base_name(fields[col['photo']]).lower())
         touch = st is not None and (st.moved() or (need_yaw and st.turned()))
         if not touch and not add_col:
             out.append(raw)
@@ -1311,6 +1389,24 @@ class ImageStore:
         384 — le plafond évite de saturer la machine)."""
         budget = max(1, int(MEMORY_BUDGET_MB / max(1.0, self.frame_mb())))
         return max(2, min(self.cache_size, budget))
+
+    def bind_stations(self, stations: Sequence[Station]) -> int:
+        """Rattache chaque bulle à son fichier, même si le nom sur disque est
+        le numéro de scan (0347.jpg) ou le nom projeté plutôt que la colonne
+        « Fichier photo ». Retourne le nombre de rattachements par alias."""
+        n = 0
+        with self._lock:
+            for st in stations:
+                photo = st.photo.lower()
+                if photo in self._paths:
+                    continue
+                for cand in st.name_candidates():
+                    path = self._paths.get(cand.lower())
+                    if path:
+                        self._paths[photo] = path
+                        n += 1
+                        break
+        return n
 
     def has(self, photo: str) -> bool:
         return photo.lower() in self._paths
@@ -1631,6 +1727,7 @@ class BubbleNavApp(_TkBase):
         # Edition
         self.corrections = Corrections()
         self.by_photo: Dict[str, Station] = {}
+        self.by_key: Dict[str, Station] = {}
         self.selected: Optional[int] = None      # bulle en cours de modification
         self._hs_drag = None                     # (idx station, dz, mode)
         self._sync_ui = False                    # garde anti-boucle des widgets
@@ -1971,13 +2068,14 @@ class BubbleNavApp(_TkBase):
         self.floor_cb.config(values=self.floors)
         self.f_floor_cb.config(values=['tous', 'courant'] + self.floors)
         self.by_photo = {s.photo: s for s in stations}
+        self.by_key = {s.key.lower(): s for s in stations}
         custom = self.cfg.get('corr_paths', {}).get(path, '')
         self.corrections = Corrections(path, custom if isinstance(custom, str) else '')
         self.selected = None
         corr_msg = ''
         if os.path.isfile(self.corrections.path):
             try:
-                n_ok, n_miss = self.corrections.load(self.by_photo)
+                n_ok, n_miss = self.corrections.load(self.by_photo, by_key=self.by_key)
                 corr_msg = (f" · {n_ok} correction(s) reprises de "
                             f"{os.path.basename(self.corrections.path)}")
                 if n_miss:
@@ -2019,11 +2117,14 @@ class BubbleNavApp(_TkBase):
 
     def _images_indexed(self, paths: Dict[str, str]) -> None:
         self.store.set_paths(paths)
+        alias = self.store.bind_stations(self.stations)   # num scan / nom projeté
         found = sum(1 for s in self.stations if self.store.has(s.photo))
         total = len(self.stations)
         color = COLORS['ok'] if found == total else COLORS['warning']
         self._set_status(f"{found}/{total} images trouvées dans « {self.images_dir} » "
-                         f"({len(paths)} fichiers indexés)", color)
+                         f"({len(paths)} fichiers indexés"
+                         + (f", {alias} rattachée(s) par numéro de scan ou nom projeté"
+                            if alias else '') + ")", color)
         save_config(self.cfg)
         if self.current < 0:
             start = next((s.idx for s in self.stations if self.store.has(s.photo)), 0)
@@ -2388,7 +2489,8 @@ class BubbleNavApp(_TkBase):
         p = tgt.parts()
         lines = [
             tgt.locator,
-            f"photo        {tgt.photo}",
+            f"photo        {tgt.photo}"
+            + (f"   (clé {tgt.key})" if tgt.key_explicit or tgt.key != tgt.photo else ''),
             f"local        {p.local or '—'}   étage {p.etage or '—'}   "
             f"index {p.index or '—'}",
             f"prise de vue {p.date_lisible() or '—'}",
@@ -2801,6 +2903,10 @@ class BubbleNavApp(_TkBase):
         """Fiche d'une bulle : nom analysé, position, état, distance à l'origine."""
         p = st.parts()
         lignes = [st.locator, f"photo    {st.photo}"]
+        if st.key_explicit or st.key != st.photo:
+            lignes.append(f"clé      {st.key}")
+        if st.target:
+            lignes.append(f"projeté  {st.target}")
         repere = ' · '.join(v for v in (p.campagne, p.site, p.tranche, p.ouvrage) if v)
         if repere:
             lignes.append(f"repère   {repere}")
@@ -2829,7 +2935,7 @@ class BubbleNavApp(_TkBase):
         if st.moved():
             lignes.append("DÉPLACÉE de "
                           f"{math.dist((st.x, st.y, st.z), (st.ox, st.oy, st.oz)):.2f} m")
-        applied = self.corrections.applied.get(st.photo) if self.corrections else None
+        applied = self.corrections.applied.get(st.key) if self.corrections else None
         if applied:
             lignes.append(f"image tournée le {applied}")
         return '\n'.join(lignes)
@@ -3378,7 +3484,7 @@ class BubbleNavApp(_TkBase):
                 f"{os.path.basename(path)} existe déjà.\n\n"
                 "Reprendre les corrections qu'il contient ?"):
             try:
-                n_ok, n_miss = self.corrections.load(self.by_photo)
+                n_ok, n_miss = self.corrections.load(self.by_photo, by_key=self.by_key)
                 self._set_status(f"{n_ok} correction(s) reprises"
                                  + (f", {n_miss} sans correspondance" if n_miss else ''),
                                  COLORS['edit'])
@@ -3438,7 +3544,8 @@ class BubbleNavApp(_TkBase):
                 self._post(lambda: (win.destroy(), messagebox.showerror("Export", str(exc))))
                 return
             failed = {e.split(' : ')[0] for e in errors}
-            applied = {s.photo for s in todo if s.photo not in failed} if not cancel.is_set() else set()
+            applied = ({s.key for s in todo if s.photo not in failed}
+                       if not cancel.is_set() else set())
             self._post(self._export_done, win, out_dir, ok, skipped + absent,
                        errors, applied, merged_after)
 
@@ -3460,7 +3567,7 @@ class BubbleNavApp(_TkBase):
         if applied:
             # Les images portent l'angle : la correction est consommée.
             for st in self.stations:
-                if st.photo in applied:
+                if st.key in applied:
                     self.corrections.apply(st, yaw_fix=0.0, record=False)
             self.corrections.mark_applied(applied)
             self._autosave()
@@ -4666,8 +4773,8 @@ def selftest(csv_path: str = '') -> int:
             check("une ligne par bulle corrigée seulement", len(corr_lines) == 4,
                   f"{len(corr_lines) - 1} ligne(s)")
             check("en-tête du fichier de corrections",
-                  corr_lines[0].split(';')[:6] ==
-                  ['Fichier photo', 'Nom du Locator', 'X', 'Y', 'Z', YAW_COLUMN],
+                  corr_lines[0].split(';')[:7] ==
+                  ['Cle', 'Fichier photo', 'Nom du Locator', 'X', 'Y', 'Z', YAW_COLUMN],
                   corr_lines[0][:60])
             check("le relevé chargé n'est pas touché",
                   open(work_csv, 'rb').read() == before)
@@ -4876,6 +4983,84 @@ def selftest(csv_path: str = '') -> int:
     attendu = math.tan(math.radians(50)) / math.tan(math.radians(25))
     check("zoom : la pastille grossit du bon facteur", abs(ratio - attendu) < 1e-9,
           f"champ 100° → 50° : ×{ratio:.2f}")
+
+    # 10. Mode « num scan » : cle immuable, nom projete, attributs explicites
+    print("\n10) Mode num scan (clé immuable, nom projeté)")
+    import shutil as _sh
+    import tempfile as _tf
+    tmp2 = _tf.mkdtemp(prefix='bubblenav_scan_')
+    try:
+        csv_scan = os.path.join(tmp2, 'scan.csv')
+        with open(csv_scan, 'w', encoding='utf-8-sig', newline='') as fh:
+            fh.write("Num scan;Fichier photo;X;Y;Z;% NORD;Plancher;Nom projeté;Local;Étage\r\n"
+                     "0347;0347;10.000;20.000;1.650;50;PLANCHER 02;"
+                     "CP1_GRA_TR6_BK_02_K256_20260416_01;K256;02\r\n"
+                     "0348;0348;12.000;20.000;1.650;50;PLANCHER 02;"
+                     "CP1_GRA_TR6_BK_02_K256_20260416_02;;\r\n"
+                     "0349;0349;14.000;20.000;1.650;50;PLANCHER 02;;;\r\n")
+        sts_scan, w_scan = read_survey_csv(csv_scan)
+        check("CSV num scan lu", len(sts_scan) == 3 and not w_scan, f"{len(w_scan)} alerte(s)")
+        a, b, c = sts_scan
+        check("clé immuable = numéro de scan", a.key == '0347' and a.photo == '0347')
+        check("attributs depuis le nom projeté",
+              b.parts().local == 'K256' and b.parts().etage == '02'
+              and b.parts().index == '02' and b.parts().date == '20260416',
+              str(b.parts())[:70])
+        check("colonnes explicites prioritaires", a.parts().local == 'K256'
+              and a.parts().etage == '02' and a.locator == 'K256_01')
+        check("sans projection : attributs vides, jamais d'erreur",
+              c.parts().local == '' and c.locator == '0349' and not c.parts().reconnu)
+        check("filtre local exploitable en mode num scan",
+              HotspotFilter(active=True, local='K25').match_local(a)
+              and not HotspotFilter(active=True, local='K25').match_local(c))
+
+        # rattachement des images par numero de scan et nom projete
+        for nom in ('0347.jpg', 'CP1_GRA_TR6_BK_02_K256_20260416_02.jpg', '349.jpg'):
+            open(os.path.join(tmp2, nom), 'wb').write(b'\xff\xd8\xff\xd9')
+        store2 = ImageStore()
+        store2.set_paths(index_images(tmp2))
+        alias = store2.bind_stations(sts_scan)
+        check("photos rattachées par numéro, nom projeté et numéro sans zéros",
+              all(store2.has(s.photo) for s in sts_scan) and alias == 2,
+              f"{alias} alias")
+
+        # corrections ecrites par cle, relues apres RENOMMAGE des photos
+        corr2 = Corrections(csv_scan)
+        corr2.apply(a, x=a.x + 0.25, yaw_fix=0.75)
+        corr2.mark_applied([b.key])
+        corr2.save(sts_scan)
+        l = _read_text(corr2.path).splitlines()
+        check("clé en tête du fichier de corrections",
+              l[0].startswith('Cle;') and l[1].startswith('0347;0347;'), l[1][:30])
+
+        csv_ren = os.path.join(tmp2, 'renomme.csv')
+        with open(csv_ren, 'w', encoding='utf-8-sig', newline='') as fh:
+            fh.write("Num scan;Fichier photo;X;Y;Z;% NORD;Plancher\r\n"
+                     "0347;CP1_GRA_TR6_BK_02_K256_20260416_01;10.000;20.000;1.650;50;PLANCHER 02\r\n"
+                     "0348;CP1_GRA_TR6_BK_02_K256_20260416_02;12.000;20.000;1.650;50;PLANCHER 02\r\n")
+        sts_ren, _ = read_survey_csv(csv_ren)
+        corr3 = Corrections(csv_ren, path=corr2.path)
+        n_ok, n_miss = corr3.load({s.photo: s for s in sts_ren}, by_key={s.key.lower(): s for s in sts_ren})
+        check("corrections retrouvées après renommage des photos (par clé)",
+              n_ok == 2 and abs(sts_ren[0].x - 10.25) < 1e-9
+              and abs(sts_ren[0].yaw_fix - 0.75) < 1e-9 and '0348' in corr3.applied,
+              f"{n_ok} reprise(s), {n_miss} orpheline(s)")
+        check("le nom projeté est relu comme nom de photo après renommage",
+              sts_ren[0].parts().local == 'K256' and sts_ren[0].locator == 'K256_01')
+
+        # releve complet corrige : correspondance par cle
+        out3 = os.path.join(tmp2, 'complet.csv')
+        n_mod, _, _ = write_corrected_csv(csv_ren, out3, sts_ren)
+        rel3, _ = read_survey_csv(out3)
+        check("relevé complet corrigé par clé", n_mod == 1 and abs(rel3[0].x - 10.25) < 5e-4)
+
+        dup = os.path.join(tmp2, 'dup.csv')
+        with open(dup, 'w', encoding='utf-8', newline='') as fh:
+            fh.write("Num scan;Fichier photo;X;Y\n0001;a;1;1\n0001;b;2;2\n")
+        sts_dup, w_dup = read_survey_csv(dup)
+        check("clé dupliquée signalée, jamais fatale", len(sts_dup) == 1 and len(w_dup) == 1)
+    finally:
+        _sh.rmtree(tmp2, ignore_errors=True)
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))
