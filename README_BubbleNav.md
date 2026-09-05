@@ -104,6 +104,13 @@ La liste « Plancher » change de niveau en rejoignant la bulle la plus proche �
 violet ▼ = niveau en dessous · rouge sombre = image absente du dossier · orange =
 bulle corrigée.
 
+**Aspect des pastilles** : chaque pastille est une **sphère ombrée** posée sur son
+ombre portée — éclairage en haut à gauche, reflet, ombre douce au pied — générée
+une fois par couleur et par taille puis mise en cache (3 ms, aussi rapide qu'un
+disque plat à l'affichage). Le point du sol projeté est le pied de la sphère ;
+la sphère comme l'ombre sont cliquables. « Réglages… → Pastilles en relief »
+revient aux disques plats.
+
 **Taille des pastilles** : rayon à l'écran = focale × rayon physique ÷ distance —
 une pastille trois fois plus loin est trois fois plus petite, et zoomer les
 grossit exactement comme un disque posé au sol. La taille est **bornée** :
@@ -360,7 +367,8 @@ calculée des pastilles et le rendu réel** (écart mesuré < 2 px), la lecture 
 construction du réseau, les temps de rendu, l'aller-retour **écran ↔ sol** utilisé pour
 déplacer une pastille, l'analyse des noms de fichiers (convention, variantes, noms incomplets, cohérence
 avec les colonnes du relevé sur les 693 bulles), les filtres de pastilles (également
-appliqués à la vue de comparaison), la loi de taille en 1/distance et ses bornes (taille toujours comprise entre 10 et 36 px, de
+appliqués à la vue de comparaison), le rendu des sphères ombrées (image, ombre, reflet, zone de clic), la loi de taille en
+1/distance et ses bornes (taille toujours comprise entre 10 et 36 px, de
 0,4 m à 200 m), les deux composantes d'altitude (hauteur station laissant le sol en place, delta
 plancher le déplaçant, relevé complet mis à jour par composante, ancien format relu),
 le mode num scan (clé immuable, nom projeté, attributs explicites, rattachement des

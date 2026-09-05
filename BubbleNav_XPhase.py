@@ -211,6 +211,7 @@ DEFAULT_CONFIG = {
     'disc_radius': DISC_RADIUS_M,
     'disc_min_px': DISC_PX_MIN,
     'disc_max_px': DISC_PX_MAX,
+    'disc_3d': True,           # pastilles en relief (sphere ombree)
     'filter_active': False,
     'filter_floor': 'tous',
     'filter_dist': 0.0,
@@ -1787,6 +1788,88 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
     return out, masques
 
 
+SPHERE_RADIUS = 0.74     # rayon de la sphere, en fraction du rayon de pastille
+SHADOW_RX, SHADOW_RY = 1.00, 0.36   # demi-axes de l'ombre au sol (fractions)
+SPHERE_LIFT = 0.86       # centre de la sphere au-dessus du sol (fraction de rs)
+
+
+def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2):
+    """Pastille en relief : sphère éclairée reposant sur son ombre portée.
+
+    Retourne (image RGBA PIL, (ax, ay)) où (ax, ay) est le point du sol dans
+    l'image — c'est lui qui se place sur la position projetée de la bulle.
+    Sur-échantillonnage `ss` pour des bords lisses ; ~4 ms par sprite, mis en
+    cache par l'application.
+    """
+    import numpy as np
+    from PIL import Image, ImageFilter
+    R = max(3, int(r)) * ss
+    rs = SPHERE_RADIUS * R
+    sx, sy = SHADOW_RX * R, SHADOW_RY * R
+    blur = max(1.0, 0.10 * R)
+    pad = int(2 * blur + 2 * ss)
+    W = int(2 * sx) + 2 * pad
+    gy = int(2 * rs * 0.95 + pad)
+    H = int(gy + sy + 2 * pad)
+    cx = W / 2.0
+    cy = gy - rs * SPHERE_LIFT
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+
+    # ombre portée : ellipse douce, un peu decalee (lumiere en haut a gauche)
+    ox, oy = cx + 0.06 * R, gy + 0.10 * sy
+    d = np.sqrt(((xx - ox) / sx) ** 2 + ((yy - oy) / sy) ** 2)
+    shadow_a = np.clip((1.0 - d) / 0.35, 0, 1) * 0.55
+    shadow = Image.fromarray((shadow_a * 255).astype(np.uint8), 'L').filter(
+        ImageFilter.GaussianBlur(blur))
+    out = np.zeros((H, W, 4), np.float32)
+    out[..., 3] = np.asarray(shadow, np.float32) / 255.0
+
+    # sphere : lambert + speculaire + assombrissement du bord
+    h = color.lstrip('#')
+    base = np.array([int(h[i:i + 2], 16) for i in (0, 2, 4)], np.float32) / 255.0
+    if hover:
+        base = np.clip(base * 1.12 + 0.05, 0, 1)
+    nx = (xx - cx) / rs
+    ny = (yy - cy) / rs
+    d2 = nx * nx + ny * ny
+    nz = np.sqrt(np.clip(1.0 - d2, 0, 1))
+    lx, ly, lz = -0.45, -0.60, 0.66
+    nl = math.sqrt(lx * lx + ly * ly + lz * lz)
+    ndotl = np.clip((nx * lx + ny * ly + nz * lz) / nl, 0, 1)
+    light = (0.30 + 0.70 * ndotl) * (1.0 - np.clip((d2 - 0.55) / 0.45, 0, 1) * 0.35)
+    spec = ndotl ** 40 * 0.55
+    rgb = np.clip(base[None, None, :] * light[..., None] + spec[..., None], 0, 1)
+    edge = np.clip((1.0 - np.sqrt(d2)) * rs / ss, 0, 1)
+    a_s = np.where(d2 <= 1.0, edge, 0.0)
+    a_old = out[..., 3]
+    a_new = a_s + a_old * (1 - a_s)
+    out[..., :3] = ((rgb * a_s[..., None] + out[..., :3] * (a_old * (1 - a_s))[..., None])
+                    / np.maximum(a_new, 1e-6)[..., None])
+    out[..., 3] = a_new
+    img = Image.fromarray((out * 255).astype(np.uint8), 'RGBA')
+    if ss > 1:
+        img = img.resize((W // ss, H // ss), Image.LANCZOS)
+    return img, (cx / ss, gy / ss)
+
+
+def hotspot_hit(hotspots: Sequence["Hotspot"], x: float, y: float,
+                relief: bool = True) -> Optional[int]:
+    """Pastille sous le curseur : sphère (au-dessus du sol) ou ombre au sol."""
+    best, best_d = None, float('inf')
+    for i, hs in enumerate(hotspots):
+        r = hs.radius
+        rx, ry = r + HIT_SLACK_PX, r * 0.55 + HIT_SLACK_PX
+        d = ((x - hs.col) / rx) ** 2 + ((y - hs.row) / ry) ** 2
+        if relief:
+            rs = SPHERE_RADIUS * r
+            cy = hs.row - rs * SPHERE_LIFT
+            ds = ((x - hs.col) ** 2 + (y - cy) ** 2) / (rs + HIT_SLACK_PX) ** 2
+            d = min(d, ds)
+        if d <= 1.0 and d < best_d:
+            best, best_d = i, d
+    return best
+
+
 @dataclass
 class Hotspot:
     """Pastille projetee dans la vue."""
@@ -1846,6 +1929,7 @@ class BubbleNavApp(_TkBase):
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
         self._cone_sig = None                    # état du camembert du plan
+        self._sprites: "OrderedDict[tuple, tuple]" = OrderedDict()   # sphères
         self._cmp_sig = None                     # état de synchro de la vue B
         self._last_current = -1
         self._plan_hit = None                    # deplacement sur le plan
@@ -2455,6 +2539,59 @@ class BubbleNavApp(_TkBase):
         self.hidden_count = masques
         return out
 
+    def _sprite(self, color: str, r: float, hover: bool = False):
+        """Sphère ombrée prête à afficher, mise en cache par couleur et taille."""
+        rq = max(3, int(round(r / 2.0) * 2))          # pas de 2 px : cache compact
+        key = (color, rq, hover)
+        hit = self._sprites.get(key)
+        if hit is not None:
+            return hit
+        from PIL import ImageTk
+        img, (ax, ay) = sphere_sprite(color, rq, hover)
+        entry = (ImageTk.PhotoImage(img), ax, ay)
+        if len(self._sprites) >= 400:
+            self._sprites.pop(next(iter(self._sprites)))
+        self._sprites[key] = entry
+        return entry
+
+    def relief(self) -> bool:
+        return bool(self.cfg.get('disc_3d', True))
+
+    def draw_hotspot(self, canvas, hs: "Hotspot", color: str, hovered: bool,
+                     selected: bool = False) -> None:
+        """Dessine une pastille (relief ou plate) sur un canevas."""
+        r = hs.radius * (1.25 if hovered else 1.0)
+        if self.relief():
+            photo, ax, ay = self._sprite(color, r, hovered)
+            canvas.create_image(hs.col - ax, hs.row - ay, anchor='nw', image=photo,
+                                tags='hs')
+            if selected:
+                rs = SPHERE_RADIUS * r * 1.35
+                cy = hs.row - SPHERE_RADIUS * r * SPHERE_LIFT
+                canvas.create_oval(hs.col - rs, cy - rs, hs.col + rs, cy + rs,
+                                   outline=COLORS['sel'], width=2, tags='hs')
+            return
+        if selected:
+            canvas.create_oval(hs.col - r * 1.6, hs.row - r * 0.95,
+                               hs.col + r * 1.6, hs.row + r * 0.95,
+                               outline=COLORS['sel'], width=2, tags='hs')
+        canvas.create_oval(hs.col - r, hs.row - r * 0.55, hs.col + r, hs.row + r * 0.55,
+                           fill=color, outline=COLORS['hot_edge'],
+                           width=2 if hovered else 1, tags='hs')
+        canvas.create_oval(hs.col - r * 0.22, hs.row - r * 0.12,
+                           hs.col + r * 0.22, hs.row + r * 0.12,
+                           fill=COLORS['hot_edge'], outline='', tags='hs')
+
+    def label_y(self, hs: "Hotspot", hovered: bool) -> float:
+        r = hs.radius * (1.25 if hovered else 1.0)
+        return hs.row + (SHADOW_RY * r if self.relief() else 0.55 * r) + 10
+
+    def glyph_y(self, hs: "Hotspot", hovered: bool) -> float:
+        r = hs.radius * (1.25 if hovered else 1.0)
+        if self.relief():
+            return hs.row - SPHERE_RADIUS * r * (SPHERE_LIFT + 1.0) - 8
+        return hs.row - r * 0.9
+
     def disc_bounds(self) -> Tuple[float, float]:
         """Bornes d'affichage des pastilles (px), toujours cohérentes."""
         lo, hi = DISC_PX_LIMITS
@@ -2485,20 +2622,10 @@ class BubbleNavApp(_TkBase):
             if tgt.modified():
                 color = COLORS['edit']
             hovered = (i == self._hover)
-            r = hs.radius * (1.25 if hovered else 1.0)
-            if self.edit_mode and self.selected == tgt.idx:
-                self.canvas.create_oval(hs.col - r * 1.6, hs.row - r * 0.95,
-                                        hs.col + r * 1.6, hs.row + r * 0.95,
-                                        outline=COLORS['sel'], width=2, tags='hs')
-            self.canvas.create_oval(hs.col - r, hs.row - r * 0.55,
-                                    hs.col + r, hs.row + r * 0.55,
-                                    fill=color, outline=COLORS['hot_edge'],
-                                    width=2 if hovered else 1, tags='hs')
-            self.canvas.create_oval(hs.col - r * 0.22, hs.row - r * 0.12,
-                                    hs.col + r * 0.22, hs.row + r * 0.12,
-                                    fill=COLORS['hot_edge'], outline='', tags='hs')
+            self.draw_hotspot(self.canvas, hs, color, hovered,
+                              selected=self.edit_mode and self.selected == tgt.idx)
             if lk.kind != 'same':
-                self.canvas.create_text(hs.col, hs.row - r * 0.9,
+                self.canvas.create_text(hs.col, self.glyph_y(hs, hovered),
                                         text='▲' if lk.kind == 'up' else '▼',
                                         fill=color, font=('Segoe UI', 11, 'bold'), tags='hs')
             if show_lbl or hovered:
@@ -2507,7 +2634,7 @@ class BubbleNavApp(_TkBase):
                     txt = f"{hs.label} · {txt}"
                     if missing:
                         txt += " · image absente"
-                ty = hs.row + r * 0.55 + 10
+                ty = self.label_y(hs, hovered)
                 self.canvas.create_text(hs.col + 1, ty + 1, text=txt, fill='#000000',
                                         font=F_UI, tags='hs')
                 self.canvas.create_text(hs.col, ty, text=txt,
@@ -2655,15 +2782,7 @@ class BubbleNavApp(_TkBase):
         self.canvas.tag_lower(rect, item)
 
     def _hotspot_at(self, x: float, y: float) -> Optional[int]:
-        best, best_d = None, float('inf')
-        for i, hs in enumerate(self.hotspots):
-            rx = hs.radius + HIT_SLACK_PX
-            ry = hs.radius * 0.55 + HIT_SLACK_PX
-            dx, dy = (x - hs.col) / rx, (y - hs.row) / ry
-            d = dx * dx + dy * dy
-            if d <= 1.0 and d < best_d:
-                best, best_d = i, d
-        return best
+        return hotspot_hit(self.hotspots, x, y, self.relief())
 
     # ═════════════════════════════════════════════════════════════════
     # EVENEMENTS SOURIS / CLAVIER
@@ -4110,6 +4229,15 @@ class BubbleNavApp(_TkBase):
                                   f"{proche:.1f} m et {loin:.0f} m")
             self._draw_overlay()
 
+        relief_var = tk.BooleanVar(value=self.relief())
+        tk.Checkbutton(cal, text="Pastilles en relief (sphère ombrée)", variable=relief_var,
+                       command=lambda: (self.cfg.__setitem__('disc_3d', bool(relief_var.get())),
+                                        self._draw_overlay(),
+                                        self.compare and self.compare._draw_overlay()),
+                       font=F_UI, anchor='w', bg=COLORS['bg_dark'], fg=COLORS['text'],
+                       selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_dark'],
+                       activeforeground=COLORS['text'], bd=0, highlightthickness=0
+                       ).pack(fill='x', pady=(4, 0))
         slider(cal, "Rayon des pastilles (m)", disc_var, 0.10, 1.00, 0.01, apply_disc)
         slider(cal, "Taille mini (px)", dmin_var, DISC_PX_LIMITS[0], 40, 1, apply_disc)
         slider(cal, "Taille maxi (px)", dmax_var, 12, DISC_PX_LIMITS[1], 1, apply_disc)
@@ -4552,14 +4680,11 @@ class CompareView(tk.Toplevel if _TK_OK else object):
                 color = COLORS['plan_missing']
             if tgt.modified():
                 color = COLORS['edit']
-            r = hs.radius * (1.25 if i == self._hover else 1.0)
-            self.canvas.create_oval(hs.col - r, hs.row - r * 0.55, hs.col + r,
-                                    hs.row + r * 0.55, fill=color,
-                                    outline=COLORS['hot_edge'],
-                                    width=2 if i == self._hover else 1, tags='hs')
-            txt = f"{hs.label} · {human_dist(hs.link.dist)}" if i == self._hover \
+            hovered = i == self._hover
+            app.draw_hotspot(self.canvas, hs, color, hovered)
+            txt = f"{hs.label} · {human_dist(hs.link.dist)}" if hovered \
                 else human_dist(hs.link.dist)
-            ty = hs.row + r * 0.55 + 10
+            ty = app.label_y(hs, hovered)
             self.canvas.create_text(hs.col + 1, ty + 1, text=txt, fill='#000000',
                                     font=F_UI, tags='hs')
             self.canvas.create_text(hs.col, ty, text=txt, fill='#e8e8e8',
@@ -4595,13 +4720,7 @@ class CompareView(tk.Toplevel if _TK_OK else object):
             self.status.config(text="même bulle que la vue principale")
 
     def _hotspot_at(self, x: float, y: float) -> Optional[int]:
-        best, best_d = None, float('inf')
-        for i, hs in enumerate(self.hotspots):
-            rx, ry = hs.radius + HIT_SLACK_PX, hs.radius * 0.55 + HIT_SLACK_PX
-            d = ((x - hs.col) / rx) ** 2 + ((y - hs.row) / ry) ** 2
-            if d <= 1.0 and d < best_d:
-                best, best_d = i, d
-        return best
+        return hotspot_hit(self.hotspots, x, y, self.app.relief())
 
     # ── interactions ─────────────────────────────────────────────────
     def _on_press(self, event) -> None:
@@ -5280,6 +5399,29 @@ def selftest(csv_path: str = '') -> int:
         check("clé dupliquée signalée, jamais fatale", len(sts_dup) == 1 and len(w_dup) == 1)
     finally:
         _sh.rmtree(tmp2, ignore_errors=True)
+
+    # 11. Pastilles en relief
+    print("\n11) Pastilles en relief")
+    t0 = time.perf_counter()
+    img, (ax, ay) = sphere_sprite(COLORS['hot'], 24)
+    dt = (time.perf_counter() - t0) * 1000
+    arr = np.asarray(img)
+    check("sprite RGBA généré", img.mode == 'RGBA' and arr.shape[2] == 4, f"{img.size}")
+    check("génération rapide", dt < 40.0, f"{dt:.1f} ms")
+    check("point du sol à l'intérieur de l'image", 0 < ax < img.width and 0 < ay < img.height)
+    top = arr[:int(ay - 0.74 * 24 * 0.86), :, 3]
+    check("la sphère est au-dessus du point du sol", top.max() > 200)
+    check("ombre présente au sol, transparente", 30 < arr[int(ay) + 2, int(ax), 3] < 200,
+          f"alpha {arr[int(ay) + 2, int(ax), 3]}")
+    bright = arr[..., :3].max()
+    check("reflet spéculaire plus clair que la couleur", bright > 0xD2, f"{bright}")
+    hs = Hotspot(Link(0, 5.0, 5.0, 0.0, 0.0), 100.0, 100.0, 20.0, 'x')
+    check("clic sur la sphère (au-dessus du sol) reconnu",
+          hotspot_hit([hs], 100, 70, True) == 0)
+    check("clic sur l'ombre reconnu", hotspot_hit([hs], 100, 102, True) == 0)
+    check("clic à côté refusé", hotspot_hit([hs], 160, 100, True) is None)
+    check("mode plat : la zone haute n'est plus cliquable",
+          hotspot_hit([hs], 100, 70, False) is None)
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))
