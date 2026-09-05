@@ -220,15 +220,38 @@ corrections**, un CSV distinct écrit à côté du relevé. Elles s'appliquent e
 direct à l'affichage, sont relues automatiquement à la réouverture du relevé, et
 ne touchent ni le relevé ni les images.
 
-### Le fichier de corrections
+### Le fichier de corrections = un patch pour QGIS
 ```
-Cle;Fichier photo;Nom du Locator;X;Y;Z;Delta Nord (deg);dX;dY;dZ;Orientation appliquee;Date
-0347;0347;K256_01;589.150;73.450;1.650;6.1077;+0.000;+0.000;+0.000;;2026-09-04 17:53
+Cle;Fichier photo;Nom du Locator;X;Y;Z;dX;dY;dH station;dDelta plancher;dZ;Delta Nord (deg);H appareil;Delta plancher;Orientation appliquee;Date
+0347;0347;K256_01;589.150;73.450;1.500;+0.000;+0.000;-0.150;+0.000;-0.150;6.1077;1.500;+0.000;;2026-09-04 17:53
 ```
+Chaque correction est rangée **selon sa nature physique**, pour être appliquée
+telle quelle au projet QGIS qui produit le relevé (jointure par la colonne
+`Cle`, puis calculatrice de champs : `X + dX`, `Y + dY`, hauteur `+ dH`,
+delta `+ dDelta`) :
+
+| Nature | Colonnes | Effet dans la vue | Cible du patch |
+|---|---|---|---|
+| Orientation | `Delta Nord (deg)` | l'image tourne | l'image (ou l'attribut nord si vous le portez) |
+| Position en plan | `dX`, `dY` | la pastille se déplace, en 2D | géométrie du point |
+| **Hauteur de station** | `dH station` | la caméra monte ou descend, **le sol reste** | attribut hauteur appareil |
+| **Delta plancher** | `dDelta plancher` | caméra **et** sol se déplacent : marche, faux plancher, local sur plusieurs niveaux | attribut delta / altitude locale |
+
+Le modèle d'altitude est `Z caméra = altitude du plancher + hauteur appareil + delta`.
+`dZ = dH + dDelta` est donné pour contrôle ; `X` `Y` `Z` `H appareil` `Delta
+plancher` sont les valeurs absolues corrigées, pour une chaîne qui préfère
+remplacer plutôt qu'ajouter. Si le relevé porte déjà des colonnes `Hauteur
+appareil` / `Delta plancher`, elles sont lues au chargement et mises à jour dans
+le relevé complet corrigé.
+
+**Convention de signe de `Delta Nord`** : angle en degrés à appliquer à l'image
+par rotation cyclique, **positif = le contenu de l'image glisse vers la droite**
+(soit un décalage de `+angle/360 × largeur` pixels). Un ancien fichier de
+corrections ne portant qu'un `Z` absolu est relu comme une correction de hauteur
+de station.
+
 * une ligne par bulle corrigée, rien d'autre, identifiée par sa **clé immuable**
   (numéro de scan, ou nom de photo à défaut) puis par son nom de photo ;
-* `X` `Y` `Z` sont les valeurs **corrigées**, `dX` `dY` `dZ` l'écart au relevé —
-  relisible à l'œil pour contrôler une passe de correction ;
 * `Delta Nord (deg)` est l'angle **restant à appliquer** à l'image ;
 * `Orientation appliquee` porte la date une fois les images tournées ;
 * écriture atomique et continue : rien n'est perdu si l'outil se ferme ;
@@ -256,8 +279,14 @@ Trois gestes, au choix :
   azimut, haut/bas = éloignement (intersection exacte du rayon avec le plan du
   sol, vérifiée au pixel près) ;
 * **glisser un point sur le plan** : positionnement X/Y en vue de dessus ;
-* **saisie numérique** X/Y/Z, avec pas réglable (1 cm à 50 cm) et Page haut/bas
-  pour l'altitude.
+* **saisie numérique** X/Y, avec pas réglable (1 cm à 50 cm).
+
+L'**altitude** se corrige par ses deux composantes, dans le bloc « Altitude » :
+**hauteur station** (Page haut/bas — la caméra bouge, le sol de la pastille
+reste) ou **delta plancher** (Maj + Page haut/bas — caméra et sol bougent).
+Depuis les bulles voisines, les deux se ressemblent : c'est la scène qui tranche
+(une marche ou un faux plancher visible = delta ; sinon = hauteur). Le panneau
+affiche en permanence Z caméra, altitude du sol, hauteur et delta résultants.
 
 **Ctrl + glisser** dans la vue déplace la **bulle active** elle-même : tout le
 réseau de pastilles suit le curseur, ce qui permet de recaler une bulle mal
@@ -332,7 +361,9 @@ construction du réseau, les temps de rendu, l'aller-retour **écran ↔ sol** u
 déplacer une pastille, l'analyse des noms de fichiers (convention, variantes, noms incomplets, cohérence
 avec les colonnes du relevé sur les 693 bulles), les filtres de pastilles (également
 appliqués à la vue de comparaison), la loi de taille en 1/distance et ses bornes (taille toujours comprise entre 10 et 36 px, de
-0,4 m à 200 m), le mode num scan (clé immuable, nom projeté, attributs explicites, rattachement des
+0,4 m à 200 m), les deux composantes d'altitude (hauteur station laissant le sol en place, delta
+plancher le déplaçant, relevé complet mis à jour par composante, ancien format relu),
+le mode num scan (clé immuable, nom projeté, attributs explicites, rattachement des
 photos par numéro, corrections retrouvées après renommage), l'aller-retour du fichier
 de corrections (écriture, relecture, ligne orpheline,
 date d'application) avec relevé source inchangé octet pour octet, l'écriture du relevé

@@ -370,16 +370,47 @@ class Station:
     oy: float = 0.0
     oz: float = 0.0
     oyaw: float = 0.0
+    # Altitude : Z camera = altitude du plancher + hauteur appareil + delta.
+    #   h0     : hauteur appareil lue dans le CSV (None = reglage global)
+    #   delta0 : decalage local du sol lu dans le CSV (marche, faux plancher)
+    #   dh     : correction « hauteur station »  -> la camera bouge, le sol reste
+    #   ddelta : correction « delta plancher »   -> camera ET sol bougent
+    h0: Optional[float] = None
+    delta0: float = 0.0
+    dh: float = 0.0
+    ddelta: float = 0.0
     key: str = ''          # cle immuable (numero de scan) ; = photo si absente
     key_explicit: bool = False   # True si la cle vient d'une colonne du CSV
     target: str = ''       # nom projete selon la convention, s'il est fourni
     attrs: Dict[str, str] = field(default_factory=dict)   # local/etage/date/index
     _parts: Optional[NameParts] = field(default=None, repr=False, compare=False)
 
+    def height(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
+        """Hauteur de l'appareil au-dessus du sol local, correction comprise."""
+        return (self.h0 if self.h0 is not None else eye) + self.dh
+
+    def ground(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
+        """Altitude du sol sous la station (là où se pose la pastille)."""
+        return self.z - self.height(eye)
+
+    def delta(self) -> float:
+        """Décalage du sol local par rapport au plancher, correction comprise."""
+        return self.delta0 + self.ddelta
+
     def moved(self, tol: float = 1e-4) -> bool:
-        """Position différente de celle lue dans le CSV."""
-        return (abs(self.x - self.ox) > tol or abs(self.y - self.oy) > tol
-                or abs(self.z - self.oz) > tol)
+        """Position en plan différente de celle lue dans le CSV (2D)."""
+        return abs(self.x - self.ox) > tol or abs(self.y - self.oy) > tol
+
+    def raised(self, tol: float = 1e-4) -> bool:
+        """Hauteur de station corrigée."""
+        return abs(self.dh) > tol
+
+    def shifted(self, tol: float = 1e-4) -> bool:
+        """Delta plancher corrigé."""
+        return abs(self.ddelta) > tol
+
+    def z_changed(self, tol: float = 1e-4) -> bool:
+        return self.raised(tol) or self.shifted(tol)
 
     def turned(self, tol: float = 1e-4) -> bool:
         """Orientation différente de celle lue dans le CSV."""
@@ -391,7 +422,7 @@ class Station:
 
     def modified(self) -> bool:
         """Modifiée depuis la lecture du CSV (donc non enregistrée)."""
-        return self.moved() or self.turned()
+        return self.moved() or self.z_changed() or self.turned()
 
     def parts(self) -> NameParts:
         """Attributs de la bulle : nom projeté s'il existe, sinon nom de la
@@ -436,7 +467,13 @@ COL_ALIASES = {
                 'nomdupoint', 'nom', 'id'),
     'x': ('x', 'e', 'est', 'easting', 'xm', 'coordx'),
     'y': ('y', 'n', 'nord', 'northing', 'ym', 'coordy'),
-    'z': ('z', 'altitude', 'alt', 'elevation', 'h', 'hauteur', 'zm', 'coordz'),
+    'z': ('z', 'altitude', 'alt', 'elevation', 'zm', 'coordz', 'zcamera'),
+    'hcam': ('hauteurappareil', 'hauteurcamera', 'hauteurstation', 'hcam',
+             'hauteur', 'h', 'hcamera', 'happareil'),
+    'delta': ('delta', 'deltaplancher', 'decalageplancher', 'deltasol',
+              'surelevation', 'marche', 'deltaz'),
+    'dh': ('dhstation', 'dh', 'dhauteur', 'correctionhauteur', 'dhauteurstation'),
+    'ddelta': ('ddeltaplancher', 'ddelta', 'correctiondelta', 'ddeltasol'),
     'north': ('pctnord', 'nordpct', 'pct', 'nordpourcent', 'cap', 'heading',
               'azimut', 'orientation'),
     'floor': ('plancher', 'niveau', 'etage', 'level', 'floor', 'dalle'),
@@ -542,6 +579,8 @@ def read_survey_csv(path: str) -> Tuple[List[Station], List[str]]:
         if north is None:
             north = 50.0
         dnord = parse_float(cell(row, 'dnord')) or 0.0
+        h0 = parse_float(cell(row, 'hcam'))
+        delta0 = parse_float(cell(row, 'delta')) or 0.0
         cle = cell(row, 'key') or photo
         target = base_name(cell(row, 'target')) if cell(row, 'target') else ''
         attrs = {k: cell(row, k) for k in ('local', 'etage', 'date', 'index')
@@ -571,6 +610,7 @@ def read_survey_csv(path: str) -> Tuple[List[Station], List[str]]:
             yaw_fix=wrap180(dnord),
             ox=x, oy=y, oz=zv, oyaw=wrap180(dnord),
             key=cle, target=target, attrs=attrs, key_explicit='key' in col,
+            h0=h0, delta0=delta0,
         ))
 
     if not stations:
@@ -907,6 +947,33 @@ def ground_from_screen(view: View, col: float, row: float, calib: Calib,
     return calib.azimuth(psi, north_pct), dist
 
 
+@dataclass(frozen=True)
+class Bilan:
+    """Décompte des bulles corrigées, par nature."""
+    xy: int = 0
+    h: int = 0
+    delta: int = 0
+    nord: int = 0
+
+    def position(self) -> int:
+        return self.xy + self.h + self.delta
+
+    def any(self) -> bool:
+        return bool(self.xy or self.h or self.delta or self.nord)
+
+    def texte(self) -> str:
+        parts = []
+        if self.xy:
+            parts.append(f"{self.xy} XY")
+        if self.h:
+            parts.append(f"{self.h} hauteur")
+        if self.delta:
+            parts.append(f"{self.delta} delta")
+        if self.nord:
+            parts.append(f"{self.nord} nord")
+        return ' · '.join(parts) if parts else "aucune"
+
+
 class Corrections:
     """Journal des corrections, stocké dans un FICHIER DE CORRECTIONS distinct.
 
@@ -918,12 +985,19 @@ class Corrections:
 
     SUFFIX = '_corrections.csv'
     DELIM = ';'
-    HEADER = ('Cle', 'Fichier photo', 'Nom du Locator', 'X', 'Y', 'Z', YAW_COLUMN,
-              'dX', 'dY', 'dZ', 'Orientation appliquee', 'Date')
+    # Un enregistrement = un patch : deltas separes par nature physique, et
+    # valeurs absolues corrigees, joignables dans QGIS par la colonne « Cle ».
+    HEADER = ('Cle', 'Fichier photo', 'Nom du Locator',
+              'X', 'Y', 'Z', 'dX', 'dY',
+              'dH station', 'dDelta plancher', 'dZ',
+              YAW_COLUMN, 'H appareil', 'Delta plancher',
+              'Orientation appliquee', 'Date')
 
-    def __init__(self, csv_path: str = '', path: str = ''):
+    def __init__(self, csv_path: str = '', path: str = '',
+                 eye: float = EYE_HEIGHT_DEFAULT):
         self.csv_path = csv_path
         self.path = path or self.default_path(csv_path)
+        self.eye = eye                       # hauteur appareil par defaut
         self.applied: Dict[str, str] = {}   # photo -> date de rotation des images
         self.dirty = False
         self._undo: List[Tuple[str, dict]] = []
@@ -938,19 +1012,28 @@ class Corrections:
     # ── etat ─────────────────────────────────────────────────────────
     @staticmethod
     def snapshot(st: Station) -> dict:
-        return {'x': st.x, 'y': st.y, 'z': st.z, 'yaw_fix': st.yaw_fix}
+        return {'x': st.x, 'y': st.y, 'dh': st.dh, 'ddelta': st.ddelta,
+                'yaw_fix': st.yaw_fix}
 
     @staticmethod
     def restore(st: Station, snap: dict) -> None:
         st.x = float(snap.get('x', st.x))
         st.y = float(snap.get('y', st.y))
-        st.z = float(snap.get('z', st.z))
+        st.dh = float(snap.get('dh', st.dh))
+        st.ddelta = float(snap.get('ddelta', st.ddelta))
+        st.z = st.oz + st.dh + st.ddelta
         st.yaw_fix = float(snap.get('yaw_fix', st.yaw_fix))
 
     # ── modifications ────────────────────────────────────────────────
     def apply(self, st: Station, *, x: float = None, y: float = None,
-              z: float = None, yaw_fix: float = None, record: bool = True) -> None:
-        """Applique une correction, en empilant l'état précédent (annulation)."""
+              dh: float = None, ddelta: float = None, yaw_fix: float = None,
+              record: bool = True) -> None:
+        """Applique une correction, en empilant l'état précédent (annulation).
+
+        Les deux composantes en Z sont distinctes : `dh` (hauteur station) ne
+        déplace que la caméra, `ddelta` (delta plancher) déplace caméra et sol.
+        L'altitude caméra `z` est toujours recalculée : oz + dh + ddelta.
+        """
         if record:
             with self._lock:
                 self._undo.append((st.photo, self.snapshot(st)))
@@ -959,8 +1042,11 @@ class Corrections:
             st.x = float(x)
         if y is not None:
             st.y = float(y)
-        if z is not None:
-            st.z = float(z)
+        if dh is not None:
+            st.dh = float(dh)
+        if ddelta is not None:
+            st.ddelta = float(ddelta)
+        st.z = st.oz + st.dh + st.ddelta
         if yaw_fix is not None:
             st.yaw_fix = wrap180(float(yaw_fix))
         self.dirty = True
@@ -981,7 +1067,7 @@ class Corrections:
 
     def revert(self, st: Station) -> None:
         """Retour aux valeurs du relevé d'origine."""
-        self.apply(st, x=st.ox, y=st.oy, z=st.oz, yaw_fix=st.oyaw)
+        self.apply(st, x=st.ox, y=st.oy, dh=0.0, ddelta=0.0, yaw_fix=st.oyaw)
         self.applied.pop(st.key, None)
 
     def revert_all(self, stations: Sequence[Station]) -> int:
@@ -993,10 +1079,12 @@ class Corrections:
         return n
 
     @staticmethod
-    def counts(stations: Sequence[Station]) -> Tuple[int, int]:
-        """(positions corrigées, orientations corrigées) au regard du relevé."""
-        return (sum(1 for s in stations if s.moved()),
-                sum(1 for s in stations if s.turned()))
+    def counts(stations: Sequence[Station]) -> "Bilan":
+        """Nombre de bulles corrigées, par nature de correction."""
+        return Bilan(xy=sum(1 for s in stations if s.moved()),
+                     h=sum(1 for s in stations if s.raised()),
+                     delta=sum(1 for s in stations if s.shifted()),
+                     nord=sum(1 for s in stations if s.turned()))
 
     @staticmethod
     def pending_images(stations: Sequence[Station]) -> List[Station]:
@@ -1025,8 +1113,10 @@ class Corrections:
             lines.append(self.DELIM.join((
                 st.key, st.photo, st.locator,
                 f"{st.x:.3f}", f"{st.y:.3f}", f"{st.z:.3f}",
+                f"{st.x - st.ox:+.3f}", f"{st.y - st.oy:+.3f}",
+                f"{st.dh:+.3f}", f"{st.ddelta:+.3f}", f"{st.z - st.oz:+.3f}",
                 f"{st.yaw_fix:.4f}",
-                f"{st.x - st.ox:+.3f}", f"{st.y - st.oy:+.3f}", f"{st.z - st.oz:+.3f}",
+                f"{st.height(self.eye):.3f}", f"{st.delta():+.3f}",
                 self.applied.get(st.key, ''), stamp)))
         tmp = self.path + '.tmp'
         try:
@@ -1057,7 +1147,7 @@ class Corrections:
             return 0, 0
         header = [norm_key(c) for c in rows[0]]
         col: Dict[str, int] = {}
-        for field_name in ('photo', 'x', 'y', 'z', 'dnord', 'key'):
+        for field_name in ('photo', 'x', 'y', 'z', 'dnord', 'key', 'dh', 'ddelta'):
             for alias in COL_ALIASES[field_name]:
                 if alias in header:
                     col[field_name] = header.index(alias)
@@ -1082,10 +1172,22 @@ class Corrections:
                 n_miss += 1
                 continue
             values = {}
-            for axis in ('x', 'y', 'z'):
+            for axis in ('x', 'y'):
                 v = parse_float(cell(axis))
                 if v is not None:
                     values[axis] = v
+            dh = parse_float(cell('dh'))
+            dd = parse_float(cell('ddelta'))
+            if dh is None and dd is None:
+                # ancien format : seule l'altitude camera etait ecrite ; on la
+                # range en hauteur de station, la lecture la plus courante
+                z = parse_float(cell('z'))
+                if z is not None:
+                    dh = z - st.oz
+            if dh is not None:
+                values['dh'] = dh
+            if dd is not None:
+                values['ddelta'] = dd
             dn = parse_float(cell('dnord'))
             if dn is not None:
                 values['yaw_fix'] = dn
@@ -1115,7 +1217,8 @@ def _format_like(sample: str, value: float, default_decimals: int = 3) -> str:
 
 
 def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
-                        write_yaw: Optional[bool] = None) -> Tuple[int, int, bool]:
+                        write_yaw: Optional[bool] = None,
+                        eye: float = EYE_HEIGHT_DEFAULT) -> Tuple[int, int, bool]:
     """Écrit une copie du CSV portant les corrections : X/Y/Z et Δ nord.
 
     Rien n'est destructif : le fichier source n'est pas touché, les images non
@@ -1138,7 +1241,7 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
     head_eol = lines[0][len(head_body):]
     header = [norm_key(c) for c in next(csv.reader([head_body], delimiter=delim))]
     col: Dict[str, int] = {}
-    for field_name in ('photo', 'x', 'y', 'z', 'dnord', 'key'):
+    for field_name in ('photo', 'x', 'y', 'z', 'dnord', 'key', 'hcam', 'delta'):
         for alias in COL_ALIASES[field_name]:
             if alias in header:
                 col[field_name] = header.index(alias)
@@ -1146,6 +1249,15 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
     if 'photo' not in col:
         raise ValueError("Colonne « Fichier photo » introuvable dans le CSV source.")
     by_key = {st.key.lower(): st for st in stations}
+
+    def cellules(st: Station):
+        """Cellules à réécrire pour une bulle déplacée ou remontée."""
+        out = [('x', st.x), ('y', st.y), ('z', st.z)]
+        if 'hcam' in col:
+            out.append(('hcam', st.height(eye)))
+        if 'delta' in col:
+            out.append(('delta', st.delta()))
+        return out
 
     need_yaw = (any(st.has_yaw() or st.turned() for st in stations)
                 if write_yaw is None else bool(write_yaw))
@@ -1171,7 +1283,8 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
             st = by_key.get(fields[col['key']].strip().lower())
         if st is None and col['photo'] < len(fields):
             st = by_photo.get(base_name(fields[col['photo']]).lower())
-        touch = st is not None and (st.moved() or (need_yaw and st.turned()))
+        touch = st is not None and (st.moved() or st.z_changed()
+                                    or (need_yaw and st.turned()))
         if not touch and not add_col:
             out.append(raw)
             n_keep += 1
@@ -1185,8 +1298,8 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
             yaw_txt = _format_like(sample, value, default_decimals=4)
 
         if '"' in body:                       # ligne avec guillemets : réécriture csv
-            if st is not None and st.moved():
-                for name, value in (('x', st.x), ('y', st.y), ('z', st.z)):
+            if st is not None and (st.moved() or st.z_changed()):
+                for name, value in cellules(st):
                     i = col.get(name, -1)
                     if 0 <= i < len(fields):
                         fields[i] = _format_like(fields[i], value)
@@ -1200,8 +1313,8 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
             out.append(buf.getvalue() + eol)
         else:                                  # cas courant : substitution en place
             parts = body.split(delim)
-            if st is not None and st.moved():
-                for name, value in (('x', st.x), ('y', st.y), ('z', st.z)):
+            if st is not None and (st.moved() or st.z_changed()):
+                for name, value in cellules(st):
                     i = col.get(name, -1)
                     if 0 <= i < len(parts):
                         parts[i] = _format_like(parts[i], value)
@@ -1658,7 +1771,7 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
     out: List[Hotspot] = []
     for lk in retenus:
         tgt = stations[lk.target]
-        dz = (tgt.z - eye) - st.z          # pastille posée au sol de la cible
+        dz = tgt.ground(eye) - st.z        # pastille posée au sol de la cible
         dh = lk.dist_h
         elev = math.degrees(math.atan2(dz, dh)) if dh > 1e-6 else (90.0 if dz > 0 else -90.0)
         pr = project(view, calib.pano_yaw(lk.azimuth, st.north_pct), elev)
@@ -2003,8 +2116,10 @@ class BubbleNavApp(_TkBase):
         self.bind('<E>', lambda e: self._toggle_edit())
         self.bind('<Control-z>', lambda e: self._undo_edit())
         self.bind('<Control-s>', lambda e: self._dlg_apply())
-        self.bind('<Prior>', lambda e: self._bump('z', +1))
-        self.bind('<Next>', lambda e: self._bump('z', -1))
+        self.bind('<Prior>', lambda e: self._bump('dh', +1))
+        self.bind('<Next>', lambda e: self._bump('dh', -1))
+        self.bind('<Shift-Prior>', lambda e: self._bump('ddelta', +1))
+        self.bind('<Shift-Next>', lambda e: self._bump('ddelta', -1))
         self.bind('<Escape>', lambda e: self.attributes('-fullscreen', False))
 
     # ═════════════════════════════════════════════════════════════════
@@ -2070,7 +2185,8 @@ class BubbleNavApp(_TkBase):
         self.by_photo = {s.photo: s for s in stations}
         self.by_key = {s.key.lower(): s for s in stations}
         custom = self.cfg.get('corr_paths', {}).get(path, '')
-        self.corrections = Corrections(path, custom if isinstance(custom, str) else '')
+        self.corrections = Corrections(path, custom if isinstance(custom, str) else '',
+                                       eye=float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
         self.selected = None
         corr_msg = ''
         if os.path.isfile(self.corrections.path):
@@ -2459,7 +2575,7 @@ class BubbleNavApp(_TkBase):
             dh = math.hypot(dx, dy)
             if dh > radius or dh < 1e-6:
                 continue
-            dz = (other.z - eye) - st.z
+            dz = other.ground(eye) - st.z
             az = math.degrees(math.atan2(dx, dy))
             elev = math.degrees(math.atan2(dz, dh))
             pr = project(view, self.calib.pano_yaw(az, st.north_pct), elev)
@@ -2508,7 +2624,11 @@ class BubbleNavApp(_TkBase):
         if tgt.modified():
             marks = []
             if tgt.moved():
-                marks.append(f"XYZ déplacé de {math.dist((tgt.x, tgt.y, tgt.z), (tgt.ox, tgt.oy, tgt.oz)):.2f} m")
+                marks.append(f"XY déplacé de {math.hypot(tgt.x - tgt.ox, tgt.y - tgt.oy):.2f} m")
+            if tgt.raised():
+                marks.append(f"hauteur {tgt.dh:+.3f} m")
+            if tgt.shifted():
+                marks.append(f"delta {tgt.ddelta:+.3f} m")
             if tgt.turned():
                 marks.append(f"image tournée de {tgt.yaw_fix:+.2f}°")
             lines.append("modifié      " + ' · '.join(marks))
@@ -2562,11 +2682,11 @@ class BubbleNavApp(_TkBase):
                 self._hs_drag = ('yaw', self.current, st.yaw_fix, event.x)
                 return
             if ctrl:                                     # deplacer la bulle active
-                pos = self._ground_target(event.x, event.y, -eye)
+                pos = self._ground_target(event.x, event.y, -st.height(eye))
                 if pos is not None:
                     self._set_target(None)
                     self.corrections.apply(st)           # état avant le geste
-                    self._hs_drag = ('active', self.current, -eye,
+                    self._hs_drag = ('active', self.current, -st.height(eye),
                                      pos[0], pos[1], st.x, st.y)
                     return
             hit = self._hotspot_at(event.x, event.y)
@@ -2574,7 +2694,7 @@ class BubbleNavApp(_TkBase):
                 tgt = self.stations[self.hotspots[hit].link.target]
                 self._set_target(tgt.idx)
                 self.corrections.apply(tgt)              # état avant le geste
-                self._hs_drag = ('pastille', tgt.idx, (tgt.z - eye) - st.z)
+                self._hs_drag = ('pastille', tgt.idx, tgt.ground(eye) - st.z)
                 return
         self._drag = (event.x, event.y, self.view.yaw, self.view.pitch)
 
@@ -2932,9 +3052,15 @@ class BubbleNavApp(_TkBase):
             lignes.append(f"         Δz {st.z - origin.z:+.2f} m depuis {origin.locator}")
         if st.has_yaw():
             lignes.append(f"Δ nord   {st.yaw_fix:+.3f}°  (à appliquer à l'image)")
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        lignes.append(f"sol      {st.ground(eye):.2f}  ·  hauteur {st.height(eye):.2f}"
+                      + (f"  ·  delta {st.delta():+.2f}" if st.delta() else ''))
         if st.moved():
-            lignes.append("DÉPLACÉE de "
-                          f"{math.dist((st.x, st.y, st.z), (st.ox, st.oy, st.oz)):.2f} m")
+            lignes.append(f"DÉPLACÉE en plan de {math.hypot(st.x - st.ox, st.y - st.oy):.2f} m")
+        if st.raised():
+            lignes.append(f"HAUTEUR STATION corrigée de {st.dh:+.3f} m")
+        if st.shifted():
+            lignes.append(f"DELTA PLANCHER corrigé de {st.ddelta:+.3f} m")
         applied = self.corrections.applied.get(st.key) if self.corrections else None
         if applied:
             lignes.append(f"image tournée le {applied}")
@@ -2989,7 +3115,7 @@ class BubbleNavApp(_TkBase):
         grid = tk.Frame(self.edit_frame, bg=COLORS['card'])
         grid.pack(fill='x', pady=2)
         self.pos_vars = {}
-        for i, axis in enumerate(('x', 'y', 'z')):
+        for i, axis in enumerate(('x', 'y')):
             tk.Label(grid, text=axis.upper(), font=F_MONO, width=2, bg=COLORS['card'],
                      fg=COLORS['text']).grid(row=i, column=0)
             var = tk.StringVar(value='—')
@@ -3008,7 +3134,33 @@ class BubbleNavApp(_TkBase):
                      style='BN.TCombobox', values=('0.01', '0.05', '0.10', '0.50')
                      ).grid(row=1, column=4, padx=(8, 2))
         self._mk_button(grid, "Appliquer", self._apply_position_fields,
-                        bg=COLORS['bg_light']).grid(row=2, column=4, padx=(8, 2))
+                        bg=COLORS['bg_light']).grid(row=1, column=5, padx=(8, 2))
+
+        # Altitude : deux composantes de nature physique differente
+        tk.Label(self.edit_frame, text="Altitude (deux composantes)", font=F_UI_B,
+                 bg=COLORS['card'], fg=COLORS['accent']).pack(anchor='w', pady=(6, 0))
+        zg = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        zg.pack(fill='x', pady=2)
+        for i, (axis, lib) in enumerate((('dh', "Hauteur station"),
+                                         ('ddelta', "Delta plancher"))):
+            tk.Label(zg, text=lib, font=F_UI, width=15, anchor='w', bg=COLORS['card'],
+                     fg=COLORS['text']).grid(row=i, column=0)
+            var = tk.StringVar(value='0.000')
+            self.pos_vars[axis] = var
+            ent = tk.Entry(zg, textvariable=var, width=8, font=F_MONO,
+                           bg=COLORS['bg_light'], fg=COLORS['text'], relief='flat',
+                           insertbackground=COLORS['text'])
+            ent.grid(row=i, column=1, padx=3, pady=1)
+            ent.bind('<Return>', lambda e: self._apply_position_fields())
+            self._mk_button(zg, "−", lambda a=axis: self._bump(a, -1)).grid(row=i, column=2)
+            self._mk_button(zg, "+", lambda a=axis: self._bump(a, +1)).grid(row=i, column=3, padx=2)
+        self.z_lbl = tk.Label(self.edit_frame, text="", font=F_MONO, bg=COLORS['card'],
+                              fg=COLORS['text_muted'], anchor='w', justify='left')
+        self.z_lbl.pack(fill='x')
+        label(self.edit_frame,
+              "hauteur station : la caméra bouge, le sol reste (PgUp/PgDn)\n"
+              "delta plancher : caméra et sol bougent — marche, faux\n"
+              "plancher (Maj+PgUp/PgDn)").pack(anchor='w', pady=(0, 2))
 
         # Orientation image
         tk.Label(self.edit_frame, text="Orientation — Δ nord (enregistré au CSV)",
@@ -3126,8 +3278,13 @@ class BubbleNavApp(_TkBase):
             return
         who = "bulle active" if self.selected is None else "pastille"
         self.target_lbl.config(text=f"{st.locator}  ({who})")
-        for axis in ('x', 'y', 'z'):
+        for axis in ('x', 'y'):
             self.pos_vars[axis].set(f"{getattr(st, axis):.3f}")
+        self.pos_vars['dh'].set(f"{st.dh:+.3f}")
+        self.pos_vars['ddelta'].set(f"{st.ddelta:+.3f}")
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        self.z_lbl.config(text=(f"Z caméra {st.z:.3f}  ·  sol {st.ground(eye):.3f}  ·  "
+                                f"hauteur {st.height(eye):.2f}  ·  delta {st.delta():+.2f}"))
         self._sync_ui = True
         try:
             self.yaw_var.set(round(self.stations[self.current].yaw_fix, 2)
@@ -3135,17 +3292,17 @@ class BubbleNavApp(_TkBase):
         finally:
             self._sync_ui = False
         self.yaw_lbl.config(text=f"{self.yaw_var.get():+.2f}°".replace('.', ','))
-        moved, turned = Corrections.counts(self.stations)
+        bilan = Corrections.counts(self.stations)
         pending = len(Corrections.pending_images(self.stations))
         etat = "modifications non enregistrées" if self.corrections.dirty else "enregistré"
         self.corr_lbl.config(
             text=f"{os.path.basename(self.corrections.path) or '—'} ({etat})",
             fg=COLORS['edit'] if self.corrections.dirty else COLORS['ok'])
-        if moved or turned:
+        if bilan.any():
             self.edit_count.config(
-                text=(f"corrections : {moved} position(s) · {turned} orientation(s)\n"
+                text=(f"corrections : {bilan.texte()}\n"
                       f"images à tourner : {pending}"), fg=COLORS['edit'])
-            self.edit_lbl.config(text=f"✎ {moved} XYZ · {turned} nord")
+            self.edit_lbl.config(text=f"✎ {bilan.texte()}")
         else:
             self.edit_count.config(
                 text=("aucune correction" if not pending else
@@ -3177,10 +3334,10 @@ class BubbleNavApp(_TkBase):
         if not self.corrections.dirty:
             return
         path = self.corrections.save(self.stations)
-        moved, turned = Corrections.counts(self.stations)
+        bilan = Corrections.counts(self.stations)
         if path:
-            self._set_status(f"{moved} position(s) et {turned} orientation(s) "
-                             f"enregistrées → {os.path.basename(path)}")
+            self._set_status(f"corrections enregistrées ({bilan.texte()}) "
+                             f"→ {os.path.basename(path)}")
         else:
             self._set_status("Enregistrement des corrections impossible : "
                              f"{self.corrections.path}", COLORS['error'])
@@ -3191,10 +3348,10 @@ class BubbleNavApp(_TkBase):
         if st is None:
             return
         vals = {}
-        for axis in ('x', 'y', 'z'):
+        for axis in ('x', 'y', 'dh', 'ddelta'):
             v = parse_float(self.pos_vars[axis].get())
             if v is None:
-                messagebox.showwarning("Position", f"Valeur {axis.upper()} illisible.")
+                messagebox.showwarning("Position", f"Valeur « {axis} » illisible.")
                 self._refresh_edit_panel()
                 return
             vals[axis] = v
@@ -3335,9 +3492,9 @@ class BubbleNavApp(_TkBase):
         if not self.stations:
             return
         self._autosave()
-        moved, turned = Corrections.counts(self.stations)
+        bilan = Corrections.counts(self.stations)
         pending = Corrections.pending_images(self.stations)
-        if not (moved or turned or pending):
+        if not (bilan.any() or pending):
             messagebox.showinfo("Appliquer", "Aucune correction en attente.")
             return
 
@@ -3351,8 +3508,10 @@ class BubbleNavApp(_TkBase):
                  fg=COLORS['accent']).pack(anchor='w', padx=14, pady=(12, 2))
         tk.Label(win, justify='left', anchor='w', font=F_MONO, bg=COLORS['card'],
                  fg=COLORS['text'], padx=10, pady=8, text=(
-                     f"positions corrigées      {moved:4d}\n"
-                     f"orientations corrigées   {turned:4d}\n"
+                     f"positions XY corrigées   {bilan.xy:4d}\n"
+                     f"hauteurs de station      {bilan.h:4d}\n"
+                     f"deltas plancher          {bilan.delta:4d}\n"
+                     f"orientations corrigées   {bilan.nord:4d}\n"
                      f"images à tourner         {len(pending):4d}\n\n"
                      f"relevé chargé (intact)   {os.path.basename(self.csv_path)}\n"
                      f"fichier de corrections   {os.path.basename(self.corrections.path)}")
@@ -3499,7 +3658,9 @@ class BubbleNavApp(_TkBase):
     def _export_merged(self, path: str) -> bool:
         """Écrit un relevé complet corrigé, sans rien changer aux fichiers de travail."""
         try:
-            n_mod, n_keep, added = write_corrected_csv(self.csv_path, path, self.stations)
+            n_mod, n_keep, added = write_corrected_csv(
+                self.csv_path, path, self.stations,
+                eye=float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
         except Exception as exc:
             messagebox.showerror("Relevé corrigé", f"Écriture impossible :\n{exc}")
             return False
@@ -4750,13 +4911,29 @@ def selftest(csv_path: str = '') -> int:
             by_photo = {s.photo: s for s in sts}
             corr = Corrections(work_csv)
 
-            corr.apply(sts[0], x=sts[0].x + 0.123, z=sts[0].z - 0.05)
+            corr.apply(sts[0], x=sts[0].x + 0.123, dh=-0.05)
             corr.apply(sts[5], y=sts[5].y - 1.5)
             corr.apply(sts[9], yaw_fix=1.25)
-            check("état modifié détecté", sts[0].moved() and sts[9].turned()
-                  and not sts[9].moved())
-            check("comptage des corrections", Corrections.counts(sts) == (2, 1),
-                  str(Corrections.counts(sts)))
+            check("état modifié détecté", sts[0].moved() and sts[0].raised()
+                  and sts[9].turned() and not sts[9].moved())
+            check("comptage des corrections",
+                  Corrections.counts(sts) == Bilan(xy=2, h=1, delta=0, nord=1),
+                  Corrections.counts(sts).texte())
+
+            # Les deux composantes en Z : hauteur station vs delta plancher
+            s0 = sts[0]
+            sol_avant = s0.ground(1.65)
+            corr.apply(s0, dh=-0.05, record=False)
+            check("hauteur station : la caméra bouge, le sol reste",
+                  abs(s0.z - (s0.oz - 0.05)) < 1e-9 and abs(s0.ground(1.65) - sol_avant) < 1e-9,
+                  f"z {s0.oz:.3f} -> {s0.z:.3f}, sol {s0.ground(1.65):.3f}")
+            corr.apply(s0, dh=0.0, ddelta=0.12, record=False)
+            check("delta plancher : caméra ET sol bougent",
+                  abs(s0.z - (s0.oz + 0.12)) < 1e-9
+                  and abs(s0.ground(1.65) - (sol_avant + 0.12)) < 1e-9,
+                  f"z {s0.z:.3f}, sol {s0.ground(1.65):.3f}")
+            check("Z = altitude d'origine + dH + dDelta", abs(s0.z - (s0.oz + s0.dh + s0.ddelta)) < 1e-12)
+            corr.apply(s0, dh=-0.05, ddelta=0.0, record=False)
             check("images en attente de rotation",
                   [s.idx for s in Corrections.pending_images(sts)] == [9])
 
@@ -4772,10 +4949,16 @@ def selftest(csv_path: str = '') -> int:
             corr_lines = _read_text(side).splitlines()
             check("une ligne par bulle corrigée seulement", len(corr_lines) == 4,
                   f"{len(corr_lines) - 1} ligne(s)")
-            check("en-tête du fichier de corrections",
-                  corr_lines[0].split(';')[:7] ==
-                  ['Cle', 'Fichier photo', 'Nom du Locator', 'X', 'Y', 'Z', YAW_COLUMN],
-                  corr_lines[0][:60])
+            check("en-tête du fichier de corrections (patch QGIS)",
+                  corr_lines[0].split(';') == list(Corrections.HEADER),
+                  corr_lines[0][:80])
+            champs = dict(zip(corr_lines[0].split(';'), corr_lines[1].split(';')))
+            check("deltas séparés par nature dans le fichier",
+                  abs(float(champs['dH station']) + 0.05) < 1e-6
+                  and abs(float(champs['dDelta plancher'])) < 1e-6
+                  and abs(float(champs['dZ']) + 0.05) < 1e-6
+                  and abs(float(champs['dX']) - 0.123) < 1e-6,
+                  f"dH {champs['dH station']} dDelta {champs['dDelta plancher']} dZ {champs['dZ']}")
             check("le relevé chargé n'est pas touché",
                   open(work_csv, 'rb').read() == before)
 
@@ -4785,11 +4968,22 @@ def selftest(csv_path: str = '') -> int:
             check("corrections relues et appliquées",
                   n_ok == 3 and n_miss == 0
                   and abs(by2[sts[0].photo].x - sts[0].x) < 5e-4
+                  and abs(by2[sts[0].photo].dh + 0.05) < 5e-4
                   and abs(by2[sts[9].photo].yaw_fix - 1.25) < 5e-5,
                   f"{n_ok} appliquées, {n_miss} sans correspondance")
             check("corrections relues = état modifié",
                   by2[sts[0].photo].moved() and by2[sts[9].photo].turned()
-                  and Corrections.counts(sts2) == (2, 1))
+                  and Corrections.counts(sts2) == Bilan(xy=2, h=1, delta=0, nord=1))
+
+            # ancien format (Z absolu seul) : range en hauteur de station
+            legacy = os.path.join(tmp, 'ancien_corrections.csv')
+            with open(legacy, 'w', encoding='utf-8-sig', newline='') as fh:
+                fh.write("Fichier photo;X;Y;Z;Delta Nord (deg)\r\n"
+                         f"{sts[3].photo};{sts[3].ox:.3f};{sts[3].oy:.3f};{sts[3].oz + 0.2:.3f};0\r\n")
+            sts_l, _ = read_survey_csv(work_csv)
+            Corrections(work_csv, path=legacy).load({s.photo: s for s in sts_l})
+            check("ancien fichier (Z seul) relu comme hauteur de station",
+                  abs(sts_l[3].dh - 0.2) < 1e-6 and sts_l[3].raised() and not sts_l[3].shifted())
 
             with open(side, 'a', encoding='utf-8') as fh:
                 fh.write("PHOTO_INCONNUE;X;1.0;2.0;3.0;0.0;;;;;\r\n")
@@ -4852,9 +5046,9 @@ def selftest(csv_path: str = '') -> int:
                   abs(read_survey_csv(out2)[0][9].yaw_fix - 2.5) < 1e-6)
 
             corr.revert_all(sts)
-            check("réinitialisation complète", Corrections.counts(sts) == (0, 0))
+            check("réinitialisation complète", not Corrections.counts(sts).any())
             check("retour aux valeurs du fichier",
-                  all(not s.moved() and not s.turned() for s in sts))
+                  all(not s.modified() and abs(s.z - s.oz) < 1e-12 for s in sts))
 
         # 8. Rotation d'image : semantique et coherence avec le rendu
         print("\n8) Rotation d'image (correction d'orientation)")
@@ -5053,6 +5247,30 @@ def selftest(csv_path: str = '') -> int:
         n_mod, _, _ = write_corrected_csv(csv_ren, out3, sts_ren)
         rel3, _ = read_survey_csv(out3)
         check("relevé complet corrigé par clé", n_mod == 1 and abs(rel3[0].x - 10.25) < 5e-4)
+
+        # colonnes Hauteur appareil / Delta du releve mises a jour par composante
+        csv_hd = os.path.join(tmp2, 'hd.csv')
+        with open(csv_hd, 'w', encoding='utf-8-sig', newline='') as fh:
+            fh.write("Num scan;Fichier photo;X;Y;Z;Hauteur appareil;Delta plancher;% NORD;Plancher\r\n"
+                     "0001;0001;1.000;2.000;3.250;1.600;0.000;50;P0\r\n"
+                     "0002;0002;4.000;2.000;3.250;1.600;0.000;50;P0\r\n")
+        sts_hd, _ = read_survey_csv(csv_hd)
+        check("hauteur appareil et delta lus dans le relevé",
+              sts_hd[0].h0 == 1.6 and sts_hd[0].delta0 == 0.0
+              and abs(sts_hd[0].ground() - 1.65) < 1e-9)
+        c_hd = Corrections(csv_hd)
+        c_hd.apply(sts_hd[0], dh=0.05)
+        c_hd.apply(sts_hd[1], ddelta=-0.15)
+        out_hd = os.path.join(tmp2, 'hd_corrige.csv')
+        write_corrected_csv(csv_hd, out_hd, sts_hd)
+        rel_hd, _ = read_survey_csv(out_hd)
+        check("relevé complet : Z, hauteur et delta mis à jour selon la composante",
+              abs(rel_hd[0].oz - 3.30) < 5e-4 and abs(rel_hd[0].h0 - 1.65) < 5e-4
+              and abs(rel_hd[0].delta0) < 5e-4
+              and abs(rel_hd[1].oz - 3.10) < 5e-4 and abs(rel_hd[1].h0 - 1.60) < 5e-4
+              and abs(rel_hd[1].delta0 + 0.15) < 5e-4,
+              f"{rel_hd[0].oz:.3f}/{rel_hd[0].h0:.3f}/{rel_hd[0].delta0:+.3f} · "
+              f"{rel_hd[1].oz:.3f}/{rel_hd[1].h0:.3f}/{rel_hd[1].delta0:+.3f}")
 
         dup = os.path.join(tmp2, 'dup.csv')
         with open(dup, 'w', encoding='utf-8', newline='') as fh:
