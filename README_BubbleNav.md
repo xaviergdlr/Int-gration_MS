@@ -108,8 +108,10 @@ bulle corrigée.
 ombre portée — éclairage en haut à gauche, reflet, ombre douce au pied — générée
 une fois par couleur et par taille puis mise en cache (3 ms, aussi rapide qu'un
 disque plat à l'affichage). Le point du sol projeté est le pied de la sphère ;
-la sphère comme l'ombre sont cliquables. « Réglages… → Pastilles en relief »
-revient aux disques plats.
+la sphère comme l'ombre sont cliquables. Au **survol**, la sphère grossit,
+s'éclaircit et s'entoure d'un **halo lumineux**, et son infobulle apparaît —
+dans la vue principale comme dans la vue de comparaison. « Réglages… →
+Pastilles en relief » revient aux disques plats.
 
 **Taille des pastilles** : rayon à l'écran = focale × rayon physique ÷ distance —
 une pastille trois fois plus loin est trois fois plus petite, et zoomer les

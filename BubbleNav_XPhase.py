@@ -1791,6 +1791,8 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
 SPHERE_RADIUS = 0.74     # rayon de la sphere, en fraction du rayon de pastille
 SHADOW_RX, SHADOW_RY = 1.00, 0.36   # demi-axes de l'ombre au sol (fractions)
 SPHERE_LIFT = 0.86       # centre de la sphere au-dessus du sol (fraction de rs)
+HALO_RADIUS = 1.75       # rayon du halo de survol (fraction de rs)
+HALO_COLOR = (255, 255, 235)
 
 
 def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2):
@@ -1808,8 +1810,9 @@ def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2):
     sx, sy = SHADOW_RX * R, SHADOW_RY * R
     blur = max(1.0, 0.10 * R)
     pad = int(2 * blur + 2 * ss)
-    W = int(2 * sx) + 2 * pad
-    gy = int(2 * rs * 0.95 + pad)
+    rh = HALO_RADIUS * rs if hover else 0.0        # halo de surbrillance
+    W = int(2 * max(sx, rh)) + 2 * pad
+    gy = int(max(2 * rs * 0.95, rh + rs * SPHERE_LIFT) + pad)
     H = int(gy + sy + 2 * pad)
     cx = W / 2.0
     cy = gy - rs * SPHERE_LIFT
@@ -1823,6 +1826,18 @@ def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2):
         ImageFilter.GaussianBlur(blur))
     out = np.zeros((H, W, 4), np.float32)
     out[..., 3] = np.asarray(shadow, np.float32) / 255.0
+
+    if hover:
+        # halo : lueur douce autour de la sphere, bien visible sur toute photo
+        dh_ = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / max(rh, 1.0)
+        halo_a = np.clip(1.0 - dh_, 0, 1) ** 1.6 * 0.75
+        halo_rgb = np.array(HALO_COLOR, np.float32) / 255.0
+        a_old = out[..., 3]
+        a_new = halo_a + a_old * (1 - halo_a)
+        out[..., :3] = ((halo_rgb[None, None, :] * halo_a[..., None]
+                         + out[..., :3] * (a_old * (1 - halo_a))[..., None])
+                        / np.maximum(a_new, 1e-6)[..., None])
+        out[..., 3] = a_new
 
     # sphere : lambert + speculaire + assombrissement du bord
     h = color.lstrip('#')
@@ -2718,18 +2733,13 @@ class BubbleNavApp(_TkBase):
             self.canvas.create_text(col + 8, row - 7, anchor='w', text=other.locator,
                                     fill=COLORS['sel'], font=F_UI, tags='hs')
 
-    def _draw_tooltip(self, x: int, y: int, hit: Optional[int]) -> None:
-        """Infobulle au survol : nom et attributs de la bulle visée."""
-        self.canvas.delete('tip')
-        if hit is None or hit >= len(self.hotspots):
-            return
-        hs = self.hotspots[hit]
+    def tooltip_lines(self, hs: "Hotspot", origin: Optional[Station]) -> Tuple[List[str], bool]:
+        """Contenu de l'infobulle d'une pastille vue depuis `origin`."""
         lk = hs.link
-        st = self.station()
         tgt = self.stations[lk.target]
+        p = tgt.parts()
         sens = {'same': 'même plancher', 'up': 'niveau au-dessus',
                 'down': 'niveau en dessous'}[lk.kind]
-        p = tgt.parts()
         lines = [
             tgt.locator,
             f"photo        {tgt.photo}"
@@ -2745,8 +2755,8 @@ class BubbleNavApp(_TkBase):
             f"plancher     {tgt.floor}  ({sens})",
             f"image        {'présente' if self.store.has(tgt.photo) else 'ABSENTE'}",
         ]
-        if st is not None and st.idx != tgt.idx:
-            lines.append(f"cap depuis   {self.calib.pano_yaw(lk.azimuth, st.north_pct):+.1f}°"
+        if origin is not None and origin.idx != tgt.idx:
+            lines.append(f"cap depuis   {self.calib.pano_yaw(lk.azimuth, origin.north_pct):+.1f}°"
                          " dans l'image")
         if tgt.modified():
             marks = []
@@ -2759,27 +2769,40 @@ class BubbleNavApp(_TkBase):
             if tgt.turned():
                 marks.append(f"image tournée de {tgt.yaw_fix:+.2f}°")
             lines.append("modifié      " + ' · '.join(marks))
+        return lines, tgt.modified()
 
-        text = '\n'.join(lines)
-        item = self.canvas.create_text(x + 16, y + 16, anchor='nw', text=text,
-                                       fill=COLORS['text'], font=F_MONO, tags='tip')
-        bbox = self.canvas.bbox(item)
+    @staticmethod
+    def draw_tooltip(canvas, x: int, y: int, lines: List[str], width: int, height: int,
+                     modified: bool = False) -> None:
+        """Dessine une infobulle (étiquette « tip ») en la gardant dans la vue."""
+        canvas.delete('tip')
+        item = canvas.create_text(x + 18, y + 18, anchor='nw', text='\n'.join(lines),
+                                  fill=COLORS['text'], font=F_MONO, tags='tip')
+        bbox = canvas.bbox(item)
         if not bbox:
             return
         x1, y1, x2, y2 = bbox
         dx = dy = 0
-        if x2 + 8 > self.view.width:
-            dx = -(x2 - x1) - 32
-        if y2 + 8 > self.view.height:
-            dy = -(y2 - y1) - 32
+        if x2 + 8 > width:
+            dx = -(x2 - x1) - 36
+        if y2 + 8 > height:
+            dy = -(y2 - y1) - 36
         if dx or dy:
-            self.canvas.move(item, dx, dy)
-            x1, y1, x2, y2 = self.canvas.bbox(item)
-        rect = self.canvas.create_rectangle(x1 - 8, y1 - 6, x2 + 8, y2 + 6,
-                                            fill=COLORS['tip_bg'],
-                                            outline=COLORS['edit'] if tgt.modified()
-                                            else COLORS['border'], tags='tip')
-        self.canvas.tag_lower(rect, item)
+            canvas.move(item, dx, dy)
+            x1, y1, x2, y2 = canvas.bbox(item)
+        rect = canvas.create_rectangle(x1 - 8, y1 - 6, x2 + 8, y2 + 6, fill=COLORS['tip_bg'],
+                                       outline=COLORS['edit'] if modified else COLORS['sel'],
+                                       width=1, tags='tip')
+        canvas.tag_lower(rect, item)
+
+    def _draw_tooltip(self, x: int, y: int, hit: Optional[int]) -> None:
+        """Infobulle au survol : nom et attributs de la bulle visée."""
+        self.canvas.delete('tip')
+        if hit is None or hit >= len(self.hotspots):
+            return
+        lines, modified = self.tooltip_lines(self.hotspots[hit], self.station())
+        self.draw_tooltip(self.canvas, x, y, lines, self.view.width, self.view.height,
+                          modified)
 
     def _hotspot_at(self, x: float, y: float) -> Optional[int]:
         return hotspot_hit(self.hotspots, x, y, self.relief())
@@ -4665,6 +4688,7 @@ class CompareView(tk.Toplevel if _TK_OK else object):
     def _draw_overlay(self) -> None:
         view = self._frame_view
         self.canvas.delete('hs')
+        self.canvas.delete('tip')
         if view is None:
             return
         app = self.app
@@ -4689,6 +4713,8 @@ class CompareView(tk.Toplevel if _TK_OK else object):
                                     font=F_UI, tags='hs')
             self.canvas.create_text(hs.col, ty, text=txt, fill='#e8e8e8',
                                     font=F_UI, tags='hs')
+        if self._hover is not None and self._hover_xy:
+            self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
         st = self.station()
         if st is not None:
             titre = f"B · {st.locator}   ({st.floor})"
@@ -4758,11 +4784,22 @@ class CompareView(tk.Toplevel if _TK_OK else object):
         self.request_render(force=True)
 
     def _on_motion(self, event) -> None:
+        self._hover_xy = (event.x, event.y)
         hit = self._hotspot_at(event.x, event.y)
         if hit != self._hover:
             self._hover = hit
             self.canvas.config(cursor='hand2' if hit is not None else 'fleur')
             self._draw_overlay()
+        else:
+            self._draw_tooltip(event.x, event.y, hit)
+
+    def _draw_tooltip(self, x: int, y: int, hit: Optional[int]) -> None:
+        self.canvas.delete('tip')
+        if hit is None or hit >= len(self.hotspots):
+            return
+        lines, modified = self.app.tooltip_lines(self.hotspots[hit], self.station())
+        self.app.draw_tooltip(self.canvas, x, y, lines, self.view.width, self.view.height,
+                              modified)
 
     def _on_wheel(self, event, direction: int = 0) -> None:
         step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
@@ -5415,6 +5452,14 @@ def selftest(csv_path: str = '') -> int:
           f"alpha {arr[int(ay) + 2, int(ax), 3]}")
     bright = arr[..., :3].max()
     check("reflet spéculaire plus clair que la couleur", bright > 0xD2, f"{bright}")
+    img_h, (axh, ayh) = sphere_sprite(COLORS['hot'], 24, hover=True)
+    arrh = np.asarray(img_h)
+    check("survol : halo lumineux plus étendu que la sphère",
+          img_h.width > img.width + 8 and arrh[..., 3][:int(ayh - 24), :].max() > 60,
+          f"{img.width} → {img_h.width} px")
+    check("survol : sphère plus claire",
+          arrh[..., :3].astype(int).sum() / max(1, (arrh[..., 3] > 200).sum())
+          > arr[..., :3].astype(int).sum() / max(1, (arr[..., 3] > 200).sum()))
     hs = Hotspot(Link(0, 5.0, 5.0, 0.0, 0.0), 100.0, 100.0, 20.0, 'x')
     check("clic sur la sphère (au-dessus du sol) reconnu",
           hotspot_hit([hs], 100, 70, True) == 0)
