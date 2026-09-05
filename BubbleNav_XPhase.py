@@ -220,8 +220,11 @@ DEFAULT_CONFIG = {
     'filter_hide_missing': False,
     'export_workers': 2,       # panoramas 16000x8000 : ~800 Mo par tache
     'corr_paths': {},          # releve -> fichier de corrections choisi
-    'viewer_geometry': '',     # taille/position du visualiseur
+    'viewer_geometry': '',     # taille/position du visualiseur hors plein ecran
+    'viewer_start': 'plein écran',   # 'plein écran' | 'maximisé' | 'mémorisé'
 }
+
+VIEWER_START_MODES = ('plein écran', 'maximisé', 'mémorisé')
 
 
 def load_config() -> dict:
@@ -2146,7 +2149,11 @@ class BubbleNavApp(_TkBase):
             return False
 
     def _show_viewer(self) -> None:
+        premiere = not getattr(self, '_viewer_shown', False)
+        self._viewer_shown = True
         self.viewer.deiconify()
+        if premiere:
+            self._apply_viewer_start()
         self.viewer.lift()
         try:
             self.viewer.focus_force()
@@ -2154,10 +2161,58 @@ class BubbleNavApp(_TkBase):
             pass
         self._refresh_module()
 
+    def _apply_viewer_start(self) -> None:
+        """Taille d'ouverture du visualiseur : plein écran (défaut), maximisé,
+        ou dernière taille mémorisée."""
+        mode = str(self.cfg.get('viewer_start', VIEWER_START_MODES[0]))
+        v = self.viewer
+        try:
+            if mode == 'plein écran':
+                self._fs_wanted = True
+                v.attributes('-fullscreen', True)
+            elif mode == 'maximisé':
+                try:
+                    v.state('zoomed')                     # Windows
+                except Exception:
+                    try:
+                        v.attributes('-zoomed', True)     # Linux
+                    except Exception:
+                        v.geometry(f"{v.winfo_screenwidth()}x{v.winfo_screenheight() - 60}+0+0")
+            else:
+                geo = str(self.cfg.get('viewer_geometry') or '')
+                if geo:
+                    v.geometry(geo)
+        except Exception:
+            pass
+
+    def _viewer_fullscreen(self) -> bool:
+        """État plein écran : celui demandé par l'outil, ou celui confirmé par
+        le gestionnaire de fenêtres (certains ne le relisent pas tout de suite)."""
+        if getattr(self, '_fs_wanted', False):
+            return True
+        try:
+            return bool(self.viewer.attributes('-fullscreen'))
+        except Exception:
+            return False
+
+    def _leave_fullscreen(self) -> None:
+        """Échap : sortie du plein écran, retour à la dernière taille connue."""
+        if not self._viewer_fullscreen():
+            return
+        self._fs_wanted = False
+        try:
+            self.viewer.attributes('-fullscreen', False)
+            geo = str(self.cfg.get('viewer_geometry') or '')
+            if geo:
+                self.viewer.geometry(geo)
+        except Exception:
+            pass
+
     def _hide_viewer(self) -> None:
         """Fermer la fenêtre de visualisation ne fait que la masquer."""
         try:
-            self.cfg['viewer_geometry'] = self.viewer.geometry()
+            if not self._viewer_fullscreen():        # une geometrie plein ecran n'est pas une taille
+                self.cfg['viewer_geometry'] = self.viewer.geometry()
         except Exception:
             pass
         self.viewer.withdraw()
@@ -2348,7 +2403,7 @@ class BubbleNavApp(_TkBase):
         }
         for seq, fn in raccourcis.items():
             self.bind_all(seq, key(fn))
-        self.bind_all('<Escape>', key(lambda: self.viewer.attributes('-fullscreen', False)))
+        self.bind_all('<Escape>', key(self._leave_fullscreen))
 
     # ═════════════════════════════════════════════════════════════════
     # DONNEES
@@ -2542,9 +2597,13 @@ class BubbleNavApp(_TkBase):
         self._request_render(force=True)
 
     def _toggle_fullscreen(self) -> None:
+        if self._viewer_fullscreen():
+            self._leave_fullscreen()
+            return
         try:
-            self.viewer.attributes('-fullscreen',
-                                   not bool(self.viewer.attributes('-fullscreen')))
+            self.cfg['viewer_geometry'] = self.viewer.geometry()
+            self._fs_wanted = True
+            self.viewer.attributes('-fullscreen', True)
         except Exception:
             pass
 
@@ -4451,6 +4510,18 @@ class BubbleNavApp(_TkBase):
                      f"source {self.store.src_width} px : {self.store.frame_mb():.0f} Mo "
                      f"par bulle, {self.store.effective_cache()} gardée(s) en mémoire")
                  ).pack(fill='x')
+        row = tk.Frame(perf, bg=COLORS['bg_dark'])
+        row.pack(fill='x', pady=(4, 0))
+        tk.Label(row, text="Visualiseur à l'ouverture", width=22, anchor='w', font=F_UI,
+                 bg=COLORS['bg_dark'], fg=COLORS['text']).pack(side='left')
+        start_var = tk.StringVar(value=str(self.cfg.get('viewer_start', VIEWER_START_MODES[0])))
+        cb_start = ttk.Combobox(row, textvariable=start_var, state='readonly', width=14,
+                                style='BN.TCombobox', values=VIEWER_START_MODES)
+        cb_start.pack(side='left')
+        cb_start.bind('<<ComboboxSelected>>',
+                      lambda e: self.cfg.__setitem__('viewer_start', start_var.get()))
+        tk.Label(perf, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'], anchor='w',
+                 text="F11 bascule le plein écran, Échap en sort.").pack(fill='x')
         exp_var = tk.IntVar(value=int(self.cfg.get('export_workers', 2)))
         slider(perf, "Tâches d'export d'images", exp_var, 1, 8, 1,
                lambda _=None: self.cfg.__setitem__('export_workers', int(exp_var.get())))
@@ -4542,7 +4613,7 @@ class BubbleNavApp(_TkBase):
         try:
             self.cfg['fov'] = self.view.fov
             self.cfg['show_labels'] = bool(self.labels_var.get())
-            if self._viewer_visible():
+            if self._viewer_visible() and not self._viewer_fullscreen():
                 self.cfg['viewer_geometry'] = self.viewer.geometry()
             save_config(self.cfg)
         except Exception:

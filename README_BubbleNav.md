@@ -24,9 +24,11 @@ L'outil s'organise en **deux fenêtres** :
 | **Module principal** (petite, toujours présente) | choix du **relevé CSV**, du **dossier des images** et du **fichier de corrections** ; état du chargement (bulles, planchers, images trouvées, corrections) ; boutons Réglages, Appliquer / enregistrer, Aide, Quitter |
 | **Visualiseur** (grande, touche **V**) | la vue bulle A et, quand la comparaison est ouverte, la vue B **empilée dessous** (séparation ajustable) ; à droite le **panneau latéral** : plan du plancher, filtres, fiche de la bulle, voisins ou outils d'édition |
 
-Le visualiseur s'ouvre de lui-même dès qu'un relevé est chargé ; le fermer ne
-fait que le masquer (le bouton « Ouvrir le visualiseur » ou la touche V le
-ramène), sa taille et sa position sont mémorisées. Les raccourcis clavier
+Le visualiseur s'ouvre de lui-même dès qu'un relevé est chargé, **en plein
+écran** par défaut (F11 bascule, Échap en sort et revient à la dernière taille
+connue). « Réglages… → Visualiseur à l'ouverture » propose aussi *maximisé* ou
+*mémorisé* (dernière taille et position). Le fermer ne fait que le masquer : le
+bouton « Ouvrir le visualiseur » ou la touche V le ramène. Les raccourcis clavier
 fonctionnent depuis l'une ou l'autre fenêtre. Le dossier des images est exploré
 récursivement ; chemins mémorisés pour les lancements suivants.
 
