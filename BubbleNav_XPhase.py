@@ -3133,8 +3133,6 @@ class BubbleNavApp(_TkBase):
         ttk.Combobox(grid, textvariable=self.step_var, width=5, state='readonly',
                      style='BN.TCombobox', values=('0.01', '0.05', '0.10', '0.50')
                      ).grid(row=1, column=4, padx=(8, 2))
-        self._mk_button(grid, "Appliquer", self._apply_position_fields,
-                        bg=COLORS['bg_light']).grid(row=1, column=5, padx=(8, 2))
 
         # Altitude : deux composantes de nature physique differente
         tk.Label(self.edit_frame, text="Altitude (deux composantes)", font=F_UI_B,
@@ -3161,6 +3159,9 @@ class BubbleNavApp(_TkBase):
               "hauteur station : la caméra bouge, le sol reste (PgUp/PgDn)\n"
               "delta plancher : caméra et sol bougent — marche, faux\n"
               "plancher (Maj+PgUp/PgDn)").pack(anchor='w', pady=(0, 2))
+        self._mk_button(self.edit_frame, "Appliquer les valeurs saisies",
+                        self._apply_position_fields, bg=COLORS['bg_light']
+                        ).pack(anchor='w', pady=(2, 0))
 
         # Orientation image
         tk.Label(self.edit_frame, text="Orientation — Δ nord (enregistré au CSV)",
