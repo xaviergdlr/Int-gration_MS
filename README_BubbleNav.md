@@ -17,12 +17,18 @@ Double-cliquez sur `BubbleNav.bat` (Windows) ou lancez :
 python BubbleNav_XPhase.py
 ```
 
-Au premier lancement, l'outil demande :
-1. le **CSV de relevé** ;
-2. le **dossier des images bulles** (exploré récursivement ; on peut annuler et le
-   choisir plus tard avec le bouton « Images… »).
+L'outil s'organise en **deux fenêtres** :
 
-Les deux chemins sont mémorisés pour les lancements suivants.
+| Fenêtre | Contenu |
+|---|---|
+| **Module principal** (petite, toujours présente) | choix du **relevé CSV**, du **dossier des images** et du **fichier de corrections** ; état du chargement (bulles, planchers, images trouvées, corrections) ; boutons Réglages, Appliquer / enregistrer, Aide, Quitter |
+| **Visualiseur** (grande, touche **V**) | la vue bulle A et, quand la comparaison est ouverte, la vue B **empilée dessous** (séparation ajustable) ; à droite le **panneau latéral** : plan du plancher, filtres, fiche de la bulle, voisins ou outils d'édition |
+
+Le visualiseur s'ouvre de lui-même dès qu'un relevé est chargé ; le fermer ne
+fait que le masquer (le bouton « Ouvrir le visualiseur » ou la touche V le
+ramène), sa taille et sa position sont mémorisées. Les raccourcis clavier
+fonctionnent depuis l'une ou l'autre fenêtre. Le dossier des images est exploré
+récursivement ; chemins mémorisés pour les lancements suivants.
 
 Options en ligne de commande :
 
@@ -189,8 +195,9 @@ portée des liaisons entre planchers.
 
 ## 5. Comparer deux points de vue  (touche C)
 
-Le bouton « Comparer » ouvre une **seconde vue bulle** dans sa propre fenêtre,
-placée à côté de la principale. Elle partage tout le modèle — relevé, réseau,
+Le bouton « Comparer » ouvre une **seconde vue bulle**, empilée sous la
+première dans le visualiseur (séparation glissante, bouton ✕ pour la refermer).
+Elle partage tout le modèle — relevé, réseau,
 filtres, calibration, corrections, cache d'images — et n'a que son point de vue
 en propre.
 
@@ -210,6 +217,8 @@ en propre.
   et le Δz par rapport à la bulle A**.
 * Sur le plan, la vue B a son propre repère cyan avec son camembert, relié à A
   par un trait pointillé.
+* Les deux vues partagent la hauteur à parts égales à l'ouverture ; la
+  séparation se déplace à la souris.
 
 L'édition reste réservée à la vue principale ; la vue B affiche les corrections
 en direct (position et orientation) puisque le modèle est partagé.

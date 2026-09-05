@@ -220,6 +220,7 @@ DEFAULT_CONFIG = {
     'filter_hide_missing': False,
     'export_workers': 2,       # panoramas 16000x8000 : ~800 Mo par tache
     'corr_paths': {},          # releve -> fichier de corrections choisi
+    'viewer_geometry': '',     # taille/position du visualiseur
 }
 
 
@@ -1988,10 +1989,14 @@ class BubbleNavApp(_TkBase):
     # CONSTRUCTION DE L'INTERFACE
     # ═════════════════════════════════════════════════════════════════
     def _build_ui(self) -> None:
-        self.title(f"{APP_NAME} v{__version__}")
+        """Deux fenêtres : le MODULE (fichiers, réglages, état) et le
+        VISUALISEUR (vues empilées + panneau latéral). Le module est la racine ;
+        fermer le visualiseur ne fait que le masquer."""
+        self.title(f"{APP_NAME} v{__version__} — module")
         self.configure(bg=COLORS['bg_dark'])
-        self.geometry("1500x900")
-        self.minsize(900, 560)
+        self.geometry("580x460+30+30")
+        self.minsize(520, 400)
+        self.resizable(True, False)
 
         style = ttk.Style(self)
         try:
@@ -2015,15 +2020,112 @@ class BubbleNavApp(_TkBase):
         self.option_add('*TCombobox*Listbox.selectForeground', 'white')
         style.configure('BN.Horizontal.TScale', background=COLORS['bg_medium'])
 
-        self._build_toolbar()
+        self._build_module()
+        self._build_viewer()
+        self._bind_keys()
 
-        body = tk.Frame(self, bg=COLORS['bg_dark'])
+    # ── fenêtre-module ───────────────────────────────────────────────
+    def _build_module(self) -> None:
+        tk.Label(self, text="BubbleNav — module principal", font=F_TITLE,
+                 bg=COLORS['bg_dark'], fg=COLORS['accent']).pack(anchor='w', padx=14,
+                                                                 pady=(10, 4))
+
+        def section(title: str) -> tk.Frame:
+            tk.Label(self, text=title, font=F_UI_B, bg=COLORS['bg_dark'],
+                     fg=COLORS['text']).pack(anchor='w', padx=14, pady=(8, 2))
+            fr = tk.Frame(self, bg=COLORS['card'], padx=8, pady=6)
+            fr.pack(fill='x', padx=14)
+            return fr
+
+        files = section("Fichiers")
+        self.module_paths: Dict[str, tk.Label] = {}
+        for key, lib, cmd in (('csv', "Relevé CSV", self._open_csv),
+                              ('images', "Dossier images", self._open_images),
+                              ('corr', "Corrections", self._choose_corrections_file)):
+            row = tk.Frame(files, bg=COLORS['card'])
+            row.pack(fill='x', pady=1)
+            self._mk_button(row, lib + "…", cmd, width=16).pack(side='left')
+            lbl = tk.Label(row, text="—", anchor='w', font=F_UI, bg=COLORS['card'],
+                           fg=COLORS['text_muted'])
+            lbl.pack(side='left', fill='x', expand=True, padx=8)
+            self.module_paths[key] = lbl
+
+        etat = section("État")
+        self.module_state = tk.Label(etat, text="Aucun relevé chargé.", justify='left',
+                                     anchor='w', font=F_MONO, bg=COLORS['card'],
+                                     fg=COLORS['text'])
+        self.module_state.pack(fill='x')
+
+        actions = section("Actions")
+        self._mk_button(actions, "Ouvrir le visualiseur  (V)", self._show_viewer,
+                        bg=COLORS['accent']).pack(side='left')
+        self._mk_button(actions, "Réglages…", self._dlg_settings).pack(side='left', padx=6)
+        self._mk_button(actions, "Appliquer / enregistrer…", self._dlg_apply
+                        ).pack(side='left')
+        self._mk_button(actions, "Aide", self._dlg_help).pack(side='left', padx=6)
+        self._mk_button(actions, "Quitter", self._on_close).pack(side='right')
+
+        self.module_status = tk.Label(self, text="Chargez un relevé, puis le dossier des images.",
+                                      anchor='w', bg=COLORS['bg_medium'],
+                                      fg=COLORS['text_muted'], font=F_UI, padx=10, pady=4)
+        self.module_status.pack(fill='x', side='bottom')
+
+    def _refresh_module(self) -> None:
+        """Chemins et état affichés dans la fenêtre-module."""
+        if not hasattr(self, 'module_state'):
+            return
+
+        def court(path: str) -> str:
+            if not path:
+                return "—"
+            return f"{os.path.basename(path)}   ({os.path.dirname(path)})"
+
+        self.module_paths['csv'].config(text=court(self.csv_path))
+        self.module_paths['images'].config(text=self.images_dir or "—")
+        corr = self.corrections.path if self.corrections else ''
+        self.module_paths['corr'].config(text=court(corr) if self.stations else "—")
+        if not self.stations:
+            self.module_state.config(text="Aucun relevé chargé.")
+            return
+        found = sum(1 for st in self.stations if self.store.has(st.photo))
+        bilan = Corrections.counts(self.stations)
+        pending = len(Corrections.pending_images(self.stations))
+        etat = ("modifications non enregistrées" if self.corrections.dirty
+                else "enregistrées")
+        self.module_state.config(text=(
+            f"bulles        {len(self.stations)}   ·   planchers {len(self.floors)}\n"
+            f"images        {found}/{len(self.stations)} trouvées\n"
+            f"corrections   {bilan.texte()}  ({etat})\n"
+            f"images à tourner   {pending}\n"
+            f"visualiseur   {'ouvert' if self._viewer_visible() else 'fermé'}"))
+
+    # ── fenêtre de visualisation ─────────────────────────────────────
+    def _build_viewer(self) -> None:
+        self.viewer = tk.Toplevel(self)
+        self.viewer.title(f"{APP_NAME} — visualiseur")
+        self.viewer.configure(bg=COLORS['bg_dark'])
+        self.viewer.geometry(str(self.cfg.get('viewer_geometry') or "1500x900"))
+        self.viewer.minsize(900, 560)
+        self.viewer.protocol('WM_DELETE_WINDOW', self._hide_viewer)
+        self.viewer.withdraw()
+
+        self._build_toolbar(self.viewer)
+
+        body = tk.Frame(self.viewer, bg=COLORS['bg_dark'])
         body.pack(fill='both', expand=True)
 
-        # Vue bulle
-        left = tk.Frame(body, bg=COLORS['bg_dark'])
-        left.pack(side='left', fill='both', expand=True)
-        self.canvas = tk.Canvas(left, bg='#101010', highlightthickness=0,
+        # Panneau lateral d'abord : il garde sa largeur quoi qu'il arrive,
+        # les vues se partagent le reste.
+        self._build_side_panel(body)
+
+        # Vues empilées : A en haut, B (comparaison) en dessous quand elle est ouverte
+        self.views = tk.PanedWindow(body, orient='vertical', bg=COLORS['bg_dark'],
+                                    sashwidth=6, sashrelief='flat', bd=0,
+                                    opaqueresize=True)
+        self.views.pack(side='left', fill='both', expand=True)
+        self.pane_a = tk.Frame(self.views, bg=COLORS['bg_dark'])
+        self.views.add(self.pane_a, minsize=160, stretch='always')
+        self.canvas = tk.Canvas(self.pane_a, bg='#101010', highlightthickness=0,
                                 cursor='fleur')
         self.canvas.pack(fill='both', expand=True)
         self.canvas.bind('<Configure>', self._on_canvas_resize)
@@ -2035,11 +2137,32 @@ class BubbleNavApp(_TkBase):
         self.canvas.bind('<Button-4>', lambda e: self._on_wheel(e, +1))
         self.canvas.bind('<Button-5>', lambda e: self._on_wheel(e, -1))
         self.canvas.bind('<Double-Button-1>', self._on_double)
+        self._build_status(self.viewer)
 
-        # Panneau lateral
-        self._build_side_panel(body)
-        self._build_status()
-        self._bind_keys()
+    def _viewer_visible(self) -> bool:
+        try:
+            return self.viewer.state() != 'withdrawn'
+        except Exception:
+            return False
+
+    def _show_viewer(self) -> None:
+        self.viewer.deiconify()
+        self.viewer.lift()
+        try:
+            self.viewer.focus_force()
+        except Exception:
+            pass
+        self._refresh_module()
+
+    def _hide_viewer(self) -> None:
+        """Fermer la fenêtre de visualisation ne fait que la masquer."""
+        try:
+            self.cfg['viewer_geometry'] = self.viewer.geometry()
+        except Exception:
+            pass
+        self.viewer.withdraw()
+        self._refresh_module()
+        self.lift()
 
     def _mk_button(self, parent, text, cmd, bg=None, width=None):
         b = tk.Button(parent, text=text, command=cmd,
@@ -2051,15 +2174,13 @@ class BubbleNavApp(_TkBase):
             b.config(width=width)
         return b
 
-    def _build_toolbar(self) -> None:
-        bar = tk.Frame(self, bg=COLORS['bg_medium'])
+    def _build_toolbar(self, parent) -> None:
+        bar = tk.Frame(parent, bg=COLORS['bg_medium'])
         bar.pack(fill='x', side='top')
 
         tk.Label(bar, text="BubbleNav", font=F_TITLE, bg=COLORS['bg_medium'],
                  fg=COLORS['accent']).pack(side='left', padx=(10, 12), pady=5)
-
-        self._mk_button(bar, "CSV…", self._open_csv).pack(side='left', padx=3, pady=4)
-        self._mk_button(bar, "Images…", self._open_images).pack(side='left', padx=3, pady=4)
+        self._mk_button(bar, "Module", self._show_module).pack(side='left', padx=3, pady=4)
 
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
                                                          padx=8, pady=6)
@@ -2067,7 +2188,7 @@ class BubbleNavApp(_TkBase):
         tk.Label(bar, text="Plancher", bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
                  font=F_UI).pack(side='left', padx=(2, 4))
         self.floor_var = tk.StringVar()
-        self.floor_cb = ttk.Combobox(bar, textvariable=self.floor_var, width=24,
+        self.floor_cb = ttk.Combobox(bar, textvariable=self.floor_var, width=20,
                                      state='readonly', style='BN.TCombobox')
         self.floor_cb.pack(side='left', padx=2, pady=4)
         self.floor_cb.bind('<<ComboboxSelected>>', self._on_floor_selected)
@@ -2121,8 +2242,7 @@ class BubbleNavApp(_TkBase):
                                  fg=COLORS['edit'], font=F_UI_B)
         self.edit_lbl.pack(side='left', padx=6)
 
-        self._mk_button(bar, "Aide", self._dlg_help).pack(side='right', padx=(3, 10), pady=4)
-        self._mk_button(bar, "Réglages…", self._dlg_settings).pack(side='right', padx=3, pady=4)
+        self._mk_button(bar, "Réglages…", self._dlg_settings).pack(side='right', padx=(3, 10), pady=4)
 
     def _build_side_panel(self, parent) -> None:
         side = tk.Frame(parent, bg=COLORS['bg_medium'], width=360)
@@ -2180,8 +2300,12 @@ class BubbleNavApp(_TkBase):
         self.nb_list.bind('<Double-Button-1>', self._on_nb_activate)
         self.nb_list.bind('<Return>', self._on_nb_activate)
 
-    def _build_status(self) -> None:
-        bar = tk.Frame(self, bg=COLORS['bg_medium'])
+    def _show_module(self) -> None:
+        self.deiconify()
+        self.lift()
+
+    def _build_status(self, parent) -> None:
+        bar = tk.Frame(parent, bg=COLORS['bg_medium'])
         bar.pack(fill='x', side='bottom')
         self.status = tk.Label(bar, text="Chargez un CSV puis le dossier des images.",
                                anchor='w', bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
@@ -2192,34 +2316,39 @@ class BubbleNavApp(_TkBase):
         self.heading_lbl.pack(side='right')
 
     def _bind_keys(self) -> None:
-        self.bind('<Left>', lambda e: self._nudge(yaw=-6))
-        self.bind('<Right>', lambda e: self._nudge(yaw=+6))
-        self.bind('<Up>', lambda e: self._nudge(pitch=+5))
-        self.bind('<Down>', lambda e: self._nudge(pitch=-5))
-        self.bind('<Shift-Left>', lambda e: self._nudge(yaw=-25))
-        self.bind('<Shift-Right>', lambda e: self._nudge(yaw=+25))
-        self.bind('<plus>', lambda e: self._zoom(-6))
-        self.bind('<KP_Add>', lambda e: self._zoom(-6))
-        self.bind('<minus>', lambda e: self._zoom(+6))
-        self.bind('<KP_Subtract>', lambda e: self._zoom(+6))
-        self.bind('<Return>', lambda e: self._go_forward())
-        self.bind('<space>', lambda e: self._go_forward())
-        self.bind('<BackSpace>', lambda e: self.go_back())
-        self.bind('<Home>', lambda e: self._reset_view())
-        self.bind('<F11>', lambda e: self._toggle_fullscreen())
-        self.bind('<c>', lambda e: self._toggle_compare())
-        self.bind('<C>', lambda e: self._toggle_compare())
-        self.bind('<f>', lambda e: self._toggle_filters())
-        self.bind('<F>', lambda e: self._toggle_filters())
-        self.bind('<e>', lambda e: self._toggle_edit())
-        self.bind('<E>', lambda e: self._toggle_edit())
-        self.bind('<Control-z>', lambda e: self._undo_edit())
-        self.bind('<Control-s>', lambda e: self._dlg_apply())
-        self.bind('<Prior>', lambda e: self._bump('dh', +1))
-        self.bind('<Next>', lambda e: self._bump('dh', -1))
-        self.bind('<Shift-Prior>', lambda e: self._bump('ddelta', +1))
-        self.bind('<Shift-Next>', lambda e: self._bump('ddelta', -1))
-        self.bind('<Escape>', lambda e: self.attributes('-fullscreen', False))
+        """Raccourcis actifs dans le module comme dans le visualiseur, sauf quand
+        un champ de saisie a le clavier."""
+        def key(fn):
+            def handler(event):
+                w = event.widget
+                if isinstance(w, (tk.Entry, tk.Text, ttk.Combobox, tk.Spinbox)):
+                    return None
+                fn()
+                return 'break'
+            return handler
+
+        raccourcis = {
+            '<Left>': lambda: self._nudge(yaw=-6), '<Right>': lambda: self._nudge(yaw=+6),
+            '<Up>': lambda: self._nudge(pitch=+5), '<Down>': lambda: self._nudge(pitch=-5),
+            '<Shift-Left>': lambda: self._nudge(yaw=-25),
+            '<Shift-Right>': lambda: self._nudge(yaw=+25),
+            '<plus>': lambda: self._zoom(-6), '<KP_Add>': lambda: self._zoom(-6),
+            '<minus>': lambda: self._zoom(+6), '<KP_Subtract>': lambda: self._zoom(+6),
+            '<Return>': self._go_forward, '<space>': self._go_forward,
+            '<BackSpace>': self.go_back, '<Home>': self._reset_view,
+            '<F11>': self._toggle_fullscreen,
+            '<c>': self._toggle_compare, '<C>': self._toggle_compare,
+            '<f>': self._toggle_filters, '<F>': self._toggle_filters,
+            '<e>': self._toggle_edit, '<E>': self._toggle_edit,
+            '<v>': self._show_viewer, '<V>': self._show_viewer,
+            '<Control-z>': self._undo_edit, '<Control-s>': self._dlg_apply,
+            '<Prior>': lambda: self._bump('dh', +1), '<Next>': lambda: self._bump('dh', -1),
+            '<Shift-Prior>': lambda: self._bump('ddelta', +1),
+            '<Shift-Next>': lambda: self._bump('ddelta', -1),
+        }
+        for seq, fn in raccourcis.items():
+            self.bind_all(seq, key(fn))
+        self.bind_all('<Escape>', key(lambda: self.viewer.attributes('-fullscreen', False)))
 
     # ═════════════════════════════════════════════════════════════════
     # DONNEES
@@ -2259,10 +2388,12 @@ class BubbleNavApp(_TkBase):
                 pass
 
     def _set_status(self, text: str, color: str = None) -> None:
-        try:
-            self.status.config(text=text, fg=color or COLORS['text_muted'])
-        except Exception:
-            pass
+        for lbl in (getattr(self, 'status', None), getattr(self, 'module_status', None)):
+            try:
+                if lbl is not None:
+                    lbl.config(text=text, fg=color or COLORS['text_muted'])
+            except Exception:
+                pass
 
     def load_csv(self, path: str, images_dir: str = '') -> bool:
         try:
@@ -2316,6 +2447,8 @@ class BubbleNavApp(_TkBase):
             self._plan_view['fitted'] = False
             self.goto(0, keep_heading=False)
         save_config(self.cfg)
+        self._show_viewer()
+        self._refresh_module()
         return True
 
     def set_images_dir(self, path: str) -> None:
@@ -2341,6 +2474,7 @@ class BubbleNavApp(_TkBase):
                          + (f", {alias} rattachée(s) par numéro de scan ou nom projeté"
                             if alias else '') + ")", color)
         save_config(self.cfg)
+        self._refresh_module()
         if self.current < 0:
             start = next((s.idx for s in self.stations if self.store.has(s.photo)), 0)
             self._plan_view['fitted'] = False
@@ -2409,7 +2543,8 @@ class BubbleNavApp(_TkBase):
 
     def _toggle_fullscreen(self) -> None:
         try:
-            self.attributes('-fullscreen', not bool(self.attributes('-fullscreen')))
+            self.viewer.attributes('-fullscreen',
+                                   not bool(self.viewer.attributes('-fullscreen')))
         except Exception:
             pass
 
@@ -3441,6 +3576,7 @@ class BubbleNavApp(_TkBase):
         self.corr_lbl.config(
             text=f"{os.path.basename(self.corrections.path) or '—'} ({etat})",
             fg=COLORS['edit'] if self.corrections.dirty else COLORS['ok'])
+        self._refresh_module()
         if bilan.any():
             self.edit_count.config(
                 text=(f"corrections : {bilan.texte()}\n"
@@ -3763,6 +3899,9 @@ class BubbleNavApp(_TkBase):
 
     def _choose_corrections_file(self) -> None:
         """Change de fichier de corrections (ou en reprend un existant)."""
+        if not self.stations:
+            messagebox.showinfo("Fichier de corrections", "Chargez d'abord un relevé.")
+            return
         path = filedialog.asksaveasfilename(
             title="Fichier de corrections (créé ou repris)",
             initialdir=os.path.dirname(self.corrections.path or self.csv_path),
@@ -3797,6 +3936,7 @@ class BubbleNavApp(_TkBase):
             self.corrections.dirty = True
             self._autosave()
         self._refresh_edit_panel()
+        self._refresh_module()
 
     def _export_merged(self, path: str) -> bool:
         """Écrit un relevé complet corrigé, sans rien changer aux fichiers de travail."""
@@ -4402,6 +4542,8 @@ class BubbleNavApp(_TkBase):
         try:
             self.cfg['fov'] = self.view.fov
             self.cfg['show_labels'] = bool(self.labels_var.get())
+            if self._viewer_visible():
+                self.cfg['viewer_geometry'] = self.viewer.geometry()
             save_config(self.cfg)
         except Exception:
             pass
@@ -4432,7 +4574,7 @@ class BubbleNavApp(_TkBase):
 # SECONDE VUE BULLE (COMPARAISON)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class CompareView(tk.Toplevel if _TK_OK else object):
+class CompareView(tk.Frame if _TK_OK else object):
     """Seconde vue bulle, pour comparer deux points de vue.
 
     Elle partage tout le modèle avec la vue principale (relevé, réseau, filtres,
@@ -4444,7 +4586,7 @@ class CompareView(tk.Toplevel if _TK_OK else object):
     FOLLOW_MODES = ('aucun', 'même local, autre plancher', 'bulle la plus proche')
 
     def __init__(self, app: "BubbleNavApp", idx: int):
-        super().__init__(app)
+        super().__init__(app.views, bg=COLORS['bg_dark'])
         self.app = app
         self.idx = idx
         self.view = View(app.view.yaw, app.view.pitch, app.view.fov, 900, 560)
@@ -4461,44 +4603,31 @@ class CompareView(tk.Toplevel if _TK_OK else object):
         self.linked = tk.BooleanVar(value=True)
         self.follow = tk.StringVar(value=self.FOLLOW_MODES[0])
 
-        self.title("BubbleNav — vue de comparaison")
-        self.configure(bg=COLORS['bg_dark'])
-        self.geometry("920x620")
-        self.minsize(420, 320)
         self._build_ui()
-        self.protocol('WM_DELETE_WINDOW', self.close)
-        self.bind('<Escape>', lambda e: self.close())
-        self.after(0, self._place_beside)
-        self.after(40, lambda: self.request_render(force=True))
+        app.views.add(self, minsize=160, stretch='always')
+        self.after(60, self._share_height)
+        self.after(80, lambda: self.request_render(force=True))
 
-    def _place_beside(self) -> None:
-        """Se place à côté de la fenêtre principale, sans la recouvrir."""
+    def _share_height(self) -> None:
+        """Les deux vues se partagent la hauteur à parts égales."""
         try:
-            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-            ax, ay = self.app.winfo_rootx(), self.app.winfo_rooty()
-            aw = self.app.winfo_width()
-            w, h = 920, 620
-            x = ax + aw + 8
-            if x + w > sw:
-                if sw - x >= 460:               # on rétrécit plutôt que recouvrir A
-                    w = sw - x - 8
-                else:                           # écran trop étroit : on cadre à droite
-                    x = max(0, sw - w - 8)
-            y = max(0, min(ay, sh - h - 40))
-            self.geometry(f"{w}x{h}+{x}+{y}")
+            h = self.app.views.winfo_height()
+            if h > 100:
+                self.app.views.sash_place(0, 0, h // 2)
         except Exception:
             pass
 
     # ── interface ────────────────────────────────────────────────────
     def _build_ui(self) -> None:
         bar = tk.Frame(self, bg=COLORS['bg_medium'])
-        bar.pack(fill='x', side='top')
+        bar.pack(fill='x', side='top', pady=(4, 0))
         tk.Label(bar, text="Vue B", font=F_TITLE, bg=COLORS['bg_medium'],
                  fg=COLORS['sel']).pack(side='left', padx=(10, 8), pady=4)
         self.title_lbl = tk.Label(bar, text="—", font=F_UI_B, bg=COLORS['bg_medium'],
                                   fg=COLORS['text'])
         self.title_lbl.pack(side='left', padx=4)
 
+        self.app._mk_button(bar, "✕", self.close).pack(side='right', padx=(4, 8), pady=4)
         self.app._mk_button(bar, "⇄ Échanger", self.swap).pack(side='right', padx=4, pady=4)
         self.app._mk_button(bar, "A → B", self.copy_from_a).pack(side='right', padx=4, pady=4)
         tk.Checkbutton(bar, text="Vue liée", variable=self.linked,
@@ -4508,7 +4637,7 @@ class CompareView(tk.Toplevel if _TK_OK else object):
                        activeforeground=COLORS['text']).pack(side='right', padx=6)
         tk.Label(bar, text="Suivi de A", font=F_UI, bg=COLORS['bg_medium'],
                  fg=COLORS['text_muted']).pack(side='right', padx=(8, 2))
-        cb = ttk.Combobox(bar, textvariable=self.follow, state='readonly', width=22,
+        cb = ttk.Combobox(bar, textvariable=self.follow, state='readonly', width=18,
                           style='BN.TCombobox', values=self.FOLLOW_MODES)
         cb.pack(side='right', pady=4)
         cb.bind('<<ComboboxSelected>>', lambda e: self.follow_a(self.app.current))
@@ -4837,6 +4966,14 @@ class CompareView(tk.Toplevel if _TK_OK else object):
             self.app._reqs.pop('B', None)
         if self.app.compare is self:
             self.app.compare = None
+            try:
+                self.app.cmp_btn.config(bg=COLORS['bg_light'], fg=COLORS['text'])
+            except Exception:
+                pass
+        try:
+            self.app.views.forget(self)
+        except Exception:
+            pass
         try:
             self.app._draw_plan()
         except Exception:
@@ -5506,22 +5643,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if images_dir and not os.path.isdir(images_dir):
         images_dir = ''
 
-    if not csv_path:
-        root = tk.Tk()
-        root.withdraw()
-        csv_path = filedialog.askopenfilename(
-            title="CSV de relevé (Fichier photo ; X ; Y ; Z ; % NORD ; Plancher)",
-            filetypes=[("Fichiers CSV", "*.csv *.txt"), ("Tous les fichiers", "*.*")])
-        root.destroy()
-        if not csv_path:
-            return 0
-    if not images_dir:
-        root = tk.Tk()
-        root.withdraw()
-        images_dir = filedialog.askdirectory(
-            title="Dossier des images bulles (laisser vide pour le choisir plus tard)")
-        root.destroy()
-
+    # Le module principal s'ouvre toujours ; le relevé et les images s'y
+    # choisissent, et le visualiseur apparaît dès qu'un relevé est chargé.
     app = BubbleNavApp(cfg, csv_path, images_dir)
     app.mainloop()
     return 0
