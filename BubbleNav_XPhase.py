@@ -4103,7 +4103,12 @@ class BubbleNavApp(_TkBase):
 
     def _plan_transform(self, pts: Sequence[Station], w: int, h: int):
         pv = self._plan_view
-        if not pv['fitted'] or self._plan_floor != self.floor_var.get():
+        # Recadrage si rien n'est cadre, si le plancher change, ou si le plan
+        # n'a plus la taille pour laquelle le cadrage avait ete calcule (par
+        # exemple un chargement effectue avant l'affichage du visualiseur,
+        # un redimensionnement ou un passage en plein ecran).
+        if (not pv['fitted'] or self._plan_floor != self.floor_var.get()
+                or pv.get('fit_size') != (w, h)):
             xs = [s.x for s in pts]
             ys = [s.y for s in pts]
             span_x = max(1e-3, max(xs) - min(xs))
@@ -4113,6 +4118,7 @@ class BubbleNavApp(_TkBase):
             pv['cx'] = (max(xs) + min(xs)) / 2.0
             pv['cy'] = (max(ys) + min(ys)) / 2.0
             pv['fitted'] = True
+            pv['fit_size'] = (w, h)
             self._plan_floor = self.floor_var.get()
         s = pv['scale']
         cx, cy = pv.get('cx', 0.0), pv.get('cy', 0.0)
