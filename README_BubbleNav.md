@@ -78,7 +78,7 @@ Colonnes reconnues :
 | `Fichier photo` ou `N° scan` | identifiant ; nom de l'image, avec ou sans extension | l'un des deux |
 | `X` | coordonnée **Est** (m) | oui |
 | `Y` | coordonnée **Nord** (m) | oui |
-| `Z` | altitude **finale** du point de vue, telle que produite (m) : sert de **contrôle** | recommandé |
+| `Z` | altitude du point de vue ; **recalculée** (voir ci-dessous), lue seulement pour une bulle sans altitude de plancher | facultatif |
 | `% NORD` | position du nord dans l'image, en % de la largeur (50 % = centre) | recommandé |
 | `Nom du Locator` | nom affiché de la bulle | facultatif |
 | `Plancher` | niveau, sert au plan et aux liens verticaux | facultatif |
@@ -90,31 +90,28 @@ Intitulés reconnus, entre autres : `Z plancher`, `Altitude plancher`, `Z dalle`
 `Delta`, `Delta plancher` ; `Hauteur instrument`, `H instrument`, `HI`,
 `H appareil`.
 
-**Altitude du point de vue : calculée, jamais recopiée.** Le programme calcule
+**Altitude du point de vue** : toujours calculée,
 
 ```
-Z point de vue = Z plancher + Delta + Hauteur instrument
+Z = Z plancher + Delta + Hauteur instrument
 ```
 
-Le `Z` du CSV peut être faux : c'est justement ce qu'on veut vérifier. Il n'est
-donc pas utilisé pour placer les pastilles ; il est **comparé** au calcul :
-* au chargement, la barre d'état indique combien de bulles ont un Z du CSV
-  différent du calcul (écart de plus de 2 cm) ;
-* la fiche de la bulle affiche `Z CSV … ⚠ écart …` ;
-* sous la pastille, la ligne Z devient orange : `Z 1.65  (CSV 3.15)`.
-
-Les corrections de l'édition portent sur les deux composantes, jamais sur le Z
-lui-même :
+Les corrections de l'édition portent sur ces composantes :
 * **hauteur station** : seule la caméra bouge ;
 * **delta plancher** : caméra et sol bougent.
 
-Le Z final se recalcule. Le relevé corrigé réécrit `Z`, `Delta` et
-`Hauteur instrument` pour les bulles corrigées. `X` et `Y` se corrigent à part,
-pour la position et la cohérence d'orientation entre points de vue.
+Le Z se recalcule aussitôt. `X` et `Y` se corrigent à part, pour la position
+et la cohérence d'orientation entre points de vue.
 
-Une bulle sans altitude de plancher (ni colonne, ni libellé) garde son Z du
-CSV. Réglages → *Altitude du point de vue* permet aussi de revenir au Z du CSV
-tel quel, pour comparaison.
+**Le CSV corrigé** (« Appliquer / enregistrer… », coché par défaut) reprend le
+format du CSV chargé avec les **bonnes valeurs** sur chaque ligne :
+* X et Y ;
+* Z = plancher + Δ + H (un Z faux est remplacé, même sans correction) ;
+* Delta et Hauteur instrument ;
+* Δ nord.
+
+Si une correction de delta, de hauteur ou d'orientation le demande, la colonne
+correspondante est ajoutée en fin de ligne. Le CSV chargé n'est jamais modifié.
 
 Les lignes inexploitables sont ignorées et listées dans « Réglages… → Voir les
 avertissements CSV » — jamais bloquantes.
@@ -217,18 +214,12 @@ tiers du tour. Pour tout voir :
   **mât** la relie à son pied au sol. On lit ainsi H d'un coup d'œil.
 
 Le point de vue se calcule toujours de la même façon, **Z = plancher + Δ + H**
-(voir § 2). La fiche détaille le calcul et le compare au Z du CSV :
+(voir § 2). La fiche détaille le calcul :
 
 ```
 sol      plancher -8.50 + Δ +0.00 = -8.50
 caméra   sol + H 1.65 = -6.85 (point de vue)
-Z CSV    -7.30  ⚠ écart -0.45 m avec le calcul
 ```
-
-Les relevés actuels (GRA6, BUG_BR) n'ont encore ni colonne delta ni colonne
-hauteur : tout y est calculé avec Δ = 0 et H = 1,65 m. Sur GRA6, 150 bulles
-ont un Z du CSV qui diffère de ce calcul. Ce sont les marches, les mezzanines
-ou les erreurs à examiner.
 
 **Étiquettes des pastilles** (menu « Affichage ▾ », chaque ligne se coche à
 part, le choix est mémorisé et vaut aussi pour la vue B) :
@@ -324,9 +315,7 @@ recharger les images :
 * **Correction nord** : décalage global en degrés ;
 * **Hauteur instrument** : hauteur de l'appareil au-dessus du sol (1,65 m par
   défaut), pour les bulles sans colonne de hauteur. Elle entre dans le calcul
-  Z = plancher + Δ + H, avec un effet immédiat dans les deux vues ;
-* **Altitude du point de vue** : *Z plancher + Δ + H* (calcul, par défaut) ou
-  *Z du CSV* (lu tel quel, pour comparaison).
+  Z = plancher + Δ + H, avec un effet immédiat dans les deux vues.
 
 Les dialogues (Réglages, bilan…) s'ouvrent **devant le visualiseur**, même en
 plein écran.
