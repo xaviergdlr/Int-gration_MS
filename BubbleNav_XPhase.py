@@ -435,8 +435,21 @@ class Station:
         photo ; les colonnes explicites du CSV l'emportent sur l'analyse."""
         if self._parts is None:
             base = parse_photo_name(self.target or self.photo)
+            import dataclasses
+            # Num scan sans nom projeté : le locator (« R110b_01 ») donne local et
+            # index, le libellé de plancher (« PLANCHER 01 (-03.50m) ») l'étage.
+            if not base.local and self.locator and self.locator != self.photo:
+                m = re.match(r'^(.+?)[_-](\d{1,3})$', self.locator.strip())
+                if m and not m.group(1).isdigit():
+                    base = dataclasses.replace(base, local=m.group(1), index=m.group(2))
+            if not base.etage and self.floor:
+                m = re.search(r'(?:plancher|niveau|etage|étage|level|floor)\s*(-?\d{1,3})',
+                              self.floor, re.I)
+                if m:
+                    base = dataclasses.replace(base, etage=m.group(1))
+            if base.local and base.index:
+                base = dataclasses.replace(base, reconnu=True)
             if self.attrs:
-                import dataclasses
                 base = dataclasses.replace(base, **{k: v for k, v in self.attrs.items()
                                                     if v and hasattr(base, k)})
                 if base.local and base.index:
@@ -504,7 +517,8 @@ COL_ALIASES = {
     'index': ('index', 'indice', 'numimage'),
 }
 
-YAW_COLUMN = 'Delta Nord (deg)'   # intitule ecrit si la colonne n'existe pas
+YAW_COLUMN = 'Delta Nord (deg)'
+ROUNDING_TOL = 5e-4   # m — sous le demi-millimètre, un écart relu est un arrondi   # intitule ecrit si la colonne n'existe pas
 
 
 def _sniff_delimiter(sample: str) -> str:
@@ -1226,13 +1240,15 @@ class Corrections:
         stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         lines = [self.DELIM.join(self.HEADER)]
         for st in rows:
+            # précision du micromètre : un relevé à 6 décimales doit revenir
+            # intact, sinon une bulle seulement réorientée paraîtrait déplacée
             lines.append(self.DELIM.join((
                 st.key, st.photo, st.locator,
-                f"{st.x:.3f}", f"{st.y:.3f}", f"{st.z:.3f}",
-                f"{st.x - st.ox:+.3f}", f"{st.y - st.oy:+.3f}",
-                f"{st.dh:+.3f}", f"{st.ddelta:+.3f}", f"{st.z - st.oz:+.3f}",
+                f"{st.x:.6f}", f"{st.y:.6f}", f"{st.z:.6f}",
+                f"{st.x - st.ox:+.6f}", f"{st.y - st.oy:+.6f}",
+                f"{st.dh:+.6f}", f"{st.ddelta:+.6f}", f"{st.z - st.oz:+.6f}",
                 f"{st.yaw_fix:.4f}",
-                f"{st.height(self.eye):.3f}", f"{st.delta():+.3f}",
+                f"{st.height(self.eye):.6f}", f"{st.delta():+.6f}",
                 self.applied.get(st.key, ''), stamp)))
         tmp = self.path + '.tmp'
         try:
@@ -1291,7 +1307,9 @@ class Corrections:
             for axis in ('x', 'y'):
                 v = parse_float(cell(axis))
                 if v is not None:
-                    values[axis] = v
+                    origine = st.ox if axis == 'x' else st.oy
+                    # fichiers écrits au mm près : l'arrondi n'est pas une correction
+                    values[axis] = origine if abs(v - origine) < ROUNDING_TOL else v
             dh = parse_float(cell('dh'))
             dd = parse_float(cell('ddelta'))
             if dh is None and dd is None:
@@ -1300,6 +1318,10 @@ class Corrections:
                 z = parse_float(cell('z'))
                 if z is not None:
                     dh = z - st.oz
+            if dh is not None and abs(dh) < ROUNDING_TOL:
+                dh = 0.0
+            if dd is not None and abs(dd) < ROUNDING_TOL:
+                dd = 0.0
             if dh is not None:
                 values['dh'] = dh
             if dd is not None:
@@ -5989,6 +6011,29 @@ def selftest(csv_path: str = '') -> int:
             s4, _ = read_survey_csv(c4, {'key': 'PointID', 'x': 'Coord1', 'y': 'Coord2',
                                          'z': 'Haut'})
             check("correspondance par intitulé", len(s4) == 2 and s4[1].y == 5.0)
+
+        c6 = ecrit('f.csv', "N° scan;X;Y;Z\r\n1001;15.217126;6.562585;-1.850\r\n"
+                            "1002;14.145717;9.039912;-1.850\r\n")
+        s6, _ = read_survey_csv(c6)
+        k6 = Corrections(c6)
+        k6.apply(s6[0], yaw_fix=1.5)
+        k6.apply(s6[1], x=s6[1].x + 0.0123)
+        k6.save(s6)
+        r6, _ = read_survey_csv(c6)
+        Corrections(c6).load({s.photo: s for s in r6}, by_key={s.key.lower(): s for s in r6})
+        check("coordonnées au micromètre : une bulle réorientée n'est pas « déplacée »",
+              not r6[0].moved() and r6[0].x == 15.217126 and r6[0].turned(),
+              f"x relu {r6[0].x!r}")
+        check("coordonnées au micromètre : un déplacement revient exact",
+              abs(r6[1].x - (14.145717 + 0.0123)) < 1e-9 and r6[1].moved(),
+              f"{r6[1].x:.6f}")
+        ancien = ecrit('f_ancien_corrections.csv',
+                       "Cle;Fichier photo;X;Y;Z;Delta Nord (deg)\r\n1001;1001;15.217;6.563;-1.850;1.5\r\n")
+        r7, _ = read_survey_csv(c6)
+        Corrections(c6, path=ancien).load({s.photo: s for s in r7},
+                                          by_key={s.key.lower(): s for s in r7})
+        check("ancien fichier arrondi au mm : l'arrondi n'est pas pris pour un déplacement",
+              not r7[0].moved() and not r7[0].z_changed() and r7[0].turned())
 
         c5 = ecrit('e.csv', "N° scan;X;Y;Z\r\n0347;1.000;2.000;3.000\r\n")
         s5, _ = read_survey_csv(c5)

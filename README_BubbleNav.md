@@ -26,8 +26,10 @@ L'outil s'organise en **deux fenêtres** :
 | **Visualiseur** (grande, touche **V**) | la vue bulle A et, quand la comparaison est ouverte, la vue B **empilée dessous** (séparation ajustable) ; à droite le **panneau latéral** : plan du plancher, filtres, fiche de la bulle, voisins ou outils d'édition |
 
 Le visualiseur s'ouvre de lui-même dès qu'un relevé est chargé, **en plein
-écran** par défaut (F11 bascule, Échap en sort et revient à la dernière taille
-connue). « Réglages… → Visualiseur à l'ouverture » propose aussi *maximisé* ou
+écran** par défaut. Sa barre d'outils porte à droite **⛶** (plein écran oui /
+non, comme F11) et **✕** (fermer le visualiseur) : en plein écran, la barre de
+titre et sa croix disparaissent. Échap sort du plein écran et revient à la
+dernière taille connue. « Réglages… → Visualiseur à l'ouverture » propose aussi *maximisé* ou
 *mémorisé* (dernière taille et position). Le fermer ne fait que le masquer : le
 bouton « Ouvrir le visualiseur » ou la touche V le ramène. Les raccourcis clavier
 fonctionnent depuis l'une ou l'autre fenêtre. Le dossier des images est exploré
@@ -42,12 +44,28 @@ python BubbleNav_XPhase.py --selftest      # vérifications internes, sans inter
 
 ## 2. Le CSV attendu
 
-Séparateur `;` `,` tabulation ou `|`, virgule ou point décimal, colonnes dans n'importe
-quel ordre, accents indifférents :
+Le format est **souple** : il faut seulement un **identifiant** et **X / Y**.
+Séparateur `;` `,` tabulation ou `|`, virgule ou point décimal, colonnes dans
+n'importe quel ordre, accents et casse indifférents, nombreux synonymes
+d'intitulés (`N° scan`, `Numéro de scan`, `Scan`, `Est`, `Nord`, `Altitude`…).
+
+* **Pas de colonne « Fichier photo » ?** Le numéro de scan sert d'identifiant et
+  de nom de photo (`1001` → `1001.jpg`) : c'est le cas d'un CSV num scan prêt,
+  `Num scan;Nom du Locator;X;Y;Z;% NORD;Plancher`.
+* **Local, index et étage** se déduisent alors du locator (`R110b_01` → local
+  R110b, index 01) et du plancher (`PLANCHER 01 (-03.50m)` → étage 01) : filtres
+  et fiche restent complets sans nom projeté.
+* **Pas de ligne d'en-tête ?** L'outil le détecte et propose une correspondance
+  devinée (1re colonne = identifiant, puis X, Y, Z) à confirmer.
+* **Intitulés inconnus ?** Une boîte « Colonnes du CSV » montre les premières
+  lignes et demande quelle colonne est l'identifiant, X, Y, Z, le plancher…
+  Le choix est **mémorisé pour ce format** : on ne le refait plus.
+
+Colonnes reconnues :
 
 | Colonne | Rôle | Obligatoire |
 |---|---|---|
-| `Fichier photo` | nom de l'image, avec ou sans extension | oui |
+| `Fichier photo` ou `N° scan` | identifiant ; nom de l'image, avec ou sans extension | l'un des deux |
 | `X` | coordonnée **Est** (m) | oui |
 | `Y` | coordonnée **Nord** (m) | oui |
 | `Z` | altitude de la caméra (m) | recommandé |
@@ -386,7 +404,9 @@ appliqués à la vue de comparaison), le rendu des sphères ombrées (image, omb
 0,4 m à 200 m), les deux composantes d'altitude (hauteur station laissant le sol en place, delta
 plancher le déplaçant, relevé complet mis à jour par composante, ancien format relu),
 le mode num scan (clé immuable, nom projeté, attributs explicites, rattachement des
-photos par numéro, corrections retrouvées après renommage), l'aller-retour du fichier
+photos par numéro, corrections retrouvées après renommage), la lecture souple (N° scan sans colonne
+photo, intitulés variés, fichier sans en-tête, intitulés inconnus, relevé corrigé
+réécrit au même format), la précision du micromètre, l'aller-retour du fichier
 de corrections (écriture, relecture, ligne orpheline,
 date d'application) avec relevé source inchangé octet pour octet, l'écriture du relevé
 complet corrigé (colonne Δ nord créée puis réutilisée, seules les lignes modifiées
