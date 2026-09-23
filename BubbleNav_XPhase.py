@@ -31,6 +31,7 @@ os.environ.setdefault('OPENCV_LOG_LEVEL', 'ERROR')
 import argparse
 import csv
 import fnmatch
+import itertools
 import json
 import math
 import queue
@@ -39,7 +40,6 @@ import sys
 import threading
 import time
 import unicodedata
-from bisect import insort
 from collections import OrderedDict, defaultdict
 from datetime import datetime
 from dataclasses import dataclass, field, replace as dc_replace
@@ -59,7 +59,11 @@ CONFIG_NAME = ".bubblenav_xphase.json"
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.webp', '.bmp')
 
 # Rendu
-FOV_MIN, FOV_MAX = 30.0, 130.0
+FOV_MIN, FOV_MAX = 30.0, 200.0
+# Au-delà de 110°, la perspective normale étire trop les bords : on passe
+# progressivement à une projection stéréographique (pleine à 160°), qui garde
+# les formes et permet de voir bien plus large, jusqu'à 200°.
+WIDE_START, WIDE_FULL = 110.0, 160.0
 FOV_DEFAULT = 105.0            # vue large demandee
 PITCH_MIN, PITCH_MAX = -89.0, 89.0
 PITCH_DEFAULT = -20.0          # les pastilles au sol sont sous l'horizon
@@ -231,7 +235,9 @@ DEFAULT_CONFIG = {
     'drag_axis': 'auto',             # axe du glisser en édition : 'auto' | 'x' | 'y' | 'z'
     'drag_z': 'ddelta',              # l'axe Z agit sur 'ddelta' (sol + caméra) ou 'dh'
     'hotspot_anchor': 'sol',         # pastille au 'sol' ou au point de 'vue' (mât)
-    'all_hotspots': False,           # toutes les bulles à portée, sans élagage
+    'hotspots_mode': 'plancher',     # 'plancher' : toutes les bulles du plancher ;
+                                     # 'reseau' : réseau élagué (portée, nombre, direction)
+    'color_mode': 'local',           # couleur des pastilles : 'local' ou 'lien'
     'focus_origin': False,           # à l'arrivée, regarder la bulle d'où l'on vient
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
@@ -955,8 +961,36 @@ class View:
     width: int = 1280
     height: int = 720
 
+    def lens(self) -> float:
+        """0 = perspective normale, 1 = stéréographique (grand angle)."""
+        return lens_mix(self.fov)
+
     def focal(self) -> float:
-        return (self.width / 2.0) / math.tan(math.radians(self.fov) / 2.0)
+        """Échelle au centre de l'image (px par radian)."""
+        return lens_focal(self.fov, self.width)
+
+
+def lens_mix(fov: float) -> float:
+    return clamp((fov - WIDE_START) / (WIDE_FULL - WIDE_START), 0.0, 1.0)
+
+
+def lens_g(theta: float, d: float) -> float:
+    """Rayon image (en focales) d'une direction à `theta` de l'axe.
+
+    Perspective générale : d = 0 donne tan θ (perspective normale), d = 1
+    donne 2 tan(θ/2) (stéréographique) ; entre les deux, transition continue.
+    """
+    return (d + 1.0) * math.sin(theta) / (d + math.cos(theta))
+
+
+def lens_inv(rho: float, d: float) -> float:
+    """Angle à l'axe d'un point image à `rho` focales du centre (inverse exact)."""
+    r = math.hypot(d + 1.0, rho)
+    return math.atan2(rho, d + 1.0) + math.asin(clamp(rho * d / r, -1.0, 1.0))
+
+
+def lens_focal(fov: float, width: int) -> float:
+    return (width / 2.0) / lens_g(math.radians(fov) / 2.0, lens_mix(fov))
 
 
 def project(view: View, pano_yaw_deg: float, elev_deg: float
@@ -979,15 +1013,23 @@ def project(view: View, pano_yaw_deg: float, elev_deg: float
 
     fwd = cy * wx + sy * wy                 # composante dans le plan de visee
     xc = cp * fwd + sp * wz                 # avant camera
-    if xc <= 1e-6:
-        return None
     yc = -sy * wx + cy * wy                 # droite ecran
     zc = -sp * fwd + cp * wz                # haut ecran
-
+    d = view.lens()
+    margin = d + xc                         # > 0 : direction représentable
+    if margin <= 1e-6:
+        return None
     f = view.focal()
-    col = view.width / 2.0 + f * yc / xc
-    row = view.height / 2.0 - f * zc / xc
-    return col, row, xc
+    if d == 0.0:
+        col = view.width / 2.0 + f * yc / xc
+        row = view.height / 2.0 - f * zc / xc
+        return col, row, xc
+    side = math.hypot(yc, zc)
+    if side < 1e-12:
+        return view.width / 2.0, view.height / 2.0, margin
+    rho = f * lens_g(math.acos(clamp(xc, -1.0, 1.0)), d)
+    return (view.width / 2.0 + rho * yc / side,
+            view.height / 2.0 - rho * zc / side, margin)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1075,6 +1117,7 @@ class GraphParams:
     ang_min: float = ANG_MIN_DEFAULT
     floor_radius: float = FLOOR_RADIUS_DEFAULT
     floor_dz_max: float = FLOOR_DZ_MAX
+    whole_floor: bool = False     # toutes les bulles du plancher, sans portée ni tri
 
 
 class SpatialIndex:
@@ -1120,25 +1163,40 @@ def build_graph(stations: Sequence[Station], params: GraphParams
     if n == 0:
         return links
 
-    index = SpatialIndex(stations, max(params.radius, params.floor_radius))
+    whole = params.whole_floor
+    reach = params.floor_radius if whole else max(params.radius, params.floor_radius)
+    index = SpatialIndex(stations, max(0.5, reach))
     r2 = params.radius * params.radius
     fr2 = params.floor_radius * params.floor_radius
+    floors: Dict[str, List[int]] = defaultdict(list)
+    if whole:
+        for st in stations:
+            floors[st.floor].append(st.idx)
 
     for st in stations:
         same: List[Tuple[float, float, float, float, int]] = []
         by_floor: Dict[str, Tuple[float, int]] = {}
 
-        for j in index.around(st.x, st.y, max(params.radius, params.floor_radius)):
+        # plancher entier : toutes ses bulles (liste du plancher), les autres
+        # planchers restant cherchés dans le voisinage ; sinon, la portée
+        if whole:
+            cands = itertools.chain(
+                floors[st.floor],
+                (j for j in index.around(st.x, st.y, reach)
+                 if stations[j].floor != st.floor))
+        else:
+            cands = index.around(st.x, st.y, reach)
+        for j in cands:
             if j == st.idx:
                 continue
             other = stations[j]
             dx, dy = other.x - st.x, other.y - st.y
             d2 = dx * dx + dy * dy
             if other.floor == st.floor:
-                if d2 <= r2:
+                if whole or d2 <= r2:
                     dz = other.z - st.z
                     az, _, d3 = azimuth_elev(dx, dy, dz)
-                    insort(same, (d3, az, math.sqrt(d2), dz, j))
+                    same.append((d3, az, math.sqrt(d2), dz, j))
             elif d2 <= fr2:
                 dz = other.z - st.z
                 if abs(dz) <= params.floor_dz_max:
@@ -1146,11 +1204,13 @@ def build_graph(stations: Sequence[Station], params: GraphParams
                     if prev is None or d2 < prev[0]:
                         by_floor[other.floor] = (d2, j)
 
+        same.sort()
         out: List[Link] = []
+        prune = params.ang_min > 0.0
         for d3, az, dh, dz, j in same:
             if len(out) >= params.kmax:
                 break
-            if any(abs(wrap180(az - lk.azimuth)) < params.ang_min for lk in out):
+            if prune and any(abs(wrap180(az - lk.azimuth)) < params.ang_min for lk in out):
                 continue        # deja une pastille dans cette direction
             out.append(Link(j, d3, dh, az, dz, 'same'))
 
@@ -1202,8 +1262,18 @@ def _pano_ray(view: View, col: float, row: float) -> Tuple[float, float, float]:
     f = view.focal()
     xg = col - view.width / 2.0
     yg = row - view.height / 2.0
-    norm = math.sqrt(f * f + xg * xg + yg * yg)
-    xc, yc, zc = f / norm, xg / norm, -yg / norm
+    d = view.lens()
+    if d == 0.0:
+        norm = math.sqrt(f * f + xg * xg + yg * yg)
+        xc, yc, zc = f / norm, xg / norm, -yg / norm
+    else:
+        rpx = math.hypot(xg, yg)
+        if rpx < 1e-9:
+            xc, yc, zc = 1.0, 0.0, 0.0
+        else:
+            th = lens_inv(rpx / f, d)
+            st_ = math.sin(th)
+            xc, yc, zc = math.cos(th), st_ * xg / rpx, -st_ * yg / rpx
     yr, pr = math.radians(view.yaw), math.radians(view.pitch)
     cy, sy = math.cos(yr), math.sin(yr)
     cp, sp = math.cos(pr), math.sin(pr)
@@ -1283,6 +1353,25 @@ def axis_param(ray: Sequence[float], p0: Sequence[float], axis: Sequence[float],
     if dr + b * t <= 0 or abs(t) > max_abs:
         return None
     return t
+
+
+@lru_cache(maxsize=4096)
+def local_color(name: str) -> str:
+    """Couleur stable d'un local : même local, même couleur, d'une session à l'autre.
+
+    Teinte tirée du nom (répartition « nombre d'or »), en évitant l'orange
+    réservé aux bulles corrigées ; saturation et luminosité lisibles sur une
+    image sombre comme claire.
+    """
+    import colorsys
+    import zlib
+    h = (zlib.crc32(name.encode('utf-8')) * 0.6180339887) % 1.0
+    hue = (50.0 + h * 325.0) % 360.0 / 360.0          # hors 15°–50° (orange d'édition)
+    k = zlib.crc32(name[::-1].encode('utf-8'))
+    sat = 0.55 + (k % 30) / 100.0
+    val = 0.85 + (k // 30 % 15) / 100.0
+    r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
 
 def aim_at(view: View, calib: Calib, frm: Station, to: Station,
@@ -2132,15 +2221,28 @@ class PanoRenderer:
             if rays is not None:
                 self._rays.move_to_end(key)
                 return rays
-        f = (w / 2.0) / math.tan(math.radians(fov) / 2.0)
+        f = lens_focal(fov, w)
+        d = lens_mix(fov)
         xs = np.linspace(-w / 2.0, w / 2.0, w, dtype=np.float32)
         ys = np.linspace(-h / 2.0, h / 2.0, h, dtype=np.float32)
         gx, gy = np.meshgrid(xs, ys)
-        norm = np.sqrt(f * f + gx * gx + gy * gy, dtype=np.float32)
         rays = np.empty((3, w * h), dtype=np.float32)
-        rays[0] = (f / norm).reshape(-1)
-        rays[1] = (gx / norm).reshape(-1)
-        rays[2] = (-gy / norm).reshape(-1)
+        if d == 0.0:
+            norm = np.sqrt(f * f + gx * gx + gy * gy, dtype=np.float32)
+            rays[0] = (f / norm).reshape(-1)
+            rays[1] = (gx / norm).reshape(-1)
+            rays[2] = (-gy / norm).reshape(-1)
+        else:                             # grand angle : inverse exact de lens_g
+            rpx = np.sqrt(gx * gx + gy * gy, dtype=np.float32)
+            rho = rpx / np.float32(f)
+            r = np.sqrt((d + 1.0) ** 2 + rho * rho, dtype=np.float32)
+            th = np.arctan2(rho, np.float32(d + 1.0)) + np.arcsin(
+                np.clip(rho * np.float32(d) / r, -1.0, 1.0))
+            sth = np.sin(th)
+            safe = np.where(rpx < 1e-6, np.float32(1.0), rpx)
+            rays[0] = np.cos(th).reshape(-1)
+            rays[1] = (sth * gx / safe).reshape(-1)
+            rays[2] = (-sth * gy / safe).reshape(-1)
         with self._lock:
             self._rays[key] = rays
             while len(self._rays) > RAY_CACHE_SIZE:
@@ -3007,10 +3109,16 @@ class BubbleNavApp(_TkBase):
         menu.add_radiobutton(label="Pastille au point de vue (sol + H), mât au sol",
                              value='vue', variable=self.anchor_var, command=self._set_anchor)
         menu.add_separator()
-        self.all_var = tk.BooleanVar(value=bool(self.cfg.get('all_hotspots')))
-        menu.add_checkbutton(label="Toutes les pastilles, sans élagage  (T)",
+        self.all_var = tk.BooleanVar(value=self.whole_floor())
+        menu.add_checkbutton(label="Toutes les bulles du plancher  (T)",
                              variable=self.all_var,
                              command=lambda: self._toggle_all(bool(self.all_var.get())))
+        menu.add_separator()
+        self.color_var = tk.StringVar(value=self.cfg.get('color_mode', 'local'))
+        menu.add_radiobutton(label="Couleur par local", value='local',
+                             variable=self.color_var, command=self._set_color_mode)
+        menu.add_radiobutton(label="Couleur par type de lien (▲ ▼)", value='lien',
+                             variable=self.color_var, command=self._set_color_mode)
         menu.add_separator()
         self.focus_var = tk.BooleanVar(value=bool(self.cfg.get('focus_origin')))
         menu.add_checkbutton(label="À l'arrivée, regarder d'où l'on vient",
@@ -3697,27 +3805,53 @@ class BubbleNavApp(_TkBase):
                                          "mât jusqu'au sol" if self.anchor() == 'vue'
                                          else "posées au sol (plancher + delta)"))
 
+    def whole_floor(self) -> bool:
+        """Pastilles de toutes les bulles du plancher (défaut), ou réseau élagué."""
+        return self.cfg.get('hotspots_mode', 'plancher') != 'reseau'
+
     def graph_params(self) -> GraphParams:
-        """Paramètres du réseau ; « toutes les pastilles » lève l'élagage."""
-        if self.cfg.get('all_hotspots'):
-            return dc_replace(self.params, kmax=10 ** 6, ang_min=0.0)
+        """Paramètres du réseau : tout le plancher, ou élagage (portée, nombre, direction)."""
+        if self.whole_floor():
+            return dc_replace(self.params, kmax=10 ** 6, ang_min=0.0, whole_floor=True)
         return self.params
 
     def _toggle_all(self, on: Optional[bool] = None) -> None:
-        """Touche T : toutes les bulles à portée, sans limite ni tri angulaire."""
+        """Touche T : toutes les bulles du plancher ↔ réseau élagué."""
         if on is None:
-            on = not bool(self.cfg.get('all_hotspots'))
-        self.cfg['all_hotspots'] = on
+            on = not self.whole_floor()
+        self.cfg['hotspots_mode'] = 'plancher' if on else 'reseau'
         if hasattr(self, 'all_var'):
             self.all_var.set(on)
         save_config(self.cfg)
         self.rebuild_graph()
         n = len(self.links[self.current]) if 0 <= self.current < len(self.links) else 0
         self._set_status(
-            (f"Toutes les pastilles : {n} bulle(s) à moins de {self.params.radius:g} m "
-             "(T pour revenir au réseau élagué)") if on else
-            (f"Réseau élagué : {self.params.kmax} pastilles max, une par direction "
-             f"({self.params.ang_min:g}°) — {n} ici"), COLORS['sel'] if on else None)
+            (f"Toutes les bulles du plancher : {n} pastille(s) autour de cette bulle "
+             "(T : réseau élagué)") if on else
+            (f"Réseau élagué : {self.params.kmax} pastilles max à moins de "
+             f"{self.params.radius:g} m, une par direction ({self.params.ang_min:g}°) — "
+             f"{n} ici (T : tout le plancher)"), COLORS['sel'] if on else None)
+
+    def hotspot_color(self, lk: "Link", tgt: Station) -> str:
+        """Couleur d'une pastille : par local (défaut) ou par type de lien.
+
+        Image absente et bulle corrigée gardent leur couleur d'alerte.
+        """
+        if tgt.modified():
+            return COLORS['edit']
+        if not self.store.has(tgt.photo):
+            return COLORS['plan_missing']
+        if self.cfg.get('color_mode', 'local') == 'local':
+            return local_color(tgt.parts().local or tgt.floor)
+        return {'same': COLORS['hot'], 'up': COLORS['hot_up'],
+                'down': COLORS['hot_down']}[lk.kind]
+
+    def _set_color_mode(self) -> None:
+        self.cfg['color_mode'] = self.color_var.get()
+        save_config(self.cfg)
+        self._draw_overlay()
+        self._redraw_compare()
+        self._draw_plan()
 
     def draw_hotspot(self, canvas, hs: "Hotspot", color: str, hovered: bool,
                      selected: bool = False) -> None:
@@ -3761,9 +3895,37 @@ class BubbleNavApp(_TkBase):
         if self.compare is not None:
             self.compare._draw_overlay()
 
+    def declutter(self, hotspots: Sequence["Hotspot"]) -> set:
+        """Pastilles autorisées à porter leurs étiquettes, sans chevauchement.
+
+        Les plus proches (les plus grosses à l'écran) passent d'abord ; une
+        étiquette qui mordrait sur une autre est omise, la sphère restant
+        affichée (le survol montre tout).
+        """
+        lo = self.disc_bounds()[0] + 0.5
+        n_lines = (int(bool(self.labels_var.get())) * 13
+                   + int(bool(self.heights_var.get())) * 33)
+        taken: List[Tuple[float, float, float, float]] = []
+        ok = set()
+        for i in sorted(range(len(hotspots)), key=lambda k: -hotspots[k].radius):
+            hs = hotspots[i]
+            if hs.radius <= lo:
+                continue
+            tgt = self.stations[hs.link.target]
+            w = max(56.0, 6.2 * (len(tgt.locator) + 8)) / 2.0
+            y0 = self.glyph_y(hs, False) - 9
+            y1 = self.label_y(hs, False) + n_lines - 4
+            box = (hs.col - w, y0, hs.col + w, y1)
+            if any(box[0] < b[2] and b[0] < box[2] and box[1] < b[3] and b[1] < box[3]
+                   for b in taken):
+                continue
+            taken.append(box)
+            ok.add(i)
+        return ok
+
     def draw_marks(self, canvas, hs: "Hotspot", tgt: Station, color: str,
                    hovered: bool, selected: bool = False, missing: bool = False,
-                   tag: str = '') -> None:
+                   tag: str = '', labels: bool = True) -> None:
         """Étiquettes d'une pastille, lues à chaque dessin (donc toujours à jour).
 
         Au-dessus : le nom de la station. Dessous : la distance, puis trois
@@ -3790,19 +3952,24 @@ class BubbleNavApp(_TkBase):
             cy = hs.row - (SPHERE_RADIUS * r * SPHERE_LIFT if self.relief() else 0)
             canvas.create_oval(hs.col - rs, cy - rs, hs.col + rs, cy + rs,
                                outline='white', width=2, dash=(4, 3), tags='hs')
-        if self.names_var.get() or hovered or tag:
-            text(hs.col, top, (tag + '  ' if tag else '') + tgt.locator,
+        # Pastilles lointaines (à leur taille minimale) : la sphère seule, pour
+        # que tout le plancher reste lisible ; le survol donne tout.
+        near = labels and hs.radius > self.disc_bounds()[0] + 0.5
+        name = tgt.locator
+        if tgt.key_explicit and tgt.key and tgt.key != tgt.locator:
+            name += f" · {tgt.key}"                 # n° de scan : nom de l'image
+        if (self.names_var.get() and near) or hovered or tag or selected:
+            text(hs.col, top, (tag + '  ' if tag else '') + name,
                  'white' if hovered or tag else MARK_TEXT,
                  F_TINY_B if hovered or selected or tag else F_TINY)
         y = self.label_y(hs, hovered)
-        if self.labels_var.get() or hovered:
+        if (self.labels_var.get() and near) or hovered:
             txt = human_dist(lk.dist)
             if hovered and missing:
                 txt += " · image absente"
             text(hs.col, y, txt, 'white' if hovered else '#e8e8e8',
                  F_UI_B if hovered else F_UI)
             y += 13
-        near = hs.radius > self.disc_bounds()[0] + 0.5
         if self.heights_var.get() and (near or hovered or selected):
             eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
             nd = 3 if self.edit_mode else 2
@@ -3846,22 +4013,19 @@ class BubbleNavApp(_TkBase):
             self._draw_axes(view)
         else:
             self._axis_hits = []
+        libres = self.declutter(self.hotspots)
         for i, hs in enumerate(self.hotspots):
             lk = hs.link
             tgt = self.stations[lk.target]
-            color = {'same': COLORS['hot'], 'up': COLORS['hot_up'],
-                     'down': COLORS['hot_down']}[lk.kind]
             missing = not self.store.has(tgt.photo)
-            if missing:
-                color = COLORS['plan_missing']
-            if tgt.modified():
-                color = COLORS['edit']
+            color = self.hotspot_color(lk, tgt)
             hovered = (i == self._hover)
             selected = self.edit_mode and self.selected == tgt.idx
             self.draw_hotspot(self.canvas, hs, color, hovered, selected=selected)
             tag = ("↩ origine" if tgt.idx == self.came_from else
                    "B" if self.compare is not None and tgt.idx == self.compare.idx else '')
-            self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing, tag)
+            self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing, tag,
+                            labels=i in libres)
         if self.edit_mode:
             for x, y, txt, col in self._axis_labels:
                 self.canvas.create_text(x + 1, y + 1, text=txt, fill='#000000',
@@ -3879,6 +4043,8 @@ class BubbleNavApp(_TkBase):
         self.heading_lbl.config(
             text=f"cap {az:+07.1f}°  |  site {view.pitch:+05.1f}°  |  champ {view.fov:.0f}°")
         title = f"{st.locator}   ({st.floor})"
+        if st.key_explicit and st.key and st.key != st.locator:
+            title = f"{st.locator} · scan {st.key}   ({st.floor})"
         if st.turned():
             title += f"   Δnord {st.yaw_fix:+.2f}°"
         self.canvas.create_text(15, 13, text=title, anchor='nw', fill='#000000',
@@ -4106,11 +4272,9 @@ class BubbleNavApp(_TkBase):
                 self.goto(self.hotspots[hit].link.target)
             return
         view = self._frame_view or self.view
-        f = view.focal()
-        dx = event.x - view.width / 2.0
-        dy = event.y - view.height / 2.0
-        self.view.yaw = wrap180(self.view.yaw + math.degrees(math.atan2(dx, f)))
-        self.view.pitch = clamp(self.view.pitch - math.degrees(math.atan2(dy, f)),
+        wx, wy, wz = _pano_ray(view, event.x, event.y)
+        self.view.yaw = wrap180(math.degrees(math.atan2(wy, wx)))
+        self.view.pitch = clamp(math.degrees(math.asin(clamp(wz, -1.0, 1.0))),
                                 PITCH_MIN, PITCH_MAX)
         self._request_render(force=True)
 
@@ -5537,9 +5701,10 @@ class BubbleNavApp(_TkBase):
         # Par défaut le plan n'en montre que le squelette.
         mode = self.plan_links_var.get() if hasattr(self, 'plan_links_var') else 'squelette'
         if mode == 'complet':
+            # tout le plancher relié : on se limite aux liens de la portée
             segments = {(min(st.idx, lk.target), max(st.idx, lk.target))
                         for st in pts for lk in (self.links[st.idx] if self.links else [])
-                        if lk.kind == 'same'}
+                        if lk.kind == 'same' and lk.dist_h <= self.params.radius}
         elif mode == 'squelette':
             segments = [(i, j) for i, j in self.plan_edges
                         if self.stations[i].floor == floor]
@@ -5556,7 +5721,7 @@ class BubbleNavApp(_TkBase):
             cx_, cy_ = to_screen(cur.x, cur.y)
             for lk in self._visible_links(cur.idx):
                 tgt = self.stations[lk.target]
-                if tgt.floor == floor:
+                if tgt.floor == floor and lk.dist_h <= self.params.radius:
                     x2, y2 = to_screen(tgt.x, tgt.y)
                     self.plan.create_line(cx_, cy_, x2, y2, fill=COLORS['hot'],
                                           width=1, dash=(3, 2))
@@ -5564,7 +5729,12 @@ class BubbleNavApp(_TkBase):
         for st in pts:
             x, y = to_screen(st.x, st.y)
             if -10 <= x <= w + 10 and -10 <= y <= h + 10:
-                col = COLORS['plan_pt'] if self.store.has(st.photo) else COLORS['plan_missing']
+                if not self.store.has(st.photo):
+                    col = COLORS['plan_missing']
+                elif self.cfg.get('color_mode', 'local') == 'local':
+                    col = local_color(st.parts().local or st.floor)
+                else:
+                    col = COLORS['plan_pt']
                 r = 2.5
                 if st.modified():
                     col, r = COLORS['edit'], 3.5
@@ -5610,7 +5780,7 @@ class BubbleNavApp(_TkBase):
             # voisins mis en evidence (filtres compris)
             for lk in self._visible_links(cur.idx):
                 tgt = self.stations[lk.target]
-                if tgt.floor != floor:
+                if tgt.floor != floor or lk.dist_h > self.params.radius:
                     continue
                 x, y = to_screen(tgt.x, tgt.y)
                 self.plan.create_oval(x - 4, y - 4, x + 4, y + 4,
@@ -6561,20 +6731,17 @@ class CompareView(tk.Frame if _TK_OK else object):
             app.store.has, float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
             float(app.cfg.get('disc_radius', DISC_RADIUS_M)), *app.disc_bounds(),
             anchor=app.anchor())
+        libres = app.declutter(self.hotspots)
         for i, hs in enumerate(self.hotspots):
             tgt = app.stations[hs.link.target]
-            color = {'same': COLORS['hot'], 'up': COLORS['hot_up'],
-                     'down': COLORS['hot_down']}[hs.link.kind]
-            if not app.store.has(tgt.photo):
-                color = COLORS['plan_missing']
-            if tgt.modified():
-                color = COLORS['edit']
+            color = app.hotspot_color(hs.link, tgt)
             hovered = i == self._hover
             app.draw_hotspot(self.canvas, hs, color, hovered)
             tag = ("A" if tgt.idx == app.current else
                    "↩ origine" if tgt.idx == self.came_from else '')
             app.draw_marks(self.canvas, hs, tgt, color, hovered,
-                           missing=not app.store.has(tgt.photo), tag=tag)
+                           missing=not app.store.has(tgt.photo), tag=tag,
+                           labels=i in libres)
         if self._hover is not None and self._hover_xy:
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
         st = self.station()
@@ -6825,7 +6992,10 @@ def selftest(csv_path: str = '') -> int:
     for (yaw, pitch, fov, psi, elev) in (
             (0, 0, 90, 12.0, 5.0), (30, -15, 100, 55.0, -20.0),
             (-120, 25, 70, -95.0, 30.0), (170, -40, 120, 155.0, -35.0),
-            (75, 0, 60, 60.0, 0.0)):
+            (75, 0, 60, 60.0, 0.0),
+            # grand angle (projection stéréographique progressive)
+            (0, -10, 150, 60.0, -20.0), (40, -30, 190, 125.0, -40.0),
+            (-60, 10, 200, -150.0, 5.0)):
         src = np.zeros((sh, sw, 3), dtype=np.uint8)
         u = (psi + 180.0) / 360.0 * sw
         v = (0.5 - elev / 180.0) * sh
@@ -6849,6 +7019,11 @@ def selftest(csv_path: str = '') -> int:
 
     behind = project(View(0, 0, 90, 640, 400), 179.0, 0.0)
     check("direction opposée rejetée", behind is None)
+    err_l = max(abs(lens_inv(lens_g(math.radians(t), d), d) - math.radians(t))
+                for d in (0.0, 0.3, 0.7, 1.0) for t in range(0, 85 if d == 0 else 100, 5))
+    check("grand angle : projection inverse exacte", err_l < 1e-9, f"{err_l:.1e} rad")
+    check("grand angle : transition continue à 110°",
+          abs(View(0, 0, 110.0, 640, 400).focal() - View(0, 0, 110.001, 640, 400).focal()) < 0.05)
 
     # 4. CSV + reseau
     print("\n4) Lecture CSV et réseau")
@@ -6917,7 +7092,8 @@ def selftest(csv_path: str = '') -> int:
     print("\n6) Déplacement d'une pastille (écran ↔ sol)")
     cal = Calib('colonne', 1, 0.0)
     worst_az = worst_d = 0.0
-    for view in (View(35.0, -22.0, 100.0, 1280, 720), View(-140.0, -35.0, 70.0, 900, 900)):
+    for view in (View(35.0, -22.0, 100.0, 1280, 720), View(-140.0, -35.0, 70.0, 900, 900),
+                 View(35.0, -22.0, 160.0, 1280, 720), View(-140.0, -35.0, 195.0, 900, 900)):
         for az, dh, dz in ((10.0, 3.0, -1.65), (-40.0, 8.0, -1.65),
                            (95.0, 5.0, -0.50), (150.0, 12.0, -1.65)):
             elev = math.degrees(math.atan2(dz, dh))

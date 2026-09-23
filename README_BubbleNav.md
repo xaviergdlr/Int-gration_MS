@@ -162,12 +162,12 @@ relevé déjà renommé.
 | Clic sur une pastille | aller sur cette bulle |
 | **Clic droit** sur une pastille | l'ouvrir dans l'**autre vue** (A → B, en ouvrant la comparaison au besoin ; B → A) |
 | Glisser | tourner la vue |
-| Molette, `+` / `−` | champ de vision (30° à 130°, 105° par défaut) |
+| Molette, `+` / `−` | champ de vision, de 30° à **200°** (105° par défaut) ; au-delà de 110°, passage progressif en **grand angle** |
 | Double-clic | recentrer la vue sur ce point |
 | `Entrée` / `Espace` | avancer vers la pastille la plus centrale |
 | `Retour arrière` | revenir à la bulle précédente |
 | **`Ctrl+Z`** | **annuler la dernière opération**, quelle qu'elle soit : entrée dans une bulle (retour à la bulle quittée, avec le même cap, site et champ), correction, bulle ouverte dans la vue B |
-| `T` | **toutes les pastilles** : toutes les bulles à portée, sans limite de nombre ni tri par direction (T de nouveau pour revenir) |
+| `T` | bascule **toutes les bulles du plancher** (défaut) ↔ **réseau élagué** |
 | **`O`** | **regarder d'où l'on vient** : la vue se tourne vers la pastille de la bulle quittée |
 | Flèches (`Maj` = pas large) | tourner |
 | `Origine` | redresser la vue |
@@ -202,24 +202,43 @@ La navigation (pastilles de la vue) n'est pas touchée : seul le dessin du plan
 change.
 La liste « Plancher » change de niveau en rejoignant la bulle la plus proche à l'aplomb.
 
-**Couleur des pastilles** : jaune = même plancher · bleu ▲ = niveau au-dessus ·
-violet ▼ = niveau en dessous · rouge sombre = image absente du dossier · orange =
-bulle corrigée.
+**Couleur des pastilles** (menu « Affichage ▾ ») :
+* **par local** (défaut) : chaque local a sa couleur, tirée de son nom. Elle
+  est donc toujours la même d'une session à l'autre, et identique sur le plan.
+  Les ▲ ▼ signalent toujours les planchers voisins ;
+* **par type de lien** : jaune = même plancher, bleu ▲ = niveau au-dessus,
+  violet ▼ = niveau en dessous.
+
+Dans les deux cas, le rouge sombre signale une image absente du dossier, et
+l'orange une bulle corrigée.
 
 **Infobulles** : chaque bouton, liste, curseur ou case affiche son aide après un
 court survol.
 
-**Voir toutes les pastilles** : par défaut, le réseau est **élagué** pour rester
-lisible. Il garde 8 pastilles au plus, à moins de 12 m, et **une seule par
-direction** (25°) : dans un couloir, seule la plus proche des bulles alignées
-apparaît. De plus, la vue ne montre que son champ (105°), soit environ un
-tiers du tour. Pour tout voir :
-* touche **T**, ou menu « Affichage ▾ » → *Toutes les pastilles* : toutes les
-  bulles à portée, sans limite ni tri. Sur GRA6, on passe par exemple de 10 à
-  53 pastilles autour d'une même bulle ;
-* ou **Réglages… → Réseau** : séparation angulaire à 0°, « Pastilles max »
-  (jusqu'à 40), portée. L'effet est immédiat, le nombre de liens s'affiche dans
-  la barre d'état.
+**Toutes les bulles du plancher, par défaut.** Chaque bulle du même plancher a
+sa pastille, quelle que soit sa distance. Seule limite : le champ de la vue ;
+élargissez-le, jusqu'à 200°, pour voir presque tout le tour. S'y ajoutent les
+pastilles ▲ ▼ vers les planchers voisins (la plus proche au-dessus et en
+dessous, à moins de 5 m en plan).
+
+Pour rester lisible :
+* seules les pastilles **proches** portent leurs étiquettes (nom, distance,
+  H / Δ / Z). Les lointaines, réduites à leur taille minimale, n'affichent que
+  la sphère, et le survol en donne tout le détail ;
+* une étiquette qui chevaucherait celle d'une pastille plus proche est omise ;
+* le filtre de distance (panneau « Filtres ») limite au besoin l'affichage.
+
+**Réseau élagué** (touche **T**, ou menu « Affichage ▾ ») : c'est l'ancien
+comportement, fait pour naviguer de proche en proche. Il garde au plus
+**8 pastilles**, à moins de **12 m**, et **une seule par direction** (écart de
+25°) : dans un couloir, seule la plus proche des bulles alignées reste. Ces
+trois valeurs se règlent dans *Réglages → Réseau*.
+
+**Grand angle** : jusqu'à 110°, la vue est une perspective normale (lignes
+droites). Au-delà, elle passe progressivement en projection
+**stéréographique** (complète à 160°). Les bords ne s'étirent plus à l'infini :
+on peut voir jusqu'à 200°, avec des lignes courbées mais des formes
+préservées. Pastilles, clics et glisser suivent exactement la même projection.
 
 **Hauteur des pastilles** (menu « Affichage ▾ ») :
 * **au sol** (par défaut) : la pastille se pose sur le sol de la bulle cible,
