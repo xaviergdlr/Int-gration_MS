@@ -222,6 +222,7 @@ DEFAULT_CONFIG = {
     'corr_paths': {},          # releve -> fichier de corrections choisi
     'viewer_geometry': '',     # taille/position du visualiseur hors plein ecran
     'viewer_start': 'plein écran',   # 'plein écran' | 'maximisé' | 'mémorisé'
+    'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
 
 VIEWER_START_MODES = ('plein écran', 'maximisé', 'mémorisé')
@@ -466,7 +467,8 @@ class Station:
 
 
 COL_ALIASES = {
-    'photo': ('fichierphoto', 'fichier', 'photo', 'image', 'nomimage',
+    'photo': ('fichierphoto', 'nomdufichier', 'nomfichier', 'fichierimage',
+              'nomdelaphoto', 'fichier', 'photo', 'image', 'nomimage',
               'nomphoto', 'filename', 'file', 'name'),
     'locator': ('nomdulocator', 'locator', 'nomlocator', 'station', 'point',
                 'nomdupoint', 'nom', 'id'),
@@ -486,7 +488,9 @@ COL_ALIASES = {
     'dnord': ('deltanorddeg', 'deltanord', 'dnord', 'correctionnord',
               'rotationimage', 'nordcorrection', 'deltanordo'),
     # Cle immuable (numero de scan) : survit au renommage des photos.
-    'key': ('numscan', 'numeroscan', 'nscan', 'scan', 'numero', 'num', 'cle',
+    'key': ('numscan', 'numeroscan', 'numerodescan', 'nodescan', 'ndescan',
+            'noscan', 'nscan', 'scanno', 'scannumber', 'scanid', 'numscans', 'no', 'nr',
+            'scan', 'numero', 'num', 'cle',
             'clef', 'uid', 'identifiant', 'idscan'),
     # Nom projete (nom final selon la convention) : porte local/etage/date
     # quand la photo sur disque ne s'appelle encore que par son numero.
@@ -497,7 +501,7 @@ COL_ALIASES = {
     'local': ('local', 'piece', 'salle', 'zone', 'room'),
     'etage': ('etage', 'etg', 'stage'),
     'date': ('date', 'datepdv', 'dateprisedevue', 'prisedevue', 'datephoto'),
-    'index': ('index', 'indice', 'numimage', 'numphoto'),
+    'index': ('index', 'indice', 'numimage'),
 }
 
 YAW_COLUMN = 'Delta Nord (deg)'   # intitule ecrit si la colonne n'existe pas
@@ -527,11 +531,59 @@ def _read_text(path: str) -> str:
     return _read_text_enc(path)[0]
 
 
-def read_survey_csv(path: str) -> Tuple[List[Station], List[str]]:
+class ColumnMappingNeeded(ValueError):
+    """Les colonnes indispensables n'ont pas pu être reconnues d'elles-mêmes.
+
+    Porte de quoi proposer une correspondance à l'utilisateur : intitulés,
+    premières lignes, colonnes déjà reconnues (ou devinées) et signature du
+    fichier pour mémoriser son choix.
+    """
+
+    def __init__(self, message: str, header: List[str], sample: List[List[str]],
+                 guess: Dict[str, int], signature: str, headerless: bool):
+        super().__init__(message)
+        self.header = header
+        self.sample = sample
+        self.guess = guess
+        self.signature = signature
+        self.headerless = headerless
+
+
+# Ordre d'attribution : une colonne ne sert qu'a un seul champ, les plus
+# importants choisissent en premier.
+_FIELD_ORDER = ('photo', 'key', 'x', 'y', 'z', 'target', 'locator', 'north', 'floor',
+                'dnord', 'hcam', 'delta', 'dh', 'ddelta', 'local', 'etage', 'date', 'index')
+
+# Champs proposes dans la boite de correspondance (champ, libelle, obligatoire)
+MAPPING_FIELDS = (('key', "Identifiant / N° scan", True),
+                  ('photo', "Fichier photo (si différent)", False),
+                  ('x', "X (Est)", True), ('y', "Y (Nord)", True), ('z', "Z", False),
+                  ('north', "% Nord", False), ('floor', "Plancher", False),
+                  ('target', "Nom projeté", False), ('locator', "Nom du locator", False))
+
+
+def csv_signature(header_cells: Sequence[str], headerless: bool) -> str:
+    """Empreinte d'un format de CSV, pour retrouver la correspondance choisie."""
+    if headerless:
+        return f"#sans-entete:{len(header_cells)}"
+    return '|'.join(norm_key(c) for c in header_cells)
+
+
+def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
+                    ) -> Tuple[List[Station], List[str]]:
     """Lit le CSV de releve.
 
     Tolerant : BOM, separateur ; , tab |, virgule decimale, colonnes dans
-    n'importe quel ordre, intitules accentues ou non.
+    n'importe quel ordre, intitules accentues ou non, nombreux synonymes.
+    Seuls un identifiant (nom de photo OU numero de scan) et X / Y sont
+    indispensables : sans colonne « Fichier photo », le numero de scan sert
+    de nom de photo. Un CSV sans ligne d'en-tete est reconnu.
+
+    `mapping` (champ -> intitule de colonne, ou « #n » pour la n-ieme colonne)
+    impose une correspondance, typiquement choisie par l'utilisateur.
+
+    Leve ColumnMappingNeeded si l'identifiant ou X / Y restent introuvables,
+    ou si le fichier n'a pas d'en-tete (correspondance devinee a confirmer).
 
     Retourne (stations, avertissements). Les lignes inexploitables sont
     ignorees et signalees, jamais fatales.
@@ -544,24 +596,83 @@ def read_survey_csv(path: str) -> Tuple[List[Station], List[str]]:
     delim = _sniff_delimiter(text)
     reader = csv.reader(text.splitlines(), delimiter=delim)
     rows = [r for r in reader if any((c or '').strip() for c in r)]
-    if len(rows) < 2:
-        raise ValueError("CSV sans donnees exploitables (moins de 2 lignes).")
+    if not rows:
+        raise ValueError("CSV sans donnees exploitables.")
 
-    header = [norm_key(c) for c in rows[0]]
+    # En-tete present ? Une premiere ligne majoritairement numerique n'en est pas un.
+    first = [c.strip() for c in rows[0]]
+    n_num = sum(1 for c in first if parse_float(c) is not None)
+    headerless = n_num >= 2 and n_num >= len([c for c in first if c]) - 1
+    if headerless:
+        header_cells = [f"colonne {k + 1}" for k in range(max(len(r) for r in rows[:50]))]
+        data = rows
+    else:
+        header_cells = list(rows[0])
+        data = rows[1:]
+    if not data:
+        raise ValueError("CSV sans donnees exploitables (une seule ligne).")
+    signature = csv_signature(header_cells, headerless)
+
     col: Dict[str, int] = {}
-    for field_name, aliases in COL_ALIASES.items():
-        for alias in aliases:
-            if alias in header:
-                col[field_name] = header.index(alias)
-                break
+    if mapping:
+        norm_cells = [norm_key(c) for c in header_cells]
+        for field_name, ref in mapping.items():
+            if not ref:
+                continue
+            if ref.startswith('#') and ref[1:].isdigit():
+                idx = int(ref[1:])
+            elif norm_key(ref) in norm_cells:
+                idx = norm_cells.index(norm_key(ref))
+            else:
+                continue
+            if 0 <= idx < len(header_cells):
+                col[field_name] = idx
+    elif not headerless:
+        header = [norm_key(c) for c in header_cells]
+        used: set = set()
+        for field_name in _FIELD_ORDER:
+            for alias in COL_ALIASES.get(field_name, ()):
+                if alias in header:
+                    idx = header.index(alias)
+                    if idx in used:
+                        continue
+                    col[field_name] = idx
+                    used.add(idx)
+                    break
+
+    # Identifiant : le nom de photo, a defaut le numero de scan, a defaut le nom projete
+    if 'photo' not in col:
+        if 'key' in col:
+            col['photo'] = col['key']
+            warns.append("pas de colonne « Fichier photo » : le numéro de scan "
+                         "sert de nom de photo")
+        elif 'target' in col:
+            col['photo'] = col['target']
+
+    if headerless and not mapping:
+        # Correspondance devinee : 1re colonne = identifiant, puis les trois
+        # premieres colonnes numeriques (hors identifiant) = X, Y, Z.
+        guess: Dict[str, int] = {'key': 0}
+        numeric = [k for k in range(1, len(header_cells))
+                   if sum(1 for r in data[:20] if k < len(r)
+                          and parse_float(r[k]) is not None) >= min(len(data), 20) * 0.8]
+        for field_name, k in zip(('x', 'y', 'z'), numeric):
+            guess[field_name] = k
+        raise ColumnMappingNeeded(
+            "CSV sans ligne d'en-tête : correspondance des colonnes à confirmer.",
+            header_cells, data[:6], guess, signature, True)
 
     missing = [f for f in ('photo', 'x', 'y') if f not in col]
     if missing:
-        raise ValueError(
-            "Colonnes introuvables : " + ', '.join(missing) +
-            "\nIntitules lus : " + ', '.join(rows[0]) +
-            "\nAttendu au minimum : « Fichier photo », « X », « Y »."
-        )
+        noms = {'photo': "identifiant (Fichier photo ou N° scan)", 'x': "X", 'y': "Y"}
+        raise ColumnMappingNeeded(
+            "Colonnes introuvables : " + ', '.join(noms[f] for f in missing) +
+            "\nIntitules lus : " + ', '.join(header_cells) +
+            "\nIl faut au minimum un identifiant (« Fichier photo » ou « N° scan »), "
+            "« X » et « Y ».",
+            header_cells, data[:6], dict(col), signature, False)
+
+    rows = [header_cells] + data          # la boucle ci-dessous saute la 1re ligne
 
     def cell(row: Sequence[str], key: str, default: str = '') -> str:
         i = col.get(key, -1)
@@ -569,7 +680,7 @@ def read_survey_csv(path: str) -> Tuple[List[Station], List[str]]:
 
     stations: List[Station] = []
     seen: Dict[str, int] = {}
-    for lineno, row in enumerate(rows[1:], start=2):
+    for lineno, row in enumerate(rows[1:], start=1 if headerless else 2):
         photo = base_name(cell(row, 'photo'))
         if not photo:
             warns.append(f"ligne {lineno} : nom de photo vide — ignoree")
@@ -1223,7 +1334,8 @@ def _format_like(sample: str, value: float, default_decimals: int = 3) -> str:
 
 def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
                         write_yaw: Optional[bool] = None,
-                        eye: float = EYE_HEIGHT_DEFAULT) -> Tuple[int, int, bool]:
+                        eye: float = EYE_HEIGHT_DEFAULT,
+                        mapping: Optional[Dict[str, str]] = None) -> Tuple[int, int, bool]:
     """Écrit une copie du CSV portant les corrections : X/Y/Z et Δ nord.
 
     Rien n'est destructif : le fichier source n'est pas touché, les images non
@@ -1244,15 +1356,38 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
     delim = _sniff_delimiter(text)
     head_body = lines[0].rstrip('\r\n')
     head_eol = lines[0][len(head_body):]
-    header = [norm_key(c) for c in next(csv.reader([head_body], delimiter=delim))]
+    head_cells = next(csv.reader([head_body], delimiter=delim))
+    n_num = sum(1 for c in head_cells if parse_float(c) is not None)
+    headerless = n_num >= 2 and n_num >= len([c for c in head_cells if c.strip()]) - 1
+    header = [norm_key(c) for c in head_cells]
     col: Dict[str, int] = {}
-    for field_name in ('photo', 'x', 'y', 'z', 'dnord', 'key', 'hcam', 'delta'):
-        for alias in COL_ALIASES[field_name]:
-            if alias in header:
-                col[field_name] = header.index(alias)
-                break
+    if mapping:
+        for field_name, ref in mapping.items():
+            if not ref:
+                continue
+            if ref.startswith('#') and ref[1:].isdigit():
+                col[field_name] = int(ref[1:])
+            elif not headerless and norm_key(ref) in header:
+                col[field_name] = header.index(norm_key(ref))
+    elif not headerless:
+        used: set = set()
+        for field_name in _FIELD_ORDER:
+            if field_name not in ('photo', 'x', 'y', 'z', 'dnord', 'key', 'hcam', 'delta'):
+                continue
+            for alias in COL_ALIASES[field_name]:
+                if alias in header and header.index(alias) not in used:
+                    col[field_name] = header.index(alias)
+                    used.add(col[field_name])
+                    break
+    if 'photo' not in col and 'key' in col:
+        col['photo'] = col['key']
     if 'photo' not in col:
-        raise ValueError("Colonne « Fichier photo » introuvable dans le CSV source.")
+        raise ValueError("Identifiant (« Fichier photo » ou « N° scan ») introuvable "
+                         "dans le CSV source.")
+    if headerless:
+        # pas d'en-tete : la 1re ligne est une donnee, on la traite comme les autres
+        lines = [''] + lines
+        head_body, head_eol = '', ''
     by_key = {st.key.lower(): st for st in stations}
 
     def cellules(st: Station):
@@ -1269,7 +1404,8 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
     add_col = need_yaw and 'dnord' not in col
     by_photo = {st.photo.lower(): st for st in stations}
 
-    out: List[str] = [head_body + (delim + YAW_COLUMN if add_col else '') + head_eol]
+    out: List[str] = ([] if headerless else
+                      [head_body + (delim + YAW_COLUMN if add_col else '') + head_eol])
     n_mod = n_keep = 0
     for raw in lines[1:]:
         body = raw.rstrip('\r\n')
@@ -1943,6 +2079,7 @@ class BubbleNavApp(_TkBase):
         self.corrections = Corrections()
         self.by_photo: Dict[str, Station] = {}
         self.by_key: Dict[str, Station] = {}
+        self.csv_mapping: Optional[Dict[str, str]] = None   # correspondance imposee
         self.selected: Optional[int] = None      # bulle en cours de modification
         self._hs_drag = None                     # (idx station, dz, mode)
         self._sync_ui = False                    # garde anti-boucle des widgets
@@ -2297,7 +2434,12 @@ class BubbleNavApp(_TkBase):
                                  fg=COLORS['edit'], font=F_UI_B)
         self.edit_lbl.pack(side='left', padx=6)
 
-        self._mk_button(bar, "Réglages…", self._dlg_settings).pack(side='right', padx=(3, 10), pady=4)
+        # En plein ecran la barre de titre (et sa croix) disparait : on la remplace.
+        self._mk_button(bar, "✕", self._hide_viewer, bg=COLORS['bg_light']
+                        ).pack(side='right', padx=(3, 8), pady=4)
+        self.fs_btn = self._mk_button(bar, "⛶", self._toggle_fullscreen)
+        self.fs_btn.pack(side='right', padx=3, pady=4)
+        self._mk_button(bar, "Réglages…", self._dlg_settings).pack(side='right', padx=3, pady=4)
 
     def _build_side_panel(self, parent) -> None:
         side = tk.Frame(parent, bg=COLORS['bg_medium'], width=360)
@@ -2451,11 +2593,36 @@ class BubbleNavApp(_TkBase):
                 pass
 
     def load_csv(self, path: str, images_dir: str = '') -> bool:
+        mapping = None
         try:
             stations, warns = read_survey_csv(path)
+        except ColumnMappingNeeded as need:
+            # Format deja rencontre ? On reprend la correspondance choisie alors.
+            mapping = self.cfg.get('csv_mappings', {}).get(need.signature)
+            try:
+                if not mapping:
+                    raise need
+                stations, warns = read_survey_csv(path, mapping)
+            except ColumnMappingNeeded:
+                mapping = self._dlg_mapping(path, need)
+                if not mapping:
+                    return False
+                try:
+                    stations, warns = read_survey_csv(path, mapping)
+                except Exception as exc:
+                    messagebox.showerror("Lecture du CSV", f"{path}\n\n{exc}")
+                    return False
+                maps = dict(self.cfg.get('csv_mappings', {}))
+                maps[need.signature] = mapping
+                self.cfg['csv_mappings'] = dict(list(maps.items())[-20:])
+                save_config(self.cfg)
+            except Exception as exc:
+                messagebox.showerror("Lecture du CSV", f"{path}\n\n{exc}")
+                return False
         except Exception as exc:
             messagebox.showerror("Lecture du CSV", f"{path}\n\n{exc}")
             return False
+        self.csv_mapping = mapping
 
         self.stations = stations
         self.warnings = warns
@@ -4002,7 +4169,8 @@ class BubbleNavApp(_TkBase):
         try:
             n_mod, n_keep, added = write_corrected_csv(
                 self.csv_path, path, self.stations,
-                eye=float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
+                eye=float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
+                mapping=self.csv_mapping)
         except Exception as exc:
             messagebox.showerror("Relevé corrigé", f"Écriture impossible :\n{exc}")
             return False
@@ -4357,6 +4525,91 @@ class BubbleNavApp(_TkBase):
     # ═════════════════════════════════════════════════════════════════
     # BOITES DE DIALOGUE
     # ═════════════════════════════════════════════════════════════════
+    def _dlg_mapping(self, path: str, need: "ColumnMappingNeeded") -> Optional[Dict[str, str]]:
+        """Correspondance des colonnes, quand elle n'a pas pu être devinée.
+
+        Aperçu des premières lignes, un choix de colonne par champ, et les
+        colonnes déjà reconnues présélectionnées. Retourne {champ: « #n »} ou
+        None si l'utilisateur annule. Le choix est mémorisé pour ce format.
+        """
+        win = tk.Toplevel(self)
+        win.title("Colonnes du CSV")
+        win.configure(bg=COLORS['bg_dark'])
+        win.transient(self)
+        win.resizable(True, False)
+        tk.Label(win, text=os.path.basename(path), font=F_UI_B, bg=COLORS['bg_dark'],
+                 fg=COLORS['accent']).pack(anchor='w', padx=14, pady=(12, 0))
+        tk.Label(win, text=str(need).split('\n')[0] +
+                 "\nIndiquez quelle colonne correspond à quoi ; le choix sera retenu "
+                 "pour les fichiers de même format.",
+                 font=F_UI, justify='left', anchor='w', bg=COLORS['bg_dark'],
+                 fg=COLORS['text']).pack(fill='x', padx=14, pady=(2, 8))
+
+        # aperçu
+        apercu = tk.Text(win, height=min(7, len(need.sample) + 1), width=96, font=F_MONO,
+                         bg=COLORS['card'], fg=COLORS['text'], relief='flat', wrap='none')
+        widths = [max([len(str(h))] + [len(r[k]) if k < len(r) else 0 for r in need.sample])
+                  for k, h in enumerate(need.header)]
+        widths = [min(w, 22) for w in widths]
+        def ligne(cells):
+            return '  '.join(str(cells[k] if k < len(cells) else '')[:22].ljust(widths[k])
+                             for k in range(len(need.header)))
+        apercu.insert('end', ligne(need.header) + '\n')
+        for r in need.sample:
+            apercu.insert('end', ligne(r) + '\n')
+        apercu.config(state='disabled')
+        apercu.pack(fill='x', padx=14)
+
+        choix = ["—"] + [f"{k + 1}. {h}" for k, h in enumerate(need.header)]
+        grid = tk.Frame(win, bg=COLORS['bg_dark'])
+        grid.pack(fill='x', padx=14, pady=10)
+        vars_: Dict[str, tk.StringVar] = {}
+        for i, (field_name, lib, oblig) in enumerate(MAPPING_FIELDS):
+            tk.Label(grid, text=lib + (" *" if oblig else ""), font=F_UI, anchor='w',
+                     width=28, bg=COLORS['bg_dark'],
+                     fg=COLORS['text'] if oblig else COLORS['text_muted']
+                     ).grid(row=i // 2, column=(i % 2) * 2, sticky='w', pady=2)
+            k = need.guess.get(field_name)
+            if field_name == 'key' and k is None:
+                k = need.guess.get('photo')
+            if field_name == 'photo' and need.guess.get('photo') == need.guess.get('key'):
+                k = None
+            var = tk.StringVar(value=choix[k + 1] if k is not None else "—")
+            vars_[field_name] = var
+            ttk.Combobox(grid, textvariable=var, values=choix, state='readonly', width=24,
+                         style='BN.TCombobox').grid(row=i // 2, column=(i % 2) * 2 + 1,
+                                                    padx=(4, 16), pady=2)
+        result: Dict[str, Optional[Dict[str, str]]] = {'map': None}
+
+        def valider():
+            m: Dict[str, str] = {}
+            for field_name, var in vars_.items():
+                v = var.get()
+                if v != "—":
+                    m[field_name] = '#' + str(int(v.split('.', 1)[0]) - 1)
+            manque = [lib for f, lib, oblig in MAPPING_FIELDS if oblig and f not in m]
+            if manque:
+                messagebox.showwarning("Colonnes du CSV", "À renseigner : " + ', '.join(manque),
+                                       parent=win)
+                return
+            result['map'] = m
+            win.destroy()
+
+        foot = tk.Frame(win, bg=COLORS['bg_dark'])
+        foot.pack(fill='x', padx=14, pady=(0, 12))
+        self._mk_button(foot, "Valider", valider, bg=COLORS['accent']).pack(side='right')
+        self._mk_button(foot, "Annuler", win.destroy).pack(side='right', padx=6)
+        win.bind('<Return>', lambda e: valider())
+        win.bind('<Escape>', lambda e: win.destroy())
+        win.update_idletasks()
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        win.focus_force()                    # Entrée / Échap actifs d'emblée
+        self.wait_window(win)
+        return result['map']
+
     def _open_csv(self) -> None:
         path = filedialog.askopenfilename(
             title="CSV de relevé (Fichier photo ; X ; Y ; Z ; % NORD ; Plancher)",
@@ -5681,6 +5934,71 @@ def selftest(csv_path: str = '') -> int:
     check("clic à côté refusé", hotspot_hit([hs], 160, 100, True) is None)
     check("mode plat : la zone haute n'est plus cliquable",
           hotspot_hit([hs], 100, 70, False) is None)
+
+    # 12. CSV num scan peu strict
+    print("\n12) CSV num scan peu strict")
+    import tempfile as _tf3
+    import shutil as _sh3
+    tmp3 = _tf3.mkdtemp(prefix='bubblenav_csv_')
+    try:
+        def ecrit(nom: str, contenu: str) -> str:
+            chemin = os.path.join(tmp3, nom)
+            with open(chemin, 'w', encoding='utf-8-sig', newline='') as fh:
+                fh.write(contenu)
+            return chemin
+
+        c1 = ecrit('a.csv', "N° scan;X;Y;Z;Plancher\r\n0347;589.15;73.45;1.65;P02\r\n"
+                            "0348;591.00;73.45;1.65;P02\r\n")
+        s1, w1 = read_survey_csv(c1)
+        check("sans colonne « Fichier photo » : le N° scan sert d'identifiant",
+              len(s1) == 2 and s1[0].photo == '0347' and s1[0].key == '0347'
+              and s1[0].key_explicit and any('numéro de scan' in w for w in w1),
+              f"{len(s1)} bulle(s)")
+
+        c2 = ecrit('b.csv', "Numéro de scan,Est,Nord,Altitude\n12,10.5,20.25,3.1\n13,11,20,3.1\n")
+        s2, _ = read_survey_csv(c2)
+        check("intitulés variés, séparateur virgule", len(s2) == 2 and s2[1].key == '13'
+              and abs(s2[0].x - 10.5) < 1e-9 and abs(s2[0].y - 20.25) < 1e-9 and s2[0].z == 3.1)
+
+        c3 = ecrit('c.csv', "0347;589,15;73,45;1,65\r\n0348;591,00;73,45;1,65\r\n")
+        try:
+            read_survey_csv(c3)
+            check("CSV sans en-tête détecté", False, "aucune demande de correspondance")
+        except ColumnMappingNeeded as need:
+            check("CSV sans en-tête détecté, correspondance devinée",
+                  need.headerless and need.guess == {'key': 0, 'x': 1, 'y': 2, 'z': 3},
+                  str(need.guess))
+            s3, _ = read_survey_csv(c3, {k: f"#{v}" for k, v in need.guess.items()})
+            check("CSV sans en-tête lu avec la correspondance",
+                  len(s3) == 2 and s3[0].key == '0347' and abs(s3[0].x - 589.15) < 1e-9)
+            out3 = os.path.join(tmp3, 'c_corrige.csv')
+            s3[0].x += 0.1
+            write_corrected_csv(c3, out3, s3, mapping={k: f"#{v}" for k, v in need.guess.items()})
+            l3 = _read_text(out3).splitlines()
+            check("relevé corrigé sans en-tête : aucune ligne ajoutée, valeur corrigée",
+                  len(l3) == 2 and l3[0].split(';')[1] == '589,25' and l3[1] == "0348;591,00;73,45;1,65",
+                  ' | '.join(l3))
+
+        c4 = ecrit('d.csv', "PointID;Coord1;Coord2;Haut\r\nA1;1;2;3\r\nA2;4;5;6\r\n")
+        try:
+            read_survey_csv(c4)
+            check("intitulés inconnus : correspondance demandée", False)
+        except ColumnMappingNeeded as need:
+            check("intitulés inconnus : correspondance demandée, jamais d'erreur sèche",
+                  not need.headerless and need.signature == 'pointid|coord1|coord2|haut')
+            s4, _ = read_survey_csv(c4, {'key': 'PointID', 'x': 'Coord1', 'y': 'Coord2',
+                                         'z': 'Haut'})
+            check("correspondance par intitulé", len(s4) == 2 and s4[1].y == 5.0)
+
+        c5 = ecrit('e.csv', "N° scan;X;Y;Z\r\n0347;1.000;2.000;3.000\r\n")
+        s5, _ = read_survey_csv(c5)
+        s5[0].x = 1.5
+        out5 = os.path.join(tmp3, 'e_corrige.csv')
+        n5, _, _ = write_corrected_csv(c5, out5, s5)
+        check("relevé corrigé d'un CSV num scan sans colonne photo",
+              n5 == 1 and _read_text(out5).splitlines()[1] == "0347;1.500;2.000;3.000")
+    finally:
+        _sh3.rmtree(tmp3, ignore_errors=True)
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))
