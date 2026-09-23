@@ -233,6 +233,8 @@ DEFAULT_CONFIG = {
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
 
+# clic droit (bouton 2 sous macOS)
+RIGHT_CLICK = ('<Button-2>', '<Button-3>') if sys.platform == 'darwin' else ('<Button-3>',)
 PLAN_LINK_MODES = ('squelette', 'complet', 'aucun')
 VIEWER_START_MODES = ('plein écran', 'maximisé', 'mémorisé')
 
@@ -2481,6 +2483,8 @@ class BubbleNavApp(_TkBase):
         self.canvas.bind('<Button-4>', lambda e: self._on_wheel(e, +1))
         self.canvas.bind('<Button-5>', lambda e: self._on_wheel(e, -1))
         self.canvas.bind('<Double-Button-1>', self._on_double)
+        for seq in RIGHT_CLICK:
+            self.canvas.bind(seq, self._on_right_click)
         self._build_status(self.viewer)
 
     def _viewer_visible(self) -> bool:
@@ -2675,6 +2679,7 @@ class BubbleNavApp(_TkBase):
         self.plan.bind('<Leave>', lambda e: self._set_plan_hover(None))
         self.plan.bind('<ButtonPress-3>', self._on_plan_press)
         self.plan.bind('<B3-Motion>', self._on_plan_drag)
+        self.plan.bind('<ButtonRelease-3>', self._on_plan_release_right)
         self.plan.bind('<MouseWheel>', self._on_plan_wheel)
         self.plan.bind('<Button-4>', lambda e: self._on_plan_wheel(e, +1))
         self.plan.bind('<Button-5>', lambda e: self._on_plan_wheel(e, -1))
@@ -3446,6 +3451,7 @@ class BubbleNavApp(_TkBase):
         if hit is None or hit >= len(self.hotspots):
             return
         lines, modified = self.tooltip_lines(self.hotspots[hit], self.station())
+        lines.append("clic droit   ouvrir dans la vue B")
         self.draw_tooltip(self.canvas, x, y, lines, self.view.width, self.view.height,
                           modified)
 
@@ -3707,11 +3713,34 @@ class BubbleNavApp(_TkBase):
         voisins = self._visible_links(self.current)
         if voisins:                      # un voisin immédiat : comparaison utile d'emblée
             depart = min(voisins, key=lambda lk: lk.dist).target
-        self.compare = CompareView(self, depart)
-        self.cmp_btn.config(bg=COLORS['sel'], fg='#101010')
-        self._cone_sig = None
+        self._open_compare(depart)
         self._set_status("Vue de comparaison ouverte — « Vue liée » fait tourner "
                          "les deux vues ensemble", COLORS['sel'])
+
+    def _open_compare(self, idx: int) -> None:
+        self.compare = CompareView(self, idx)
+        self.cmp_btn.config(bg=COLORS['sel'], fg='#101010')
+        self._cone_sig = None
+
+    def open_in_b(self, idx: int) -> None:
+        """Ouvre une bulle dans la vue B, en ouvrant la comparaison au besoin."""
+        if not (0 <= idx < len(self.stations)):
+            return
+        if self.compare is None:
+            self._open_compare(idx)
+            # le suivi de A ne doit pas remplacer aussitôt la bulle demandée
+            self._last_current = self.current
+        else:
+            self.compare.goto(idx)
+        self._cone_sig = None
+        self._set_status(f"{self.stations[idx].locator} ouvert dans la vue B",
+                         COLORS['sel'])
+
+    def _on_right_click(self, event) -> None:
+        """Clic droit sur une pastille de A : l'ouvrir dans la vue B."""
+        hit = self._hotspot_at(event.x, event.y)
+        if hit is not None:
+            self.open_in_b(self.hotspots[hit].link.target)
 
     def _sync_compare(self) -> None:
         """Tient la seconde vue alignée sur la vue principale."""
@@ -4954,7 +4983,7 @@ class BubbleNavApp(_TkBase):
         self.plan.create_text(w - 16, 16, text="N", fill='#ff6b6b', font=F_UI_B)
         self.plan.create_line(w - 16, 26, w - 16, 40, fill='#ff6b6b', width=2)
         self.plan.create_text(8, h - 10, anchor='w', font=F_UI, fill=COLORS['text_muted'],
-                              text=f"{len(pts)} bulles · molette: zoom · clic droit: déplacer")
+                              text=f"{len(pts)} bulles · molette: zoom · clic droit: déplacer / ouvrir en B")
         self._draw_plan_tip()
 
     def _cone_signature(self) -> Optional[tuple]:
@@ -5164,6 +5193,15 @@ class BubbleNavApp(_TkBase):
 
     def _on_plan_press(self, event) -> None:
         self._plan_drag = (event.x, event.y, self._plan_view['ox'], self._plan_view['oy'])
+
+    def _on_plan_release_right(self, event) -> None:
+        """Clic droit sans glisser sur un point du plan : l'ouvrir dans la vue B."""
+        start = self._plan_drag
+        self._plan_drag = None
+        if start and abs(event.x - start[0]) + abs(event.y - start[1]) <= 3:
+            idx = self._plan_nearest(event, 12.0)
+            if idx is not None:
+                self.open_in_b(idx)
 
     def _on_plan_drag(self, event) -> None:
         if not self._plan_drag:
@@ -5486,10 +5524,13 @@ class BubbleNavApp(_TkBase):
             "  • « Suivi de A » : la vue B se place automatiquement sur le même\n"
             "    local à un autre plancher, ou sur la bulle la plus proche\n"
             "  • « A → B » recopie la bulle courante · « ⇄ » échange les deux vues\n"
-            "  • Les pastilles de B restent cliquables pour s'y déplacer seul\n\n"
+            "  • Les pastilles de B restent cliquables pour s'y déplacer seul\n"
+            "  • Clic droit sur une pastille : l'ouvrir dans l'autre vue\n"
+            "    (A → B, en ouvrant la comparaison au besoin ; B → A)\n\n"
             "PLAN\n"
             "  • Clic gauche            : aller sur la bulle la plus proche\n"
             "  • Molette                : zoom · clic droit glissé : déplacer\n"
+            "  • Clic droit sur un point : l'ouvrir dans la vue B\n"
             "  • Liste « Plancher »     : changer de niveau (bulle la plus proche)\n\n"
             "PASTILLES\n"
             "  jaune = même plancher · bleu ▲ = niveau au-dessus\n"
@@ -5641,6 +5682,8 @@ class CompareView(tk.Frame if _TK_OK else object):
         self.canvas.bind('<Button-4>', lambda e: self._on_wheel(e, +1))
         self.canvas.bind('<Button-5>', lambda e: self._on_wheel(e, -1))
         self.canvas.bind('<Double-Button-1>', self._on_double)
+        for seq in RIGHT_CLICK:
+            self.canvas.bind(seq, self._on_right_click)
 
         self.status = tk.Label(self, text="", anchor='w', bg=COLORS['bg_medium'],
                                fg=COLORS['text_muted'], font=F_UI, padx=10, pady=3)
@@ -5860,6 +5903,15 @@ class CompareView(tk.Frame if _TK_OK else object):
     def _hotspot_at(self, x: float, y: float) -> Optional[int]:
         return hotspot_hit(self.hotspots, x, y, self.app.relief())
 
+    def _on_right_click(self, event) -> None:
+        """Clic droit sur une pastille de B : l'ouvrir dans la vue A."""
+        hit = self._hotspot_at(event.x, event.y)
+        if hit is not None:
+            idx = self.hotspots[hit].link.target
+            self.app.goto(idx, keep_heading=True)
+            self.app._set_status(f"{self.app.stations[idx].locator} ouvert dans la vue A",
+                                 COLORS['sel'])
+
     # ── interactions ─────────────────────────────────────────────────
     def _on_press(self, event) -> None:
         self._drag = (event.x, event.y, self.view.yaw, self.view.pitch,
@@ -5910,6 +5962,7 @@ class CompareView(tk.Frame if _TK_OK else object):
         if hit is None or hit >= len(self.hotspots):
             return
         lines, modified = self.app.tooltip_lines(self.hotspots[hit], self.station())
+        lines.append("clic droit   ouvrir dans la vue A")
         self.app.draw_tooltip(self.canvas, x, y, lines, self.view.width, self.view.height,
                               modified)
 

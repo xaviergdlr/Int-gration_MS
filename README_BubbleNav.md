@@ -117,6 +117,7 @@ relevé déjà renommé.
 | Action | Effet |
 |---|---|
 | Clic sur une pastille | aller sur cette bulle |
+| **Clic droit** sur une pastille | l'ouvrir dans l'**autre vue** (A → B, en ouvrant la comparaison au besoin ; B → A) |
 | Glisser | tourner la vue |
 | Molette, `+` / `−` | champ de vision (30° à 130°, 105° par défaut) |
 | Double-clic | recentrer la vue sur ce point |
@@ -128,7 +129,8 @@ relevé déjà renommé.
 
 **Plan du plancher** (à droite) : le **survol** d'un point affiche le nom de la
 station (et son n° de scan en mode num scan) ; clic gauche = aller à la bulle la plus proche,
-molette = zoom, clic droit glissé = déplacer. Le **camembert jaune** donne la
+molette = zoom, clic droit glissé = déplacer, **clic droit sans glisser = ouvrir la
+bulle dans la vue B**. Le **camembert jaune** donne la
 position, la direction de visée et l'ouverture du champ. Il est **entièrement
 dynamique** : une veille compare 60 fois par seconde l'état dont il dépend (point
 de vue, cap, champ, plancher affiché, cadrage du plan, calibration, position
@@ -264,6 +266,15 @@ première dans le visualiseur (séparation glissante, bouton ✕ pour la referme
 Elle partage tout le modèle — relevé, réseau,
 filtres, calibration, corrections, cache d'images — et n'a que son point de vue
 en propre.
+
+**Clic droit = ouvrir dans l'autre vue** :
+* sur une pastille de **A**, la bulle s'ouvre dans **B**. Si la comparaison est
+  fermée, elle s'ouvre directement sur cette bulle ; A ne bouge pas ;
+* sur une pastille de **B**, la bulle s'ouvre dans **A** ;
+* sur un point du **plan** (clic droit sans glisser), la bulle s'ouvre dans **B**.
+
+L'infobulle des pastilles le rappelle (« clic droit : ouvrir dans la vue B / A »).
+Sous macOS, le bouton 2 est aussi accepté.
 
 * **Vue liée** (par défaut) : les deux vues regardent en permanence la **même
   direction terrain**, chacune corrigée de son propre nord. Tourner ou zoomer
