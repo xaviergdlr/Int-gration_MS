@@ -159,8 +159,9 @@ relevé déjà renommé.
 
 | Action | Effet |
 |---|---|
-| Clic sur une pastille | aller sur cette bulle |
-| **Clic droit** sur une pastille | l'ouvrir dans l'**autre vue** (A → B, en ouvrant la comparaison au besoin ; B → A) |
+| Clic sur une pastille | y aller, sens de navigation conservé (déplacement simple) |
+| **Ctrl+clic** ou **clic droit** sur une pastille | **sonder** : la bulle s'ouvre dans l'autre vue et les deux se font face (voir « Contrôler H et Δ ») |
+| **`G`** / **`I`** | face à face / inverser A et B |
 | Glisser | tourner la vue |
 | Molette, `+` / `−` | champ de vision, de 30° à **200°** (105° par défaut) ; au-delà de 110°, passage progressif en **grand angle** |
 | Double-clic | recentrer la vue sur ce point |
@@ -386,6 +387,44 @@ révèle une erreur de position (X/Y), d'orientation (Δ nord) ou d'altitude
 * repères : la bulle quittée est entourée en pointillé et marquée
   « ↩ origine » ; dans A, la pastille de la bulle ouverte en B porte « B » ;
   dans B, celle de A porte « A ».
+
+## Contrôler et corriger H et Δ (sonde)
+
+Le but est de vérifier que chaque bulle voisine apparaît à la bonne hauteur
+dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
+
+1. **Sonder** : Ctrl+clic (ou clic droit) sur une pastille. Elle s'ouvre dans
+   la vue B, et A et B **se font face** : A voit la pastille de B, B voit celle
+   de A, chacune au centre.
+2. **Lire la mire** : la bulle de l'autre vue (et la pastille survolée) porte
+   une **empreinte au sol** et une **mire graduée** :
+   * l'empreinte est un cercle de 50 cm posé sur son sol, vu en perspective ;
+     il doit s'inscrire à plat sur le sol de la photo ;
+   * la mire monte du sol à la caméra, graduée tous les 10 cm (trait plus long
+     tous les 50 cm) ;
+   * les valeurs sont affichées : sol, Δ, H, Z.
+3. **Corriger** en continu :
+   * **Alt + molette** sur une pastille : son **Δ** (sol et caméra montent ou
+     descendent ensemble) ;
+   * **Maj + molette** : sa **H** (la caméra seule) ;
+   * hors pastille, la molette agit sur la bulle de la vue elle-même ;
+   * ou les boutons **− / +** de la barre de contrôle, pour A et pour B.
+
+   Le pas se règle dans la barre (1 mm à 10 cm, 1 cm par défaut). Une rafale
+   de molette ne compte que pour une étape de **Ctrl+Z**. Tout s'enregistre dans
+   le fichier de corrections et part dans le CSV corrigé.
+4. **Vérifier des deux côtés** : **G** remet A et B face à face, **I**
+   inverse les deux vues (bulles et regards). **A → B** et **B → A** recopient
+   une vue dans l'autre.
+
+**Barre de contrôle** (sous la barre d'outils) : ◀ Retour · ↩ Origine · ⇆ Face
+à face · ⇄ Inverser · A → B · B → A · puis, pour A et pour B, le nom, **H** et
+**Δ** avec leurs boutons − / +, et le pas. Les valeurs corrigées passent en
+orange.
+
+Un **clic simple** reste un déplacement ordinaire : on arrive sur la bulle en
+gardant le sens de la marche. Sur le plan, clic gauche = vue A (repère
+jaune), clic droit = vue B (repère bleu).
 
 ## 5. Comparer deux points de vue  (touche C)
 

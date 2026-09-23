@@ -239,6 +239,8 @@ DEFAULT_CONFIG = {
     'hotspots_mode': 'plancher',     # 'plancher' : toutes les bulles du plancher ;
                                      # 'reseau' : réseau élagué (portée, nombre, direction)
     'color_mode': 'local',           # couleur des pastilles : 'local' ou 'lien'
+    'show_mire': True,               # mire de hauteur sur les bulles comparées
+    'fine_step': '0.01',             # pas des réglages rapides H / Δ (m)
     'focus_origin': False,           # à l'arrivée, regarder la bulle d'où l'on vient
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
@@ -1361,6 +1363,19 @@ def axis_param(ray: Sequence[float], p0: Sequence[float], axis: Sequence[float],
     if dr + b * t <= 0 or abs(t) > max_abs:
         return None
     return t
+
+
+def alt_down(state: int) -> bool:
+    """Touche Alt (Option sous macOS) enfoncée, selon la plateforme de Tk."""
+    if sys.platform == 'win32':
+        return bool(state & 0x20000)       # 0x0008 y signale le verrouillage num.
+    if sys.platform == 'darwin':
+        return bool(state & 0x0010)
+    return bool(state & 0x0008)
+
+
+MIRE_RING_M = 0.50       # rayon de l'empreinte au sol de la mire (m)
+MIRE_TICK_M = 0.10       # graduation de la mire (m)
 
 
 @lru_cache(maxsize=4096)
@@ -2551,9 +2566,10 @@ class Tooltip:
 
 # Aide générale (F1 ou ?) : tous les raccourcis
 HELP_TEXT = """\
-NAVIGATION  (vue A)
-  Clic sur une pastille ...... aller sur cette bulle
-  Clic droit sur une pastille  l'ouvrir dans la vue B, tournée vers A
+NAVIGATION  (vue A ou B)
+  Clic sur une pastille ...... y aller (sens de navigation conservé)
+  Ctrl+clic ou clic droit .... SONDER : la bulle s'ouvre dans l'autre vue et
+                               les deux se font face (chacune voit l'autre)
   Glisser .................... tourner la vue
   Double-clic ................ recentrer la vue sur ce point
   Molette, + / - ............. champ de vision, 30° à 200° (grand angle > 110°)
@@ -2562,8 +2578,20 @@ NAVIGATION  (vue A)
   Entrée ou Espace ........... avancer vers la pastille la plus centrale
   Retour arrière ............. revenir à la bulle précédente
   O .......................... regarder d'où l'on vient
+  G .......................... face à face : A regarde B, B regarde A
+  I .......................... inverser A et B (bulles et regards)
   Ctrl+Z ..................... annuler la dernière opération (navigation,
                                correction, bulle ouverte en B)
+
+HAUTEUR ET DELTA  (sans passer par l'édition)
+  Alt + molette .............. Δ (delta plancher) de la pastille survolée,
+                               ou de la bulle de la vue hors pastille
+  Maj + molette .............. H (hauteur station), idem
+  Barre de contrôle .......... A / B : H et Δ avec boutons − / +, pas réglable
+  Mire ....................... empreinte au sol (50 cm) et mire graduée du sol
+                               à la caméra, sur la bulle de l'autre vue et la
+                               pastille survolée : elle doit se poser à plat
+                               sur le sol de la photo
 
 AFFICHAGE
   T .......................... toutes les bulles du plancher <-> réseau élagué
@@ -2582,8 +2610,8 @@ COMPARAISON  (touche C)
   « Vue liée » ............... A et B regardent la même direction terrain
   « Suivi de A » ............. B suit A : même local à un autre plancher, ou
                                la bulle la plus proche
-  « A → B » / « ⇄ » .......... recopier A dans B / échanger A et B
-  Clic droit dans B .......... ouvrir la bulle dans A
+  « A → B » / « B → A » ...... recopier une vue dans l'autre (bulle et regard)
+  Ctrl+clic dans B ........... la bulle s'ouvre dans A, face à face
 
 PLAN
   Clic gauche ................ aller sur la bulle la plus proche
@@ -2599,6 +2627,7 @@ PLAN
   Glisser un axe du repère ... suivre cet axe
   X / Y / Z .................. verrouiller l'axe (2e appui : auto)
   Ctrl + glisser ............. déplacer la bulle active (sur un axe)
+  Ctrl + clic (sans glisser) . sonder, comme hors édition
   Maj + glisser .............. tourner l'image (Δ nord)
   Page haut / bas ............ hauteur station ± pas
   Maj + Page haut / bas ...... delta plancher ± pas
@@ -2905,6 +2934,7 @@ class BubbleNavApp(_TkBase):
         self.viewer.withdraw()
 
         self._build_toolbar(self.viewer)
+        self._build_ctrlbar(self.viewer)
 
         body = tk.Frame(self.viewer, bg=COLORS['bg_dark'])
         body.pack(fill='both', expand=True)
@@ -3113,6 +3143,317 @@ class BubbleNavApp(_TkBase):
                 n += 1
         return n
 
+    def _build_ctrlbar(self, parent) -> None:
+        """Barre de contrôle : navigation A / B et réglage fin de H et Δ.
+
+        Tout ce qu'il faut pour vérifier et corriger les altitudes sans
+        passer par le mode édition : les deux bulles comparées, leur hauteur
+        et leur delta, ajustables au pas choisi.
+        """
+        bar = tk.Frame(parent, bg=COLORS['bg_dark'])
+        bar.pack(fill='x', side='top')
+        mk = self._mk_button
+        for txt, cmd, tip in (
+                ("◀ Retour", self.go_back, "Revenir à la bulle précédente (Retour arrière)."),
+                ("↩ Origine", self.look_back, "Regarder d'où l'on vient (O)."),
+                ("⇆ Face à face", self.face_a_face,
+                 "A regarde B et B regarde A : chaque vue montre la pastille de l'autre (G)."),
+                ("⇄ Inverser", self.swap_ab,
+                 "Échanger A et B, bulles et regards compris (I)."),
+                ("A → B", self.a_to_b, "Mettre dans B la bulle et le regard de A."),
+                ("B → A", self.b_to_a, "Mettre dans A la bulle et le regard de B.")):
+            mk(bar, txt, cmd, tip=tip).pack(side='left', padx=(6 if txt.startswith('◀') else 2, 2),
+                                            pady=3)
+        tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y', padx=6, pady=5)
+        self.ctrl_vals: Dict[Tuple[str, str], tk.Label] = {}
+        self.ctrl_btns: List[tk.Button] = []
+        for which, col in (('A', COLORS['hot']), ('B', COLORS['sel'])):
+            name = tk.Label(bar, text=which, font=F_UI_B, bg=COLORS['bg_dark'], fg=col,
+                            width=14, anchor='e')
+            name.pack(side='left', padx=(6, 2))
+            self.ctrl_vals[(which, 'name')] = name
+            for comp, lib, tip in (('dh', 'H', "hauteur station : la caméra bouge"),
+                                   ('ddelta', 'Δ', "delta plancher : caméra et sol bougent")):
+                b = mk(bar, "−", lambda w=which, c=comp: self.adjust_alt(w, c, -1),
+                       tip=f"{which} : {tip}, − un pas")
+                b.config(padx=5)
+                b.pack(side='left')
+                val = tk.Label(bar, text=f"{lib} —", font=F_MONO, bg=COLORS['bg_dark'],
+                               fg=COLORS['text'], width=9)
+                val.pack(side='left')
+                b2 = mk(bar, "+", lambda w=which, c=comp: self.adjust_alt(w, c, +1),
+                        tip=f"{which} : {tip}, + un pas")
+                b2.config(padx=5)
+                b2.pack(side='left', padx=(0, 4))
+                self.ctrl_vals[(which, comp)] = val
+                if which == 'B':
+                    self.ctrl_btns += [b, b2]
+        tk.Label(bar, text="pas", font=F_UI, bg=COLORS['bg_dark'],
+                 fg=COLORS['text_muted']).pack(side='left', padx=(8, 2))
+        fs = str(self.cfg.get('fine_step', '0.01'))
+        self.fine_step_var = tk.StringVar(value=fs)
+        cb = ttk.Combobox(bar, textvariable=self.fine_step_var, width=6, state='readonly',
+                          style='BN.TCombobox', values=('0.001', '0.005', '0.01', '0.05', '0.10'))
+        cb.pack(side='left', pady=3)
+        cb.bind('<<ComboboxSelected>>',
+                lambda e: self.cfg.__setitem__('fine_step', self.fine_step_var.get()))
+        Tooltip(cb, "Pas des réglages rapides de H et Δ (m), boutons et Alt / Maj + molette.")
+        tk.Label(bar, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
+                 text="Ctrl+clic sonde · Alt / Maj+molette : Δ / H"
+                 ).pack(side='left', padx=6)
+
+    def _refresh_ctrlbar(self) -> None:
+        """Valeurs de la barre de contrôle, relues à chaque changement."""
+        if not hasattr(self, 'ctrl_vals'):
+            return
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        b = self.compare.station() if self.compare is not None else None
+        for which, st in (('A', self.station()), ('B', b)):
+            if st is None:
+                self.ctrl_vals[(which, 'name')].config(text=f"{which} —")
+                self.ctrl_vals[(which, 'dh')].config(text="H —", fg=COLORS['text_muted'])
+                self.ctrl_vals[(which, 'ddelta')].config(text="Δ —", fg=COLORS['text_muted'])
+                continue
+            nom = st.key if st.key_explicit and st.key and st.key != st.locator else st.locator
+            self.ctrl_vals[(which, 'name')].config(text=f"{which} {nom}")
+            self.ctrl_vals[(which, 'dh')].config(
+                text=f"H {st.height(eye):.3f}",
+                fg=COLORS['edit'] if st.raised() else COLORS['text'])
+            self.ctrl_vals[(which, 'ddelta')].config(
+                text=f"Δ {st.delta(eye):+.3f}",
+                fg=COLORS['edit'] if st.shifted() else COLORS['text'])
+        state = 'normal' if b is not None else 'disabled'
+        for btn in self.ctrl_btns:
+            btn.config(state=state)
+
+    # ── sonder, face à face, inverser ────────────────────────────────
+    def _aim_a(self, idx: int) -> None:
+        cur = self.station()
+        if cur is not None and 0 <= idx < len(self.stations) and idx != cur.idx:
+            aim_at(self.view, self.calib, cur, self.stations[idx],
+                   float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)), self.anchor())
+            self._request_render(force=True)
+
+    def sonde(self, idx: int, src: str = 'A') -> None:
+        """Ctrl+clic : la bulle visée s'ouvre dans l'autre vue, et les deux se font face.
+
+        Depuis A : B s'ouvre sur la bulle visée, tournée vers A, et A se tourne
+        vers elle. Depuis B : c'est A qui s'ouvre sur la bulle visée. Chaque
+        vue montre alors la pastille de l'autre : c'est là que se jugent la
+        hauteur et le delta (mire graduée du sol à la caméra).
+        """
+        if not (0 <= idx < len(self.stations)):
+            return
+        if src == 'B' and self.compare is not None:
+            b = self.compare.station()
+            if b is None or idx == b.idx:
+                return
+            self.goto(idx, keep_heading=False)
+            self._last_current = self.current      # le suivi de A ne bouge pas B
+            self._aim_a(b.idx)
+            self.compare.aim_at_station(idx)
+            other = b
+        else:
+            cur = self.station()
+            if cur is None or idx == cur.idx:
+                return
+            self.open_in_b(idx)
+            self._aim_a(idx)
+            other = cur
+        self._cone_sig = None
+        self._refresh_ctrlbar()
+        self._set_status(f"Sonde : {self._nom(idx)} et {self._nom(other.idx)} face à face — "
+                         "Alt+molette : Δ, Maj+molette : H, sur une pastille",
+                         COLORS['sel'])
+
+    def _nom(self, idx: int) -> str:
+        st = self.stations[idx]
+        return st.key if st.key_explicit and st.key and st.key != st.locator else st.locator
+
+    def face_a_face(self) -> None:
+        """Touche G : A regarde B, B regarde A."""
+        cv = self.compare
+        b = cv.station() if cv is not None else None
+        if b is None or b.idx == self.current:
+            self._set_status("Face à face : ouvrez d'abord une autre bulle dans B "
+                             "(Ctrl+clic ou clic droit sur une pastille)")
+            return
+        self._aim_a(b.idx)
+        cv.aim_at_station(self.current)
+        self._cone_sig = None
+        self._set_status(f"Face à face : {self._nom(self.current)} ↔ {self._nom(b.idx)}",
+                         COLORS['sel'])
+
+    def swap_ab(self) -> None:
+        """Touche I : A et B échangent bulles et regards."""
+        cv = self.compare
+        if cv is None or cv.station() is None or cv.idx == self.current:
+            self._set_status("Inverser : il faut deux bulles différentes dans A et B")
+            return
+        a_idx, b_idx = self.current, cv.idx
+        a_v = (self.view.yaw, self.view.pitch, self.view.fov)
+        b_v = (cv.view.yaw, cv.view.pitch, cv.view.fov)
+        if cv.linked.get():
+            cv.linked.set(False)
+            cv._on_linked()
+        self.goto(b_idx, keep_heading=False)
+        self._last_current = self.current
+        self.view.yaw, self.view.pitch, self.view.fov = b_v
+        cv.goto(a_idx, keep_heading=False)
+        cv.view.yaw, cv.view.pitch, cv.view.fov = a_v
+        self._sync_fov_widgets()
+        self._request_render(force=True)
+        cv.request_render(force=True)
+        self._cone_sig = None
+        self._refresh_ctrlbar()
+        self._set_status(f"Inversé : A = {self._nom(b_idx)}, B = {self._nom(a_idx)}",
+                         COLORS['sel'])
+
+    def a_to_b(self) -> None:
+        """Bouton A → B : B reprend la bulle et le regard de A."""
+        if self.current < 0:
+            return
+        if self.compare is None:
+            self._open_compare(self.current)
+            self._last_current = self.current
+        cv = self.compare
+        cv.goto(self.current, keep_heading=False, record=True)
+        if not cv.linked.get():
+            cv.view.yaw, cv.view.pitch, cv.view.fov = (self.view.yaw, self.view.pitch,
+                                                       self.view.fov)
+        cv.request_render(force=True)
+        self._refresh_ctrlbar()
+
+    def b_to_a(self) -> None:
+        """Bouton B → A : A reprend la bulle et le regard de B."""
+        cv = self.compare
+        if cv is None or cv.station() is None:
+            self._set_status("B → A : la vue B n'est pas ouverte")
+            return
+        yaw, pitch, fov = cv.view.yaw, cv.view.pitch, cv.view.fov
+        self.goto(cv.idx, keep_heading=False)
+        self._last_current = self.current
+        self.view.yaw, self.view.pitch, self.view.fov = yaw, pitch, fov
+        self._sync_fov_widgets()
+        self._request_render(force=True)
+
+    # ── réglage fin des altitudes ────────────────────────────────────
+    def adjust_alt(self, which, comp: str, sign: int) -> None:
+        """Hauteur (dh) ou delta (ddelta) d'une bulle, ± un pas.
+
+        `which` : 'A', 'B' ou l'indice d'une bulle. Une rafale (molette,
+        clics rapprochés) sur la même bulle et la même composante ne compte
+        que pour une étape d'annulation.
+        """
+        if which == 'A':
+            st = self.station()
+        elif which == 'B':
+            st = self.compare.station() if self.compare is not None else None
+        else:
+            st = self.stations[which] if 0 <= which < len(self.stations) else None
+        if st is None:
+            return
+        step = parse_float(self.fine_step_var.get()) if hasattr(self, 'fine_step_var') else None
+        step = step or 0.01
+        now = time.monotonic()
+        last = getattr(self, '_last_adj', None)
+        burst = last is not None and last[0] == st.idx and last[1] == comp and now - last[2] < 1.2
+        self._last_adj = (st.idx, comp, now)
+        self.corrections.apply(st, **{comp: round(getattr(st, comp) + sign * step, 6)},
+                               record=not burst)
+        self._after_edit(moved=True)
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        self._set_status(f"{self._nom(st.idx)} : " + (
+            f"hauteur station {st.height(eye):.3f} (caméra seule)" if comp == 'dh'
+            else f"delta plancher {st.delta(eye):+.3f} (caméra et sol)")
+            + f" · Z {st.z:.3f}", COLORS['edit'])
+
+    def wheel_alt(self, event, hotspots, station_idx: int, direction: int) -> bool:
+        """Alt+molette : Δ, Maj+molette : H — de la pastille survolée, sinon de la bulle
+        de la vue. Retourne True si la molette a servi à cela."""
+        alt = alt_down(event.state)
+        shift = bool(event.state & 0x0001)
+        if not (alt or shift):
+            return False
+        hit = hotspot_hit(hotspots, event.x, event.y, self.relief())
+        idx = hotspots[hit].link.target if hit is not None else station_idx
+        if idx is None or idx < 0:
+            return True
+        self.adjust_alt(idx, 'ddelta' if alt else 'dh', direction)
+        return True
+
+    # ── mire de hauteur ──────────────────────────────────────────────
+    def draw_mire(self, canvas, view: View, cam: Station, tgt: Station, color: str) -> None:
+        """Empreinte au sol et mire graduée de la bulle `tgt`, vue depuis `cam`.
+
+        L'empreinte (cercle de 50 cm posé sur le sol de la bulle, en
+        perspective) doit s'inscrire à plat sur le sol de la photo ; la mire
+        monte du sol à la caméra, graduée tous les 10 cm. Hauteur et delta se
+        jugent ainsi dans l'image, et se corrigent à la molette.
+        """
+        if tgt.idx == cam.idx:
+            return
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        north = cam.north_pct
+        dx, dy = tgt.x - cam.x, tgt.y - cam.y
+        g = tgt.ground(eye) - cam.z
+        top = tgt.z - cam.z
+        pts = []
+        for k in range(33):
+            a = 2 * math.pi * k / 32
+            pr = project_point(view, self.calib, north, dx + MIRE_RING_M * math.sin(a),
+                               dy + MIRE_RING_M * math.cos(a), g)
+            if pr is None or pr[2] < 0.05:
+                pts = []
+                break
+            pts += [pr[0], pr[1]]
+        if pts:
+            canvas.create_line(*pts, fill='#000000', width=4, tags='hs')
+            canvas.create_line(*pts, fill=color, width=2, tags='hs')
+        sg = project_segment(view, self.calib, north, (dx, dy, g), (dx, dy, top))
+        if sg is None:
+            return
+        canvas.create_line(*sg, fill='#000000', width=4, tags='hs')
+        canvas.create_line(*sg, fill=color, width=2, tags='hs')
+        h = tgt.height(eye)
+        nd = 3 if self.edit_mode else 2          # au millimètre en édition
+        n = int(h / MIRE_TICK_M + 1e-9)
+        for k in range(1, n + 1):
+            pr = project_point(view, self.calib, north, dx, dy, g + k * MIRE_TICK_M)
+            if pr is None or pr[2] < 0.05:
+                continue
+            w = 7 if k % 5 == 0 else 4
+            canvas.create_line(pr[0] - w, pr[1], pr[0] + w, pr[1], fill=color, width=1,
+                               tags='hs')
+        foot = project_point(view, self.calib, north, dx, dy, g)
+        head = project_point(view, self.calib, north, dx, dy, top)
+        if foot is not None and foot[2] > 0.05:
+            canvas.create_line(foot[0] - 9, foot[1], foot[0] + 9, foot[1], fill=color,
+                               width=2, tags='hs')
+            canvas.create_text(foot[0] + 12, foot[1] + 1, anchor='w', font=F_TINY_B,
+                               fill=color, text=f"sol {tgt.ground(eye):.{nd}f}  "
+                                                f"Δ {tgt.delta(eye):+.{nd}f}",
+                               tags='hs')
+        if head is not None and head[2] > 0.05:
+            canvas.create_oval(head[0] - 4, head[1] - 4, head[0] + 4, head[1] + 4,
+                               outline=color, width=2, tags='hs')
+            canvas.create_text(head[0] + 12, head[1], anchor='w', font=F_TINY_B, fill=color,
+                               text=f"H {h:.{nd}f}  Z {tgt.z:.{nd}f}", tags='hs')
+
+    def mire_targets(self, current_idx: int, partner_idx: Optional[int],
+                     hotspots, hover: Optional[int]) -> List[int]:
+        """Bulles dotées d'une mire : l'autre vue, la pastille survolée, la cible."""
+        if not self.cfg.get('show_mire', True):
+            return []
+        out = []
+        if partner_idx is not None and partner_idx != current_idx:
+            out.append(partner_idx)
+        if hover is not None and hover < len(hotspots):
+            out.append(hotspots[hover].link.target)
+        if self.edit_mode and self.selected is not None:
+            out.append(self.selected)
+        return [i for k, i in enumerate(out) if i not in out[:k] and 0 <= i < len(self.stations)]
+
     def _build_toolbar(self, parent) -> None:
         bar = tk.Frame(parent, bg=COLORS['bg_medium'])
         bar.pack(fill='x', side='top')
@@ -3200,6 +3541,13 @@ class BubbleNavApp(_TkBase):
         menu.add_checkbutton(label="À l'arrivée, regarder d'où l'on vient",
                              variable=self.focus_var, command=self._set_focus_origin)
         menu.add_command(label="Regarder d'où l'on vient  (O)", command=self.look_back)
+        menu.add_separator()
+        self.mire_var = tk.BooleanVar(value=bool(self.cfg.get('show_mire', True)))
+        menu.add_checkbutton(label="Mire de hauteur (empreinte au sol, sol → caméra)",
+                             variable=self.mire_var,
+                             command=lambda: (self.cfg.__setitem__('show_mire',
+                                                                   bool(self.mire_var.get())),
+                                              self._draw_overlay(), self._redraw_compare()))
         mb.config(menu=menu)
         self.display_btn = mb
         Tooltip(mb, "Étiquettes des pastilles (distance, nom, H / Δ / Z), "
@@ -3338,6 +3686,8 @@ class BubbleNavApp(_TkBase):
             '<t>': self._toggle_all, '<T>': self._toggle_all,
             '<o>': self.look_back, '<O>': self.look_back,
             '<l>': self._toggle_same_local, '<L>': self._toggle_same_local,
+            '<g>': self.face_a_face, '<G>': self.face_a_face,
+            '<i>': self.swap_ab, '<I>': self.swap_ab,
             '<F1>': self._dlg_help, '<question>': self._dlg_help,
             '<x>': lambda: self._lock_axis('x'), '<X>': lambda: self._lock_axis('x'),
             '<y>': lambda: self._lock_axis('y'), '<Y>': lambda: self._lock_axis('y'),
@@ -4006,7 +4356,7 @@ class BubbleNavApp(_TkBase):
 
     def draw_marks(self, canvas, hs: "Hotspot", tgt: Station, color: str,
                    hovered: bool, selected: bool = False, missing: bool = False,
-                   tag: str = '', labels: bool = True) -> None:
+                   tag: str = '', labels: bool = True, mire: bool = False) -> None:
         """Étiquettes d'une pastille, lues à chaque dessin (donc toujours à jour).
 
         Au-dessus : le nom de la station. Dessous : la distance, puis trois
@@ -4054,7 +4404,7 @@ class BubbleNavApp(_TkBase):
             text(hs.col, y, txt, 'white' if hovered else '#e8e8e8',
                  F_UI_B if hovered else F_UI)
             y += 13
-        if self.heights_var.get() and (near or hovered or selected):
+        if self.heights_var.get() and (near or hovered or selected) and not mire:
             eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
             nd = 3 if self.edit_mode else 2
             for label, val, fix, signed in (
@@ -4098,6 +4448,9 @@ class BubbleNavApp(_TkBase):
         else:
             self._axis_hits = []
         libres = self.declutter(self.hotspots)
+        mires = set(self.mire_targets(self.current,
+                                      self.compare.idx if self.compare is not None else None,
+                                      self.hotspots, self._hover))
         for i, hs in enumerate(self.hotspots):
             lk = hs.link
             tgt = self.stations[lk.target]
@@ -4109,12 +4462,19 @@ class BubbleNavApp(_TkBase):
             tag = ("↩ origine" if tgt.idx == self.came_from else
                    "B" if self.compare is not None and tgt.idx == self.compare.idx else '')
             self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing, tag,
-                            labels=i in libres)
+                            labels=i in libres, mire=tgt.idx in mires)
         if self.edit_mode:
             for x, y, txt, col in self._axis_labels:
                 self.canvas.create_text(x + 1, y + 1, text=txt, fill='#000000',
                                         font=F_UI_B, tags='hs')
                 self.canvas.create_text(x, y, text=txt, fill=col, font=F_UI_B, tags='hs')
+        cur = self.station()
+        for idx in self.mire_targets(self.current,
+                                     self.compare.idx if self.compare is not None else None,
+                                     self.hotspots, self._hover):
+            self.draw_mire(self.canvas, view, cur, self.stations[idx],
+                           COLORS['sel'] if self.compare is not None
+                           and idx == self.compare.idx else 'white')
         self._draw_hud(view)
         if self._hover is not None and getattr(self, '_hover_xy', None):
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
@@ -4291,8 +4651,11 @@ class BubbleNavApp(_TkBase):
                 if self._start_axis_drag(self._edit_target(), event, axis, on_origin=True):
                     return
             if ctrl:                                     # deplacer la bulle active
+                probe = self._hotspot_at(event.x, event.y)
                 self._set_target(None)
                 if self._start_axis_drag(st, event, self._locked_axis()):
+                    if probe is not None:          # simple clic : ce sera une sonde
+                        self._hs_drag[1]['probe'] = self.hotspots[probe].link.target
                     return
             hit = self._hotspot_at(event.x, event.y)
             if hit is not None:
@@ -4327,7 +4690,10 @@ class BubbleNavApp(_TkBase):
         if moved <= 4 and not self.edit_mode:
             hit = self._hotspot_at(event.x, event.y)
             if hit is not None:
-                self.goto(self.hotspots[hit].link.target)
+                if event.state & 0x0004:            # Ctrl+clic : sonder
+                    self.sonde(self.hotspots[hit].link.target)
+                else:                              # clic : y aller, cap conservé
+                    self.goto(self.hotspots[hit].link.target)
                 return
         if self._interactive:
             self._render_full()
@@ -4346,6 +4712,8 @@ class BubbleNavApp(_TkBase):
 
     def _on_wheel(self, event, direction: int = 0) -> None:
         step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
+        if self.wheel_alt(event, self.hotspots, self.current, step):
+            return                          # Alt / Maj + molette : Δ / H
         self._zoom(-6 * step)
 
     def _on_double(self, event) -> None:
@@ -4535,6 +4903,7 @@ class BubbleNavApp(_TkBase):
         self.compare = CompareView(self, idx)
         self.cmp_btn.config(bg=COLORS['sel'], fg='#101010')
         self._cone_sig = None
+        self._refresh_ctrlbar()
 
     def open_in_b(self, idx: int) -> None:
         """Ouvre une bulle dans la vue B, en ouvrant la comparaison au besoin."""
@@ -4557,10 +4926,10 @@ class BubbleNavApp(_TkBase):
                          COLORS['sel'])
 
     def _on_right_click(self, event) -> None:
-        """Clic droit sur une pastille de A : l'ouvrir dans la vue B."""
+        """Clic droit sur une pastille de A : la sonder (comme Ctrl+clic)."""
         hit = self._hotspot_at(event.x, event.y)
         if hit is not None:
-            self.open_in_b(self.hotspots[hit].link.target)
+            self.sonde(self.hotspots[hit].link.target)
 
     def _sync_compare(self) -> None:
         """Tient la seconde vue alignée sur la vue principale."""
@@ -4646,6 +5015,7 @@ class BubbleNavApp(_TkBase):
     # PANNEAU LATERAL
     # ═════════════════════════════════════════════════════════════════
     def _refresh_side(self) -> None:
+        self._refresh_ctrlbar()
         st = self.station()
         if st is None or self.current >= len(self.links):
             return
@@ -5306,6 +5676,7 @@ class BubbleNavApp(_TkBase):
     def _end_edit_drag(self) -> None:
         kind = self._hs_drag[0] if self._hs_drag else None
         moved = kind == 'axe' and self._hs_drag[1]['axis'] is not None
+        probe = self._hs_drag[1].get('probe') if kind == 'axe' and not moved else None
         idx = (self._hs_drag[1]['idx'] if kind == 'axe' else
                self._hs_drag[1] if kind == 'yaw' else None)
         self._hs_drag = None
@@ -5315,6 +5686,9 @@ class BubbleNavApp(_TkBase):
                 and self.corrections.drop_if_unchanged(self.stations[idx]):
             if self.journal and self.journal[-1] == ('edit',):
                 self.journal.pop()          # clic sans effet : aucune étape à annuler
+            if probe is not None:
+                self.sonde(probe)
+                return
             self._draw_overlay()
             return
         if kind == 'axe' and not moved:
@@ -6597,8 +6971,6 @@ class CompareView(tk.Frame if _TK_OK else object):
         self.app._mk_button(bar, "✕", self.close,
                             tip="Fermer la vue B (touche C).").pack(side='right',
                                                                      padx=(4, 8), pady=4)
-        self.app._mk_button(bar, "⇄ Échanger", self.swap).pack(side='right', padx=4, pady=4)
-        self.app._mk_button(bar, "A → B", self.copy_from_a).pack(side='right', padx=4, pady=4)
         self.app.tip(tk.Checkbutton(bar, text="Vue liée", variable=self.linked,
                        command=self._on_linked, font=F_UI, bg=COLORS['bg_medium'],
                        fg=COLORS['text'], selectcolor=COLORS['bg_light'], bd=0,
@@ -6657,6 +7029,7 @@ class CompareView(tk.Frame if _TK_OK else object):
                    self.app.anchor())
         self.request_render(force=True)
         self._refresh_title()
+        self.app._refresh_ctrlbar()
         self.app.store.prefetch([self.app.stations[lk.target].photo
                                  for lk in self.app.links[idx]]
                                 if idx < len(self.app.links) else [])
@@ -6823,6 +7196,7 @@ class CompareView(tk.Frame if _TK_OK else object):
             float(app.cfg.get('disc_radius', DISC_RADIUS_M)), *app.disc_bounds(),
             anchor=app.anchor())
         libres = app.declutter(self.hotspots)
+        mires = set(app.mire_targets(self.idx, app.current, self.hotspots, self._hover))
         for i, hs in enumerate(self.hotspots):
             tgt = app.stations[hs.link.target]
             color = app.hotspot_color(hs.link, tgt)
@@ -6832,7 +7206,12 @@ class CompareView(tk.Frame if _TK_OK else object):
                    "↩ origine" if tgt.idx == self.came_from else '')
             app.draw_marks(self.canvas, hs, tgt, color, hovered,
                            missing=not app.store.has(tgt.photo), tag=tag,
-                           labels=i in libres)
+                           labels=i in libres, mire=tgt.idx in mires)
+        me = self.station()
+        if me is not None:
+            for idx in app.mire_targets(self.idx, app.current, self.hotspots, self._hover):
+                app.draw_mire(self.canvas, view, me, app.stations[idx],
+                              COLORS['hot'] if idx == app.current else 'white')
         if self._hover is not None and self._hover_xy:
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
         st = self.station()
@@ -6869,13 +7248,10 @@ class CompareView(tk.Frame if _TK_OK else object):
         return hotspot_hit(self.hotspots, x, y, self.app.relief())
 
     def _on_right_click(self, event) -> None:
-        """Clic droit sur une pastille de B : l'ouvrir dans la vue A."""
+        """Clic droit sur une pastille de B : la sonder depuis B (comme Ctrl+clic)."""
         hit = self._hotspot_at(event.x, event.y)
         if hit is not None:
-            idx = self.hotspots[hit].link.target
-            self.app.goto(idx, keep_heading=True)
-            self.app._set_status(f"{self.app.stations[idx].locator} ouvert dans la vue A",
-                                 COLORS['sel'])
+            self.app.sonde(self.hotspots[hit].link.target, src='B')
 
     # ── interactions ─────────────────────────────────────────────────
     def _on_press(self, event) -> None:
@@ -6908,7 +7284,10 @@ class CompareView(tk.Frame if _TK_OK else object):
         if moved <= 4:
             hit = self._hotspot_at(event.x, event.y)
             if hit is not None:
-                self.goto(self.hotspots[hit].link.target, record=True)
+                if event.state & 0x0004:            # Ctrl+clic : sonder depuis B
+                    self.app.sonde(self.hotspots[hit].link.target, src='B')
+                else:
+                    self.goto(self.hotspots[hit].link.target, record=True)
                 return
         self.request_render(force=True)
 
@@ -6933,6 +7312,8 @@ class CompareView(tk.Frame if _TK_OK else object):
 
     def _on_wheel(self, event, direction: int = 0) -> None:
         step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
+        if self.app.wheel_alt(event, self.hotspots, self.idx, step):
+            return
         if self.linked.get():
             self.app._zoom(-6 * step)
         else:
@@ -6943,9 +7324,9 @@ class CompareView(tk.Frame if _TK_OK else object):
         if self._hotspot_at(event.x, event.y) is not None:
             return
         view = self._frame_view or self.view
-        f = view.focal()
-        dyaw = math.degrees(math.atan2(event.x - view.width / 2.0, f))
-        dpitch = math.degrees(math.atan2(event.y - view.height / 2.0, f))
+        wx, wy, wz = _pano_ray(view, event.x, event.y)     # exact, grand angle compris
+        dyaw = wrap180(math.degrees(math.atan2(wy, wx)) - view.yaw)
+        dpitch = view.pitch - math.degrees(math.asin(clamp(wz, -1.0, 1.0)))
         if self.linked.get():
             self.app.view.yaw = wrap180(self.app.view.yaw + dyaw)
             self.app.view.pitch = clamp(self.app.view.pitch - dpitch, PITCH_MIN, PITCH_MAX)
@@ -6969,6 +7350,7 @@ class CompareView(tk.Frame if _TK_OK else object):
             self.app.compare = None
             try:
                 self.app.cmp_btn.config(bg=COLORS['bg_light'], fg=COLORS['text'])
+                self.app._refresh_ctrlbar()
             except Exception:
                 pass
         try:
