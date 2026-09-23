@@ -232,6 +232,7 @@ DEFAULT_CONFIG = {
     'drag_z': 'ddelta',              # l'axe Z agit sur 'ddelta' (sol + caméra) ou 'dh'
     'hotspot_anchor': 'sol',         # pastille au 'sol' ou au point de 'vue' (mât)
     'all_hotspots': False,           # toutes les bulles à portée, sans élagage
+    'focus_origin': False,           # à l'arrivée, regarder la bulle d'où l'on vient
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
 
@@ -524,23 +525,32 @@ COL_ALIASES = {
                 'nomdupoint', 'nom', 'id'),
     'x': ('x', 'e', 'est', 'easting', 'xm', 'coordx'),
     'y': ('y', 'n', 'nord', 'northing', 'ym', 'coordy'),
-    'z': ('z', 'altitude', 'alt', 'elevation', 'zm', 'coordz', 'zcamera'),
+    # Z du point de vue. Un « Z corrigé / final / appareil » passe avant un Z
+    # nu : dans ce cas le Z nu est l'altitude du plancher (voir 'zfloor').
+    'z': ('zcorrige', 'zcorriger', 'zcorr', 'zfinal', 'zappareil', 'zcamera',
+          'zinstrument', 'zpointdevue', 'zpdv', 'zstation',
+          'z', 'altitude', 'alt', 'elevation', 'zm', 'coordz'),
     'hcam': ('hauteurappareil', 'hauteurcamera', 'hauteurstation', 'hcam',
              'hauteurinstrument', 'hauteurdinstrument', 'hinstrument', 'hinst', 'hi',
              'hauteurinstrumentm', 'hauteurappareilm',
+             'hauteurcm', 'hcm', 'hauteurinstrumentcm', 'hauteurappareilcm', 'hicm',
+             'hauteurmm', 'hmm',
              'hauteur', 'h', 'hcamera', 'happareil'),
     'delta': ('delta', 'deltaplancher', 'decalageplancher', 'deltasol',
-              'surelevation', 'marche', 'deltaz', 'deltam'),
+              'surelevation', 'marche', 'deltaz', 'deltam', 'deltacm', 'deltamm'),
     # Altitude du plancher : base du calcul Z = plancher + delta + hauteur
     'zfloor': ('zplancher', 'altitudeplancher', 'altplancher', 'zdalle',
                'altitudedalle', 'zniveau', 'altitudeniveau', 'niveauplancher',
                'coteplancher', 'cotedalle', 'zplancherm', 'altitudeplancherm',
-               'zfloor', 'floorz', 'floorelevation'),
+               'zfloor', 'floorz', 'floorelevation',
+               # Z nu resté libre : le point de vue a sa propre colonne (Z corrigé)
+               'z', 'altitude'),
     'dh': ('dhstation', 'dh', 'dhauteur', 'correctionhauteur', 'dhauteurstation'),
     'ddelta': ('ddeltaplancher', 'ddelta', 'correctiondelta', 'ddeltasol'),
     'north': ('pctnord', 'nordpct', 'pct', 'nordpourcent', 'cap', 'heading',
               'azimut', 'orientation'),
-    'floor': ('plancher', 'niveau', 'etage', 'level', 'floor', 'dalle'),
+    'floor': ('plancher', 'plancherms', 'planchers', 'nomplancher', 'libelleplancher',
+              'niveau', 'etage', 'level', 'floor', 'dalle'),
     # Correction d'orientation : colonne dediee, ajoutee par l'outil si absente.
     'dnord': ('deltanorddeg', 'deltanord', 'dnord', 'correctionnord',
               'rotationimage', 'nordcorrection', 'deltanordo'),
@@ -623,6 +633,42 @@ MAPPING_FIELDS = (('key', "Identifiant / N° scan", True),
                   ('target', "Nom projeté", False), ('locator', "Nom du locator", False))
 
 
+def auto_columns(header: Sequence[str]) -> Dict[str, int]:
+    """Colonnes reconnues d'après leurs intitulés normalisés.
+
+    Une colonne ne sert qu'à un champ, dans l'ordre d'importance. Un plancher
+    à l'intitulé inattendu (« PlancherMS », « Niveau bâtiment »…) est repris
+    par son préfixe s'il reste libre.
+    """
+    col: Dict[str, int] = {}
+    used: set = set()
+    for field_name in _FIELD_ORDER:
+        for alias in COL_ALIASES.get(field_name, ()):
+            if alias in header:
+                idx = header.index(alias)
+                if idx in used:
+                    continue
+                col[field_name] = idx
+                used.add(idx)
+                break
+    if 'floor' not in col:
+        for idx, name in enumerate(header):
+            if idx not in used and name.startswith(('plancher', 'niveau', 'etage', 'floor')):
+                col['floor'] = idx
+                break
+    return col
+
+
+def unit_scale(name: str) -> float:
+    """Facteur vers le mètre d'après l'intitulé : « Hauteur/cm » → 0,01."""
+    n = norm_key(name)
+    if n.endswith('mm'):
+        return 0.001
+    if n.endswith('cm'):
+        return 0.01
+    return 1.0
+
+
 def csv_signature(header_cells: Sequence[str], headerless: bool) -> str:
     """Empreinte d'un format de CSV, pour retrouver la correspondance choisie."""
     if headerless:
@@ -689,17 +735,14 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
             if 0 <= idx < len(header_cells):
                 col[field_name] = idx
     elif not headerless:
-        header = [norm_key(c) for c in header_cells]
-        used: set = set()
-        for field_name in _FIELD_ORDER:
-            for alias in COL_ALIASES.get(field_name, ()):
-                if alias in header:
-                    idx = header.index(alias)
-                    if idx in used:
-                        continue
-                    col[field_name] = idx
-                    used.add(idx)
-                    break
+        col.update(auto_columns([norm_key(c) for c in header_cells]))
+
+    # Unités : hauteur et delta peuvent être en cm ou en mm (« Hauteur/cm »)
+    def scale_of(field_name: str) -> float:
+        i = col.get(field_name, -1)
+        return unit_scale(header_cells[i]) if 0 <= i < len(header_cells) and not headerless \
+            else 1.0
+    h_scale, d_scale = scale_of('hcam'), scale_of('delta')
 
     # Identifiant : le nom de photo, a defaut le numero de scan, a defaut le nom projete
     if 'photo' not in col:
@@ -757,8 +800,14 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
             north = 50.0
         dnord = parse_float(cell(row, 'dnord')) or 0.0
         h0 = parse_float(cell(row, 'hcam'))
+        if h0 is not None:
+            h0 *= h_scale
+            if h0 > 20.0:            # unité non dite : une hauteur de 165 est en cm
+                h0 /= 100.0
         zfl = parse_float(cell(row, 'zfloor'))
         delta_val = parse_float(cell(row, 'delta'))
+        if delta_val is not None:
+            delta_val *= d_scale
         delta0 = delta_val or 0.0
         cle = cell(row, 'key') or photo
         target = base_name(cell(row, 'target')) if cell(row, 'target') else ''
@@ -1236,6 +1285,24 @@ def axis_param(ray: Sequence[float], p0: Sequence[float], axis: Sequence[float],
     return t
 
 
+def aim_at(view: View, calib: Calib, frm: Station, to: Station,
+           eye: float = EYE_HEIGHT_DEFAULT, anchor: str = 'sol') -> None:
+    """Oriente la vue de `frm` vers la pastille de `to` (cap et site).
+
+    Sert à regarder d'où l'on vient : la pastille de la bulle quittée doit
+    tomber exactement sur le point de prise de vue visible dans l'image.
+    """
+    dx, dy = to.x - frm.x, to.y - frm.y
+    dh = math.hypot(dx, dy)
+    cible = to.z if anchor == 'vue' else to.ground(eye)
+    dz = cible - frm.z
+    if dh < 0.05:                            # à l'aplomb : on regarde en haut ou en bas
+        view.pitch = PITCH_MAX if dz > 0 else PITCH_MIN
+        return
+    view.yaw = wrap180(calib.pano_yaw(math.degrees(math.atan2(dx, dy)), frm.north_pct))
+    view.pitch = clamp(math.degrees(math.atan2(dz, dh)), PITCH_MIN, PITCH_MAX)
+
+
 def plan_skeleton(stations: Sequence[Station], links: Sequence[Sequence["Link"]]
                   ) -> List[Tuple[int, int]]:
     """Squelette du réseau pour le plan (voisinage relatif sur le réseau).
@@ -1631,15 +1698,11 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
             elif not headerless and norm_key(ref) in header:
                 col[field_name] = header.index(norm_key(ref))
     elif not headerless:
-        used: set = set()
-        for field_name in _FIELD_ORDER:
-            if field_name not in ('photo', 'x', 'y', 'z', 'dnord', 'key', 'hcam', 'delta'):
-                continue
-            for alias in COL_ALIASES[field_name]:
-                if alias in header and header.index(alias) not in used:
-                    col[field_name] = header.index(alias)
-                    used.add(col[field_name])
-                    break
+        col = {k: v for k, v in auto_columns(header).items()
+               if k in ('photo', 'x', 'y', 'z', 'dnord', 'key', 'hcam', 'delta')}
+    # unités d'origine (« Hauteur/cm ») : on réécrit dans la même unité
+    scale = {f: (unit_scale(head_cells[col[f]]) if f in col and not headerless
+                 and col[f] < len(head_cells) else 1.0) for f in ('hcam', 'delta')}
     if 'photo' not in col and 'key' in col:
         col['photo'] = col['key']
     if 'photo' not in col:
@@ -1656,9 +1719,9 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
         """Bonnes valeurs d'une bulle : position, altitude calculée et ses composantes."""
         out = [('x', st.x), ('y', st.y), ('z', st.z)]
         if 'hcam' in col:
-            out.append(('hcam', st.height(eye)))
+            out.append(('hcam', st.height(eye) / scale['hcam']))
         if 'delta' in col:
-            out.append(('delta', st.delta(eye)))
+            out.append(('delta', st.delta(eye) / scale['delta']))
         return out
 
     # Colonnes ajoutées au besoin : Δ nord, et les composantes d'altitude
@@ -1702,6 +1765,10 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
             for name, value in valeurs(st):
                 i = col.get(name, -1)
                 if 0 <= i < len(fields):
+                    if not fields[i].strip() and (
+                            (name == 'delta' and abs(value) < 5e-4)
+                            or (name == 'hcam' and st.h0 is None and not st.raised())):
+                        continue              # cellule vide = valeur par défaut : on la laisse
                     txt = _format_like(fields[i], value)
                     if txt != fields[i].strip():
                         fields[i] = txt
@@ -2476,6 +2543,7 @@ class BubbleNavApp(_TkBase):
             hide_missing=bool(cfg.get('filter_hide_missing', False)))
         self.hidden_count = 0
         self.focus_idx: Optional[int] = None      # bulle décrite dans le panneau
+        self.came_from: Optional[int] = None      # bulle quittée (A), pour s'y retourner
         self._hover: Optional[int] = None
         # Edition
         self.corrections = Corrections()
@@ -2943,10 +3011,16 @@ class BubbleNavApp(_TkBase):
         menu.add_checkbutton(label="Toutes les pastilles, sans élagage  (T)",
                              variable=self.all_var,
                              command=lambda: self._toggle_all(bool(self.all_var.get())))
+        menu.add_separator()
+        self.focus_var = tk.BooleanVar(value=bool(self.cfg.get('focus_origin')))
+        menu.add_checkbutton(label="À l'arrivée, regarder d'où l'on vient",
+                             variable=self.focus_var, command=self._set_focus_origin)
+        menu.add_command(label="Regarder d'où l'on vient  (O)", command=self.look_back)
         mb.config(menu=menu)
         self.display_btn = mb
         Tooltip(mb, "Étiquettes des pastilles (distance, nom, H / Δ / Z), "
-                    "hauteur des pastilles (sol ou point de vue), toutes les pastilles (T).")
+                    "hauteur des pastilles (sol ou point de vue), toutes les pastilles (T), "
+                    "regarder d'où l'on vient (O).")
         mb.pack(side='left', padx=8, pady=4)
 
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
@@ -3077,6 +3151,7 @@ class BubbleNavApp(_TkBase):
             '<e>': self._toggle_edit, '<E>': self._toggle_edit,
             '<v>': self._show_viewer, '<V>': self._show_viewer,
             '<t>': self._toggle_all, '<T>': self._toggle_all,
+            '<o>': self.look_back, '<O>': self.look_back,
             '<x>': lambda: self._lock_axis('x'), '<X>': lambda: self._lock_axis('x'),
             '<y>': lambda: self._lock_axis('y'), '<Y>': lambda: self._lock_axis('y'),
             '<z>': lambda: self._lock_axis('z'), '<Z>': lambda: self._lock_axis('z'),
@@ -3281,19 +3356,25 @@ class BubbleNavApp(_TkBase):
     # ═════════════════════════════════════════════════════════════════
     # NAVIGATION
     # ═════════════════════════════════════════════════════════════════
-    def goto(self, idx: int, keep_heading: bool = True, push: bool = True) -> None:
+    def goto(self, idx: int, keep_heading: bool = True, push: bool = True,
+             focus: Optional[bool] = None) -> None:
         if not (0 <= idx < len(self.stations)) or idx == self.current:
             return
         prev = self.station()
-        if keep_heading and prev is not None and self.cfg.get('keep_heading', True):
-            # conserve le cap terrain : azimut vise avant -> apres
-            az = self.calib.azimuth(self.view.yaw, prev.north_pct)
-            self.view.yaw = self.calib.pano_yaw(az, self.stations[idx].north_pct)
-        if push and self.current >= 0:
+        if push and self.current >= 0:     # regard d'avant le départ, pour Ctrl+Z
             self.history.append(self.current)
             del self.history[:-200]
             self._journal_push(('nav', self.current, self.view.yaw, self.view.pitch,
                                 self.view.fov))
+        if keep_heading and prev is not None and self.cfg.get('keep_heading', True):
+            # conserve le cap terrain : azimut vise avant -> apres
+            az = self.calib.azimuth(self.view.yaw, prev.north_pct)
+            self.view.yaw = self.calib.pano_yaw(az, self.stations[idx].north_pct)
+        if prev is not None:
+            self.came_from = prev.idx
+            if focus if focus is not None else bool(self.cfg.get('focus_origin')):
+                aim_at(self.view, self.calib, self.stations[idx], prev,
+                       float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)), self.anchor())
         self.current = idx
         self.selected = None
         self.focus_idx = None
@@ -3306,6 +3387,28 @@ class BubbleNavApp(_TkBase):
         self._draw_plan()
         if idx < len(self.links):      # prechargement des voisins immediats
             self.store.prefetch([self.stations[lk.target].photo for lk in self.links[idx]])
+
+    def look_back(self) -> None:
+        """Touche O : tourne la vue vers la bulle d'où l'on vient."""
+        cur = self.station()
+        src = self.came_from
+        if cur is None or src is None or not (0 <= src < len(self.stations)) \
+                or src == cur.idx:
+            self._set_status("Pas de bulle d'origine : naviguez d'abord d'une bulle à l'autre")
+            return
+        aim_at(self.view, self.calib, cur, self.stations[src],
+               float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)), self.anchor())
+        self._request_render(force=True)
+        self._set_status(f"Vue tournée vers {self.stations[src].locator}, d'où l'on vient : "
+                         "sa pastille doit tomber sur le point de prise de vue",
+                         COLORS['sel'])
+
+    def _set_focus_origin(self) -> None:
+        self.cfg['focus_origin'] = bool(self.focus_var.get())
+        save_config(self.cfg)
+        self._set_status("À l'arrivée : " + ("regard tourné vers la bulle quittée"
+                                              if self.cfg['focus_origin']
+                                              else "cap conservé"))
 
     def go_back(self) -> None:
         if self.history:
@@ -3659,7 +3762,8 @@ class BubbleNavApp(_TkBase):
             self.compare._draw_overlay()
 
     def draw_marks(self, canvas, hs: "Hotspot", tgt: Station, color: str,
-                   hovered: bool, selected: bool = False, missing: bool = False) -> None:
+                   hovered: bool, selected: bool = False, missing: bool = False,
+                   tag: str = '') -> None:
         """Étiquettes d'une pastille, lues à chaque dessin (donc toujours à jour).
 
         Au-dessus : le nom de la station. Dessous : la distance, puis trois
@@ -3680,9 +3784,16 @@ class BubbleNavApp(_TkBase):
             canvas.create_text(x + 1, y + 1, text=txt, fill='#000000', font=font, tags='hs')
             canvas.create_text(x, y, text=txt, fill=fill, font=font, tags='hs')
 
-        if self.names_var.get() or hovered:
-            text(hs.col, top, tgt.locator, 'white' if hovered else MARK_TEXT,
-                 F_TINY_B if hovered or selected else F_TINY)
+        if tag:                              # bulle quittée, ou bulle de l'autre vue
+            r = hs.radius * (1.25 if hovered else 1.0)
+            rs = (SPHERE_RADIUS * r if self.relief() else r) * 1.7
+            cy = hs.row - (SPHERE_RADIUS * r * SPHERE_LIFT if self.relief() else 0)
+            canvas.create_oval(hs.col - rs, cy - rs, hs.col + rs, cy + rs,
+                               outline='white', width=2, dash=(4, 3), tags='hs')
+        if self.names_var.get() or hovered or tag:
+            text(hs.col, top, (tag + '  ' if tag else '') + tgt.locator,
+                 'white' if hovered or tag else MARK_TEXT,
+                 F_TINY_B if hovered or selected or tag else F_TINY)
         y = self.label_y(hs, hovered)
         if self.labels_var.get() or hovered:
             txt = human_dist(lk.dist)
@@ -3748,7 +3859,9 @@ class BubbleNavApp(_TkBase):
             hovered = (i == self._hover)
             selected = self.edit_mode and self.selected == tgt.idx
             self.draw_hotspot(self.canvas, hs, color, hovered, selected=selected)
-            self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing)
+            tag = ("↩ origine" if tgt.idx == self.came_from else
+                   "B" if self.compare is not None and tgt.idx == self.compare.idx else '')
+            self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing, tag)
         if self.edit_mode:
             for x, y, txt, col in self._axis_labels:
                 self.canvas.create_text(x + 1, y + 1, text=txt, fill='#000000',
@@ -4182,8 +4295,14 @@ class BubbleNavApp(_TkBase):
             self._last_current = self.current
         else:
             self.compare.goto(idx, record=True)
+        # B regarde vers A : chaque vue montre la pastille de l'autre, la
+        # cohérence de position et d'orientation se juge d'un coup d'œil
+        if self.current >= 0 and idx != self.current:
+            self.compare.aim_at_station(self.current)
         self._cone_sig = None
-        self._set_status(f"{self.stations[idx].locator} ouvert dans la vue B",
+        cur = self.station()
+        self._set_status(f"{self.stations[idx].locator} ouvert dans la vue B, tourné vers "
+                         f"{cur.locator if cur else 'A'} (vue liée suspendue)",
                          COLORS['sel'])
 
     def _on_right_click(self, event) -> None:
@@ -6069,6 +6188,7 @@ class BubbleNavApp(_TkBase):
             "  • Ctrl+Z                 : annuler la dernière opération (navigation,\n"
             "                             correction, bulle ouverte en B)\n"
             "  • T                      : toutes les pastilles, sans élagage\n"
+            "  • O                      : regarder d'où l'on vient\n"
             "  • Clic droit (pastille)  : ouvrir dans l'autre vue\n"
             "  • Flèches                : tourner (Maj = pas large)\n"
             "  • Origine (Home)         : redresser la vue\n"
@@ -6186,6 +6306,7 @@ class CompareView(tk.Frame if _TK_OK else object):
         self._idle_job = None
         self._closed = False
         self.linked = tk.BooleanVar(value=True)
+        self.came_from: Optional[int] = None      # bulle quittée dans B
         self.follow = tk.StringVar(value=self.FOLLOW_MODES[0])
 
         self._build_ui()
@@ -6260,6 +6381,8 @@ class CompareView(tk.Frame if _TK_OK else object):
         if not (0 <= idx < len(self.app.stations)) or idx == self.idx:
             return
         prev = self.station()
+        if prev is not None:
+            self.came_from = prev.idx
         if record and prev is not None:          # geste de l'utilisateur : annulable
             self.app._journal_push(('nav_b', self.idx, self.view.yaw, self.view.pitch,
                                     self.view.fov))
@@ -6267,11 +6390,27 @@ class CompareView(tk.Frame if _TK_OK else object):
             az = self.app.calib.azimuth(self.view.yaw, prev.north_pct)
             self.view.yaw = self.app.calib.pano_yaw(az, self.app.stations[idx].north_pct)
         self.idx = idx
+        if prev is not None and not self.linked.get() and self.app.cfg.get('focus_origin'):
+            aim_at(self.view, self.app.calib, self.app.stations[idx], prev,
+                   float(self.app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
+                   self.app.anchor())
         self.request_render(force=True)
         self._refresh_title()
         self.app.store.prefetch([self.app.stations[lk.target].photo
                                  for lk in self.app.links[idx]]
                                 if idx < len(self.app.links) else [])
+
+    def aim_at_station(self, idx: int) -> None:
+        """Tourne B vers une bulle (la vue liée est suspendue pour garder ce regard)."""
+        b = self.station()
+        if b is None or not (0 <= idx < len(self.app.stations)) or idx == b.idx:
+            return
+        if self.linked.get():
+            self.linked.set(False)
+            self._on_linked()
+        aim_at(self.view, self.app.calib, b, self.app.stations[idx],
+               float(self.app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)), self.app.anchor())
+        self.request_render(force=True)
 
     def copy_from_a(self) -> None:
         self.goto(self.app.current, record=True)
@@ -6432,8 +6571,10 @@ class CompareView(tk.Frame if _TK_OK else object):
                 color = COLORS['edit']
             hovered = i == self._hover
             app.draw_hotspot(self.canvas, hs, color, hovered)
+            tag = ("A" if tgt.idx == app.current else
+                   "↩ origine" if tgt.idx == self.came_from else '')
             app.draw_marks(self.canvas, hs, tgt, color, hovered,
-                           missing=not app.store.has(tgt.photo))
+                           missing=not app.store.has(tgt.photo), tag=tag)
         if self._hover is not None and self._hover_xy:
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
         st = self.station()
@@ -6905,17 +7046,19 @@ def selftest(csv_path: str = '') -> int:
 
             src_lines = _read_text(work_csv).splitlines()
             dst_lines = _read_text(out_csv).splitlines()
+            a_h = 'hcam' in auto_columns([norm_key(c) for c in src_lines[0].split(';')])
             check("colonnes ajoutées en fin d'en-tête (Δ nord, hauteur corrigée)",
-                  dst_lines[0] == src_lines[0] + ';' + YAW_COLUMN + ';Hauteur instrument',
-                  dst_lines[0][-50:])
+                  dst_lines[0] == src_lines[0] + ';' + YAW_COLUMN
+                  + ('' if a_h else ';Hauteur instrument'), dst_lines[0][-50:])
             n_src = len(src_lines[0].split(';'))
             check("les autres colonnes ne bougent pas",
                   all(';'.join(b.split(';')[:n_src]) == a for a, b in
                       zip(src_lines[1:], dst_lines[1:])
                       if not b.startswith(tuple(x.photo for x in sts if x.modified()))))
-            h_col = [ln.split(';')[-1] for ln in dst_lines[1:4]]
-            check("hauteur instrument écrite pour chaque bulle",
-                  all(parse_float(v) is not None for v in h_col), str(h_col))
+            if not a_h:
+                h_col = [ln.split(';')[-1] for ln in dst_lines[1:4]]
+                check("hauteur instrument écrite pour chaque bulle",
+                      all(parse_float(v) is not None for v in h_col), str(h_col))
 
             sts3, _ = read_survey_csv(out_csv)
             check("valeurs X/Y/Z relues",
@@ -7442,6 +7585,52 @@ def selftest(csv_path: str = '') -> int:
               all(abs(p.z - q.z) < 5e-4 for p, q in zip(a, b)))
     finally:
         _sh5.rmtree(tmp5, ignore_errors=True)
+
+    # 16. Format terrain : Z plancher, Delta, Hauteur/cm, Zcorrige, PlancherMS
+    print("\n16) Format terrain (Z plancher, Delta, Hauteur/cm, Zcorrige)")
+    import tempfile as _tf6
+    import shutil as _sh6
+    tmp6 = _tf6.mkdtemp(prefix='bubblenav_terrain_')
+    try:
+        c = os.path.join(tmp6, 'terrain.csv')
+        src_txt = ("\ufeffNum scan;Locator;X;Y;Z;Delta;Hauteur/cm;Zcorrige;% NORD;PlancherMS\r\n"
+                   "1001;R110b_01;15.217;6.563;-3.500;;165.000;-1.850;50;PLANCHER 01 (-03.50m)\r\n"
+                   "2108;R348_01;3.667;7.057;4.000;-0.400;165.000;5.250;50;PLANCHER 03 (+04.00m)\r\n"
+                   "1052;R732_01;-8.440;-8.710;-8.500;;165.000;-6.850;50;\r\n")
+        with open(c, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(src_txt)
+        t, _ = read_survey_csv(c)
+        check("Z = plancher, Zcorrige = point de vue, hauteur en cm, PlancherMS lu",
+              t[1].floor_alt == 4.0 and t[1].z_csv == 5.25 and abs(t[1].h0 - 1.65) < 1e-9
+              and t[1].delta0 == -0.4 and t[0].floor.startswith('PLANCHER 01')
+              and t[2].floor_alt == -8.5,
+              f"plancher {t[1].floor_alt} Δ {t[1].delta0} H {t[1].h0} « {t[0].floor} »")
+        apply_altimetry(t, 1.65)
+        check("Z calculé = Zcorrige du fichier", all(abs(x.z - x.z_csv) < 1e-9 for x in t))
+        out = os.path.join(tmp6, 'terrain_corrige.csv')
+        n_mod, n_keep, _ = write_corrected_csv(c, out, t)
+        check("sans correction : CSV corrigé identique au fichier",
+              n_mod == 0 and open(out, 'rb').read() == open(c, 'rb').read())
+        Corrections(c).apply(t[0], dh=0.05, ddelta=-0.20)
+        write_corrected_csv(c, out, t)
+        ligne = _read_text(out).splitlines()[1].split(';')
+        check("correction réécrite dans les unités du fichier (cm)",
+              ligne[5] == '-0.200' and ligne[6] == '170.000' and ligne[7] == '-2.000',
+              ';'.join(ligne[4:8]))
+        # regarder d'où l'on vient : la pastille visée tombe au centre de l'écran
+        v = View(0.0, 0.0, 90.0, 800, 600)
+        cal = Calib('colonne', 1, 0.0)
+        a1 = Station(idx=0, photo='a', locator='A', x=0, y=0, z=1.65, north_pct=37.0, floor='P')
+        b1 = Station(idx=1, photo='b', locator='B', x=3, y=4, z=1.65, north_pct=62.0, floor='P')
+        aim_at(v, cal, b1, a1, 1.65, 'sol')
+        dx, dy = a1.x - b1.x, a1.y - b1.y
+        pr = project(v, cal.pano_yaw(math.degrees(math.atan2(dx, dy)), b1.north_pct),
+                     math.degrees(math.atan2(a1.ground(1.65) - b1.z, math.hypot(dx, dy))))
+        check("regarder d'où l'on vient : pastille au centre",
+              pr is not None and abs(pr[0] - 400) < 1e-6 and abs(pr[1] - 300) < 1e-6,
+              f"{pr[0]:.3f}, {pr[1]:.3f}" if pr else "hors champ")
+    finally:
+        _sh6.rmtree(tmp6, ignore_errors=True)
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))

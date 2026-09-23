@@ -88,7 +88,20 @@ Colonnes reconnues :
 
 Intitulés reconnus, entre autres : `Z plancher`, `Altitude plancher`, `Z dalle` ;
 `Delta`, `Delta plancher` ; `Hauteur instrument`, `H instrument`, `HI`,
-`H appareil`.
+`H appareil` ; `Plancher`, `PlancherMS` (et tout intitulé commençant par
+« plancher » ou « niveau »).
+
+**Format terrain** (`Num scan;Locator;X;Y;Z;Delta;Hauteur/cm;Zcorrige;% NORD;PlancherMS`) :
+* dès qu'une colonne **`Zcorrige`** (ou `Z final`, `Z appareil`) existe, c'est
+  elle l'altitude du point de vue, et le **`Z` nu est l'altitude du plancher** ;
+* l'unité se lit dans l'intitulé : **`Hauteur/cm`** est en centimètres (165 →
+  1,65 m). Une hauteur de plus de 20 sans unité est aussi comprise en cm ;
+* sur BUG_BR_TR2 terrain, Z + Delta + Hauteur/100 = Zcorrige pour les 852
+  bulles. Les 8 planchers sont lus, et même les 27 bulles sans libellé de
+  plancher ont leur altitude (colonne Z) ;
+* le CSV corrigé réécrit dans les mêmes unités (hauteur en cm). Un Delta vide
+  reste vide tant qu'il vaut 0. Sans correction, le fichier ressort identique
+  à l'octet près.
 
 **Altitude du point de vue** : toujours calculée,
 
@@ -155,6 +168,7 @@ relevé déjà renommé.
 | `Retour arrière` | revenir à la bulle précédente |
 | **`Ctrl+Z`** | **annuler la dernière opération**, quelle qu'elle soit : entrée dans une bulle (retour à la bulle quittée, avec le même cap, site et champ), correction, bulle ouverte dans la vue B |
 | `T` | **toutes les pastilles** : toutes les bulles à portée, sans limite de nombre ni tri par direction (T de nouveau pour revenir) |
+| **`O`** | **regarder d'où l'on vient** : la vue se tourne vers la pastille de la bulle quittée |
 | Flèches (`Maj` = pas large) | tourner |
 | `Origine` | redresser la vue |
 | `F11` / `Échap` | plein écran |
@@ -323,6 +337,24 @@ plein écran.
 Section *Réseau* : portée des liens, nombre maximal de pastilles, séparation angulaire
 minimale (une seule pastille par direction, pour ne pas empiler les bulles alignées) et
 portée des liaisons entre planchers.
+
+### Regarder d'où l'on vient (vérifier la cohérence)
+
+Une fois arrivé sur une bulle, la pastille de la bulle **quittée** doit tomber
+exactement sur l'endroit où se trouvait l'appareil dans l'image. Un écart
+révèle une erreur de position (X/Y), d'orientation (Δ nord) ou d'altitude
+(H, Δ).
+* touche **O**, ou menu « Affichage ▾ » → *Regarder d'où l'on vient* : la vue
+  se tourne et centre la pastille d'origine ;
+* menu « Affichage ▾ » → *À l'arrivée, regarder d'où l'on vient* : à chaque
+  clic sur une pastille, la vue arrive déjà tournée vers la bulle quittée (dans
+  A, et dans B si la vue liée est coupée) ;
+* **clic droit** sur une pastille : la bulle s'ouvre dans B, **tournée vers
+  A**, et la vue liée est suspendue. A voit B, B voit A : les deux pastilles se
+  font face ;
+* repères : la bulle quittée est entourée en pointillé et marquée
+  « ↩ origine » ; dans A, la pastille de la bulle ouverte en B porte « B » ;
+  dans B, celle de A porte « A ».
 
 ## 5. Comparer deux points de vue  (touche C)
 
