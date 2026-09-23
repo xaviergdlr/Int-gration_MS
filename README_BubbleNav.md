@@ -134,7 +134,23 @@ de vue, cap, champ, plancher affiché, cadrage du plan, calibration, position
 corrigée) et le redessine dès qu'il change. Il ne dépend donc pas du rendu de
 l'image : même pendant le décodage d'un panorama 16000×8000, il reste juste.
 Coût mesuré : 9 µs par battement, soit 0,06 % d'un cœur. Les cercles jaunes
-marquent les bulles retenues comme pastilles, filtres compris.
+marquent les bulles retenues comme pastilles, filtres compris ; des tirets
+jaunes les relient à la bulle courante.
+
+**Réseau du plan** (liste « réseau », sous le plan) :
+* **squelette** (par défaut) : le réseau de navigation compte jusqu'à 8 liens
+  par bulle, jusqu'à 12 m. Tracé en entier, il couvre le plan d'une toile de
+  diagonales qui traversent les murs : 2 832 traits sur GRA6, 3 624 sur
+  BUG_BR. Le squelette omet un lien A–B dès qu'une bulle C, reliée à A et à B,
+  est plus proche de chacune qu'elles ne le sont entre elles : le trajet A–C–B
+  le remplace. Il reste 988 et 1 206 traits (trois fois moins), qui suivent
+  les couloirs. Le squelette est connexe partout où le réseau l'est et se
+  calcule en 5 ms ;
+* **complet** : tous les liens de navigation, comme avant ;
+* **aucun** : seulement les bulles et les liens de la bulle courante.
+
+La navigation (pastilles de la vue) n'est pas touchée : seul le dessin du plan
+change.
 La liste « Plancher » change de niveau en rejoignant la bulle la plus proche à l'aplomb.
 
 **Couleur des pastilles** : jaune = même plancher · bleu ▲ = niveau au-dessus ·
@@ -322,13 +338,35 @@ cible). Le bouton « Bulle active » revient à la première.
   décalage est systématique ;
 * la colonne `% NORD` du relevé n'est jamais touchée : elle reste à 50.
 
-### Position X / Y / Z
-Trois gestes, au choix :
-* **glisser une pastille** dans la vue : elle se déplace au sol, gauche/droite =
-  azimut, haut/bas = éloignement (intersection exacte du rayon avec le plan du
-  sol, vérifiée au pixel près) ;
-* **glisser un point sur le plan** : positionnement X/Y en vue de dessus ;
+### Position X / Y / Z : toujours le long d'un axe
+En mode édition, la cible porte un **repère XYZ** : X Est en rouge, Y Nord en
+vert, Z en bleu. Il est centré sur sa **position d'origine du CSV**. Les axes
+sont **gradués** (5 cm à 1 m selon la distance, point plus gros au mètre).
+Pour une pastille, l'axe Z monte jusqu'à la caméra de la station. Un trait
+orange pointillé relie l'origine à la position actuelle. En bas de la vue, une
+ligne donne le déplacement depuis le CSV, axe par axe : ΔX, ΔY, ΔH (hauteur
+station), ΔΔ (delta plancher), avec la valeur du geste en cours.
+
+Un déplacement n'est **jamais libre** : il suit un seul axe.
+* **glisser une pastille** : en mode **Auto**, l'axe X ou Y est choisi par le
+  début du geste (celui dont la direction à l'écran est la plus proche), puis
+  reste fixe jusqu'au relâchement ;
+* **saisir un axe du repère** (le trait coloré) : le geste suit cet axe ;
+* **verrouiller un axe** : boutons *Auto X/Y · X Est · Y Nord · Z* du panneau,
+  ou touches **X**, **Y**, **Z** (un second appui revient en Auto). Z n'est
+  jamais choisi automatiquement, pour ne pas le confondre avec l'éloignement ;
+* **« Z agit sur »** : *Δ plancher* (le sol et la caméra montent, la pastille
+  suit) ou *H station* (seule la caméra bouge ; un trait orange marque la
+  nouvelle hauteur, un blanc l'ancienne) ;
+* **glisser un point sur le plan** : le long de X ou de Y aussi (axe verrouillé,
+  ou le sens dominant du geste) ;
 * **saisie numérique** X/Y, avec pas réglable (1 cm à 50 cm).
+
+Le point suivi est le point de l'axe le plus proche du rayon sous le curseur
+(calcul exact, contrôlé au 1e-12 m). La pastille reste donc sous le curseur le
+long de son axe, arrondie au millimètre. Un rail pointillé prolonge l'axe
+pendant le geste. Si l'axe est vu exactement dans l'axe du regard, le geste
+est ignoré et un message invite à changer d'axe ou de point de vue.
 
 L'**altitude** se corrige par ses deux composantes, dans le bloc « Altitude » :
 **hauteur station** (Page haut/bas — la caméra bouge, le sol de la pastille
@@ -337,9 +375,12 @@ Depuis les bulles voisines, les deux se ressemblent : c'est la scène qui tranch
 (une marche ou un faux plancher visible = delta ; sinon = hauteur). Le panneau
 affiche en permanence Z caméra, altitude du sol, hauteur et delta résultants.
 
-**Ctrl + glisser** dans la vue déplace la **bulle active** elle-même : tout le
-réseau de pastilles suit le curseur, ce qui permet de recaler une bulle mal
-positionnée sur le décor qu'elle voit.
+**Ctrl + glisser** dans la vue déplace la **bulle active** elle-même, sur un
+axe elle aussi. Le réseau de pastilles suit le curseur et la station part en
+sens inverse, ce qui permet de recaler une bulle mal positionnée sur le décor
+qu'elle voit. Son repère (visible en regardant vers le sol) marque sa position
+d'origine. En Z, vu d'aplomb, glisser vers le haut ou le bas règle l'altitude
+(2 mm par pixel).
 
 > Corrigez l'orientation **avant** les positions : sur une image mal orientée,
 > déplacer une pastille pour la faire coïncider avec ce qu'on voit reporterait
@@ -417,7 +458,9 @@ le mode num scan (clé immuable, nom projeté, attributs explicites, rattachemen
 photos par numéro, corrections retrouvées après renommage), la lecture souple (N° scan sans colonne
 photo, intitulés variés, fichier sans en-tête, intitulés inconnus, relevé corrigé
 réécrit au même format), l'étage déduit du numéro de local et son contrôle
-de cohérence avec Z, la précision du micromètre, l'aller-retour du fichier
+de cohérence avec Z, le glisser sur un axe (rayon écran ↔ point 3D,
+abscisse retrouvée sous le curseur, axe vu de face), le squelette du plan (grille
+sans diagonale, connexité identique au réseau), la précision du micromètre, l'aller-retour du fichier
 de corrections (écriture, relecture, ligne orpheline,
 date d'application) avec relevé source inchangé octet pour octet, l'écriture du relevé
 complet corrigé (colonne Δ nord créée puis réutilisée, seules les lignes modifiées

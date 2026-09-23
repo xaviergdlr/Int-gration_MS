@@ -222,9 +222,13 @@ DEFAULT_CONFIG = {
     'corr_paths': {},          # releve -> fichier de corrections choisi
     'viewer_geometry': '',     # taille/position du visualiseur hors plein ecran
     'viewer_start': 'plein écran',   # 'plein écran' | 'maximisé' | 'mémorisé'
+    'plan_links': 'squelette',       # réseau du plan : 'squelette' | 'complet' | 'aucun'
+    'drag_axis': 'auto',             # axe du glisser en édition : 'auto' | 'x' | 'y' | 'z'
+    'drag_z': 'ddelta',              # l'axe Z agit sur 'ddelta' (sol + caméra) ou 'dh'
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
 
+PLAN_LINK_MODES = ('squelette', 'complet', 'aucun')
 VIEWER_START_MODES = ('plein écran', 'maximisé', 'mémorisé')
 
 
@@ -1081,6 +1085,129 @@ def nearest_station(stations: Sequence[Station], x: float, y: float,
 # CORRECTIONS : POSITION XYZ (CSV) ET ORIENTATION (IMAGE)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _pano_ray(view: View, col: float, row: float) -> Tuple[float, float, float]:
+    """Rayon unitaire d'un pixel, dans le repère de l'image (X = centre image)."""
+    f = view.focal()
+    xg = col - view.width / 2.0
+    yg = row - view.height / 2.0
+    norm = math.sqrt(f * f + xg * xg + yg * yg)
+    xc, yc, zc = f / norm, xg / norm, -yg / norm
+    yr, pr = math.radians(view.yaw), math.radians(view.pitch)
+    cy, sy = math.cos(yr), math.sin(yr)
+    cp, sp = math.cos(pr), math.sin(pr)
+    # monde = Rz(yaw) . Ry(-pitch) . camera   (même convention que le rendu)
+    return (cy * cp * xc - sy * yc - cy * sp * zc,
+            sy * cp * xc + cy * yc - sy * sp * zc,
+            sp * xc + cp * zc)
+
+
+def screen_ray(view: View, col: float, row: float, calib: Calib,
+               north_pct: float) -> Tuple[float, float, float]:
+    """Rayon unitaire d'un pixel en coordonnées terrain (Est, Nord, Haut)."""
+    wx, wy, wz = _pano_ray(view, col, row)
+    horiz = math.hypot(wx, wy)
+    a = math.radians(calib.azimuth(math.degrees(math.atan2(wy, wx)), north_pct))
+    return horiz * math.sin(a), horiz * math.cos(a), wz
+
+
+def project_point(view: View, calib: Calib, north_pct: float,
+                  de: float, dn: float, du: float
+                  ) -> Optional[Tuple[float, float, float]]:
+    """Projette un point terrain (Est, Nord, Haut relatifs à la caméra)."""
+    dh = math.hypot(de, dn)
+    if dh < 1e-9 and abs(du) < 1e-9:
+        return None
+    az = math.degrees(math.atan2(de, dn))
+    elev = math.degrees(math.atan2(du, dh))
+    return project(view, calib.pano_yaw(az, north_pct), elev)
+
+
+def project_segment(view: View, calib: Calib, north_pct: float,
+                    p: Sequence[float], q: Sequence[float], steps: int = 32
+                    ) -> Optional[Tuple[float, float, float, float]]:
+    """Partie visible d'un segment 3D, projetée à l'écran (droite en gnomonique).
+
+    Le segment est échantillonné pour écarter la partie située derrière
+    l'observateur ; les extrémités visibles suffisent puisque la projection
+    gnomonique conserve les droites.
+    """
+    first = last = None
+    for i in range(steps + 1):
+        t = i / steps
+        pr = project_point(view, calib, north_pct,
+                           p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t,
+                           p[2] + (q[2] - p[2]) * t)
+        if pr is None or pr[2] < 0.05:        # derrière ou trop rasant
+            if last is not None:
+                break
+            continue
+        if first is None:
+            first = pr
+        last = pr
+    if first is None or last is None or first is last:
+        return None
+    return first[0], first[1], last[0], last[1]
+
+
+AXES: Dict[str, Tuple[float, float, float]] = {
+    'x': (1.0, 0.0, 0.0), 'y': (0.0, 1.0, 0.0), 'z': (0.0, 0.0, 1.0)}
+
+
+def axis_param(ray: Sequence[float], p0: Sequence[float], axis: Sequence[float],
+               max_abs: float = 60.0) -> Optional[float]:
+    """Abscisse, sur la droite p0 + t·axe, du point le plus proche du rayon.
+
+    Le rayon part de l'observateur (origine). Retourne None si le rayon est
+    presque parallèle à l'axe, s'il regarde à l'opposé ou si le point est
+    déraisonnablement loin : le geste est alors simplement ignoré.
+    """
+    b = sum(r * a for r, a in zip(ray, axis))
+    den = 1.0 - b * b
+    if den < 1e-4:
+        return None
+    dr = sum(r * c for r, c in zip(ray, p0))
+    ar = sum(a * c for a, c in zip(axis, p0))
+    t = (b * dr - ar) / den
+    if dr + b * t <= 0 or abs(t) > max_abs:
+        return None
+    return t
+
+
+def plan_skeleton(stations: Sequence[Station], links: Sequence[Sequence["Link"]]
+                  ) -> List[Tuple[int, int]]:
+    """Squelette du réseau pour le plan (voisinage relatif sur le réseau).
+
+    Parmi les liens de navigation d'un même plancher, le lien i–j est omis
+    dès qu'une bulle k, reliée à la fois à i et à j, est plus proche de
+    chacune des deux qu'elles ne le sont entre elles : le trajet i–k–j le
+    remplace. Les couloirs restent lisibles, les longues diagonales qui
+    traversent les murs disparaissent, et le squelette reste connexe
+    exactement là où le réseau l'est (un lien n'est retiré que s'il existe
+    un chemin de liens plus courts).
+    """
+    nbr: Dict[int, Dict[int, float]] = defaultdict(dict)
+    for st in stations:
+        if st.idx >= len(links):
+            continue
+        for lk in links[st.idx]:
+            if lk.kind == 'same' and lk.target != st.idx:
+                d2 = lk.dist_h * lk.dist_h
+                nbr[st.idx][lk.target] = d2
+                nbr[lk.target][st.idx] = d2
+    keep: List[Tuple[int, int]] = []
+    for i, ni in nbr.items():
+        for j, dij in ni.items():
+            if j <= i:
+                continue
+            nj = nbr[j]
+            lim = dij * (1.0 - 1e-9)
+            small, other = (ni, nj) if len(ni) <= len(nj) else (nj, ni)
+            if not any(k != i and k != j and dk < lim and other.get(k, math.inf) < lim
+                       for k, dk in small.items()):
+                keep.append((i, j))
+    return keep
+
+
 def ground_from_screen(view: View, col: float, row: float, calib: Calib,
                        north_pct: float, dz: float,
                        max_dist: float = 80.0) -> Optional[Tuple[float, float]]:
@@ -1090,20 +1217,7 @@ def ground_from_screen(view: View, col: float, row: float, calib: Calib,
     l'observateur). Calcul exact : intersection du rayon caméra avec ce plan.
     Retourne None si le rayon ne rencontre pas le plan (regard trop horizontal).
     """
-    f = view.focal()
-    xg = col - view.width / 2.0
-    yg = row - view.height / 2.0
-    norm = math.sqrt(f * f + xg * xg + yg * yg)
-    xc, yc, zc = f / norm, xg / norm, -yg / norm
-
-    yr, pr = math.radians(view.yaw), math.radians(view.pitch)
-    cy, sy = math.cos(yr), math.sin(yr)
-    cp, sp = math.cos(pr), math.sin(pr)
-    # monde = Rz(yaw) . Ry(-pitch) . camera   (même convention que le rendu)
-    wx = cy * cp * xc - sy * yc - cy * sp * zc
-    wy = sy * cp * xc + cy * yc - sy * sp * zc
-    wz = sp * xc + cp * zc
-
+    wx, wy, wz = _pano_ray(view, col, row)
     dh_unit = math.hypot(wx, wy)
     if dh_unit < 1e-9:
         return None
@@ -2002,6 +2116,16 @@ SPHERE_LIFT = 0.86       # centre de la sphere au-dessus du sol (fraction de rs)
 HALO_RADIUS = 1.75       # rayon du halo de survol (fraction de rs)
 HALO_COLOR = (255, 255, 235)
 
+# Repère XYZ du mode édition (centré sur la position d'origine du CSV)
+AXIS_COLORS = {'x': '#ff5c5c', 'y': '#4cd964', 'z': '#4da3ff'}
+AXIS_NAMES = {'x': 'X Est', 'y': 'Y Nord', 'z': 'Z'}
+AXIS_PX = 90.0                 # longueur visée d'un demi-axe à l'écran (px)
+AXIS_LEN_LIMITS = (0.3, 5.0)   # bornes de cette longueur en mètres
+AXIS_AUTO_PX = 6               # déplacement souris qui choisit l'axe (mode auto)
+AXIS_HIT_PX = 6                # tolérance de saisie d'un axe
+AXIS_Z_PX_M = 0.002            # m par pixel pour Z sur la bulle active (verticale vue de dessus)
+DRAG_AXIS_MODES = ('auto', 'x', 'y', 'z')
+
 
 def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2):
     """Pastille en relief : sphère éclairée reposant sur son ombre portée.
@@ -2111,6 +2235,7 @@ class BubbleNavApp(_TkBase):
         self.cfg = cfg
         self.stations: List[Station] = []
         self.links: List[List[Link]] = []
+        self.plan_edges: List[Tuple[int, int]] = []    # squelette du plan
         self.floors: List[str] = []
         self.current: int = -1
         self.history: List[int] = []
@@ -2150,7 +2275,9 @@ class BubbleNavApp(_TkBase):
         self.csv_mapping: Optional[Dict[str, str]] = None   # correspondance imposee
         self.incoherences: Dict[int, str] = {}     # étage déduit contredit par Z
         self.selected: Optional[int] = None      # bulle en cours de modification
-        self._hs_drag = None                     # (idx station, dz, mode)
+        self._hs_drag = None                     # geste d'édition en cours
+        self._axis_hits: List[Tuple[str, float, float, float, float]] = []
+        self._axis_origin_px: Optional[Tuple[float, float]] = None
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
         self._cone_sig = None                    # état du camembert du plan
@@ -2158,6 +2285,8 @@ class BubbleNavApp(_TkBase):
         self._cmp_sig = None                     # état de synchro de la vue B
         self._last_current = -1
         self._plan_hit = None                    # deplacement sur le plan
+        self._plan_axis: Optional[str] = None    # axe du glisser sur le plan
+        self._plan_start = (0.0, 0.0)
         self._autosave_job = None
         self._graph_job = None
         self._pump_job = None
@@ -2535,6 +2664,15 @@ class BubbleNavApp(_TkBase):
         btns.pack(fill='x', padx=10, pady=6)
         self._mk_button(btns, "Recadrer", self._plan_fit).pack(side='left')
         self._mk_button(btns, "◀ Retour", self.go_back).pack(side='left', padx=6)
+        mode = self.cfg.get('plan_links', 'squelette')
+        self.plan_links_var = tk.StringVar(
+            value=mode if mode in PLAN_LINK_MODES else 'squelette')
+        cb = ttk.Combobox(btns, textvariable=self.plan_links_var, width=9,
+                          state='readonly', style='BN.TCombobox', values=PLAN_LINK_MODES)
+        cb.pack(side='right')
+        cb.bind('<<ComboboxSelected>>', lambda e: self._set_plan_links())
+        tk.Label(btns, text="réseau", font=F_UI, bg=COLORS['bg_medium'],
+                 fg=COLORS['text_muted']).pack(side='right', padx=(0, 4))
 
         self._build_filter_panel(side)
 
@@ -2607,6 +2745,9 @@ class BubbleNavApp(_TkBase):
             '<f>': self._toggle_filters, '<F>': self._toggle_filters,
             '<e>': self._toggle_edit, '<E>': self._toggle_edit,
             '<v>': self._show_viewer, '<V>': self._show_viewer,
+            '<x>': lambda: self._lock_axis('x'), '<X>': lambda: self._lock_axis('x'),
+            '<y>': lambda: self._lock_axis('y'), '<Y>': lambda: self._lock_axis('y'),
+            '<z>': lambda: self._lock_axis('z'), '<Z>': lambda: self._lock_axis('z'),
             '<Control-z>': self._undo_edit, '<Control-s>': self._dlg_apply,
             '<Prior>': lambda: self._bump('dh', +1), '<Next>': lambda: self._bump('dh', -1),
             '<Shift-Prior>': lambda: self._bump('ddelta', +1),
@@ -2788,6 +2929,7 @@ class BubbleNavApp(_TkBase):
     def rebuild_graph(self) -> None:
         t0 = time.perf_counter()
         self.links = build_graph(self.stations, self.params)
+        self.plan_edges = plan_skeleton(self.stations, self.links)
         dt = (time.perf_counter() - t0) * 1000.0
         n_links = sum(len(v) for v in self.links)
         if self.current >= 0:
@@ -3066,6 +3208,9 @@ class BubbleNavApp(_TkBase):
         show_lbl = bool(self.labels_var.get())
         if self.edit_mode:
             self._draw_edit_refs(view)
+            self._draw_axes(view)
+        else:
+            self._axis_hits = []
         for i, hs in enumerate(self.hotspots):
             lk = hs.link
             tgt = self.stations[lk.target]
@@ -3125,8 +3270,9 @@ class BubbleNavApp(_TkBase):
             self.canvas.create_text(
                 view.width / 2, view.height - 10, anchor='s', tags='hs',
                 fill=COLORS['edit'], font=('Segoe UI', 10, 'bold'),
-                text="MODE ÉDITION — Maj+glisser : tourner l'image · "
-                     "glisser une pastille : la déplacer · Ctrl+glisser : bulle active")
+                text="ÉDITION — glisser pastille ou axe : déplacement sur un axe "
+                     "(X/Y/Z verrouille) · Ctrl : bulle active · Maj : tourner l'image")
+            self._axis_readout(view)
         # rose des vents : direction du nord dans la vue
         pr = project(view, self.calib.pano_yaw(0.0, st.north_pct), 0.0)
         if pr is not None:
@@ -3255,7 +3401,6 @@ class BubbleNavApp(_TkBase):
         self._press_xy = (event.x, event.y)
         self._hs_drag = None
         if self.edit_mode and self.current >= 0:
-            eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
             st = self.station()
             ctrl = bool(event.state & 0x0004)
             shift = bool(event.state & 0x0001)
@@ -3263,20 +3408,19 @@ class BubbleNavApp(_TkBase):
                 self.corrections.apply(st)               # état avant le geste
                 self._hs_drag = ('yaw', self.current, st.yaw_fix, event.x)
                 return
+            axis = self._axis_at(event.x, event.y)
+            if axis is not None:                         # saisie d'un axe du repère
+                if self._start_axis_drag(self._edit_target(), event, axis, on_origin=True):
+                    return
             if ctrl:                                     # deplacer la bulle active
-                pos = self._ground_target(event.x, event.y, -st.height(eye))
-                if pos is not None:
-                    self._set_target(None)
-                    self.corrections.apply(st)           # état avant le geste
-                    self._hs_drag = ('active', self.current, -st.height(eye),
-                                     pos[0], pos[1], st.x, st.y)
+                self._set_target(None)
+                if self._start_axis_drag(st, event, self._locked_axis()):
                     return
             hit = self._hotspot_at(event.x, event.y)
             if hit is not None:
                 tgt = self.stations[self.hotspots[hit].link.target]
                 self._set_target(tgt.idx)
-                self.corrections.apply(tgt)              # état avant le geste
-                self._hs_drag = ('pastille', tgt.idx, tgt.ground(eye) - st.z)
+                self._start_axis_drag(tgt, event, self._locked_axis())
                 return
         self._drag = (event.x, event.y, self.view.yaw, self.view.pitch)
 
@@ -3722,6 +3866,38 @@ class BubbleNavApp(_TkBase):
                      style='BN.TCombobox', values=('0.01', '0.05', '0.10', '0.50')
                      ).grid(row=1, column=4, padx=(8, 2))
 
+        # Glisser contraint : toujours le long d'un axe
+        tk.Label(self.edit_frame, text="Glisser selon l'axe", font=F_UI_B,
+                 bg=COLORS['card'], fg=COLORS['accent']).pack(anchor='w', pady=(6, 0))
+        ax = self.cfg.get('drag_axis', 'auto')
+        self.drag_axis_var = tk.StringVar(value=ax if ax in DRAG_AXIS_MODES else 'auto')
+        zk = self.cfg.get('drag_z', 'ddelta')
+        self.drag_z_var = tk.StringVar(value=zk if zk in ('dh', 'ddelta') else 'ddelta')
+        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        row.pack(fill='x', pady=2)
+        for val, txt in (('auto', "Auto X/Y"), ('x', "X Est"), ('y', "Y Nord"), ('z', "Z")):
+            tk.Radiobutton(row, text=txt, value=val, variable=self.drag_axis_var,
+                           indicatoron=False, command=self._on_axis_mode, font=F_UI_B,
+                           bg=COLORS['bg_light'], fg=AXIS_COLORS.get(val, COLORS['text']),
+                           selectcolor=COLORS['bg_dark'], activebackground=COLORS['bg_light'],
+                           activeforeground=COLORS['text'], relief='flat', bd=0,
+                           padx=8, pady=2).pack(side='left', padx=2)
+        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
+        row.pack(fill='x', pady=(0, 2))
+        label(row, "Z agit sur :").pack(side='left')
+        for val, txt in (('ddelta', "Δ plancher"), ('dh', "H station")):
+            tk.Radiobutton(row, text=txt, value=val, variable=self.drag_z_var,
+                           command=self._on_axis_mode, font=F_UI, bg=COLORS['card'],
+                           fg=COLORS['text'], selectcolor=COLORS['bg_dark'],
+                           activebackground=COLORS['card'],
+                           activeforeground=COLORS['text']).pack(side='left', padx=2)
+        label(self.edit_frame,
+              "Repère gradué, centré sur la position du CSV.\n"
+              "Auto : X ou Y selon le début du geste.\n"
+              "Touches X / Y / Z : verrouiller (2e appui : auto).\n"
+              "Saisir un axe du repère : le geste le suit.",
+              justify='left').pack(anchor='w', pady=(0, 2))
+
         # Altitude : deux composantes de nature physique differente
         tk.Label(self.edit_frame, text="Altitude (deux composantes)", font=F_UI_B,
                  bg=COLORS['card'], fg=COLORS['accent']).pack(anchor='w', pady=(6, 0))
@@ -3783,8 +3959,8 @@ class BubbleNavApp(_TkBase):
                         lambda: self._spread_yaw('tout')).pack(side='left', padx=3)
         label(self.edit_frame,
               "Maj + glisser dans la vue = tourner l'image ;\n"
-              "glisser une pastille = la déplacer au sol ;\n"
-              "Ctrl + glisser = déplacer la bulle active.\n"
+              "glisser une pastille = la déplacer le long d'un axe ;\n"
+              "Ctrl + glisser = déplacer la bulle active (sur un axe).\n"
               "Rien n'est écrit dans les images : l'angle vit dans le CSV et\n"
               "s'applique à l'affichage. Les images ne sont tournées qu'au\n"
               "moment choisi, par « Appliquer / enregistrer… »."
@@ -4024,20 +4200,114 @@ class BubbleNavApp(_TkBase):
         self._after_edit(moved=True, turned=True)
         self._set_status(f"{n} bulle(s) réinitialisée(s)", COLORS['edit'])
 
-    # ── deplacements a la souris ─────────────────────────────────────
-    def _ground_target(self, x: float, y: float, dz: float
-                       ) -> Optional[Tuple[float, float]]:
-        """Point du sol visé, exprimé en (Est, Nord) absolus."""
+    # ── deplacements a la souris : toujours le long d'un axe ─────────
+    def _locked_axis(self) -> Optional[str]:
+        """Axe imposé par l'utilisateur, ou None en mode automatique."""
+        v = self.drag_axis_var.get() if hasattr(self, 'drag_axis_var') else 'auto'
+        return v if v in AXES else None
+
+    def _lock_axis(self, axis: str) -> None:
+        """Touches X / Y / Z : verrouille l'axe (seconde pression : auto)."""
+        if not self.edit_mode or not hasattr(self, 'drag_axis_var'):
+            return
+        self.drag_axis_var.set('auto' if self.drag_axis_var.get() == axis else axis)
+        self._on_axis_mode()
+
+    def _on_axis_mode(self) -> None:
+        self.cfg['drag_axis'] = self.drag_axis_var.get()
+        self.cfg['drag_z'] = self.drag_z_var.get()
+        save_config(self.cfg)
+        v = self.drag_axis_var.get()
+        self._set_status("Glisser : " + (f"axe {AXIS_NAMES[v]} verrouillé" if v in AXES
+                                         else "axe choisi par le geste (X ou Y)"))
+        self._draw_overlay()
+        self._draw_plan()
+
+    def _axis_frame(self, tgt: Station) -> Optional[Dict[str, object]]:
+        """Géométrie du repère de `tgt`, relative à la caméra courante (E, N, H).
+
+        origin : position d'origine du CSV (sol) — centre du repère ;
+        point  : position actuelle (sol) — là où est la pastille ;
+        eye    : caméra de la cible (hauteur station).
+        """
+        cam = self.station()
+        if cam is None:
+            return None
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        h0 = tgt.h0 if tgt.h0 is not None else eye
+        sol0 = tgt.oz - h0
+        origin = (tgt.ox - cam.x, tgt.oy - cam.y, sol0 - cam.z)
+        point = (tgt.x - cam.x, tgt.y - cam.y, tgt.ground(eye) - cam.z)
+        eye_pt = (tgt.x - cam.x, tgt.y - cam.y, tgt.z - cam.z)
+        return {'origin': origin, 'point': point, 'eye': eye_pt,
+                'active': tgt.idx == cam.idx, 'north': cam.north_pct}
+
+    def _axis_at(self, x: float, y: float) -> Optional[str]:
+        """Axe du repère sous le curseur (hors du voisinage de son centre)."""
+        o = self._axis_origin_px
+        best, best_d = None, float(AXIS_HIT_PX)
+        for axis, x1, y1, x2, y2 in self._axis_hits:
+            if o is not None and math.hypot(x - o[0], y - o[1]) < 12:
+                return None                     # le centre appartient à la pastille
+            dx, dy = x2 - x1, y2 - y1
+            l2 = dx * dx + dy * dy
+            if l2 < 1:
+                continue
+            u = clamp(((x - x1) * dx + (y - y1) * dy) / l2, 0.0, 1.0)
+            d = math.hypot(x - (x1 + u * dx), y - (y1 + u * dy))
+            if d < best_d:
+                best, best_d = axis, d
+        return best
+
+    def _start_axis_drag(self, tgt: Station, event, axis: Optional[str],
+                         on_origin: bool = False) -> bool:
+        """Début d'un déplacement contraint : l'état avant le geste est mémorisé."""
+        fr = self._axis_frame(tgt)
+        if fr is None:
+            return False
+        self.corrections.apply(tgt)                  # état avant le geste (annulable)
+        zkey = self.drag_z_var.get() if hasattr(self, 'drag_z_var') else 'ddelta'
+        self._hs_drag = ('axe', {
+            'idx': tgt.idx, 'active': fr['active'], 'axis': None, 'want': axis,
+            'line': fr['origin'] if on_origin else fr['point'],
+            'press': (event.x, event.y), 't0': None, 'north': fr['north'],
+            'start': (tgt.x, tgt.y, tgt.dh, tgt.ddelta),
+            'zkey': zkey if zkey in ('dh', 'ddelta') else 'ddelta', 'd': 0.0})
+        if axis is not None:
+            self._fix_axis(self._hs_drag[1], axis)
+        self._draw_overlay()
+        return True
+
+    def _fix_axis(self, info: Dict[str, object], axis: str) -> None:
+        info['axis'] = axis
         view = self._frame_view or self.view
-        st = self.station()
-        if st is None:
+        ray = screen_ray(view, *info['press'], self.calib, info['north'])
+        info['t0'] = axis_param(ray, info['line'], AXES[axis])
+
+    def _auto_axis(self, info: Dict[str, object], x: float, y: float) -> Optional[str]:
+        """Mode auto : l'axe horizontal le plus aligné avec le début du geste."""
+        px, py = info['press']
+        mx, my = x - px, y - py
+        if math.hypot(mx, my) < AXIS_AUTO_PX:
             return None
-        res = ground_from_screen(view, x, y, self.calib, st.north_pct, dz)
-        if res is None:
-            return None
-        az, dist = res
-        a = math.radians(az)
-        return st.x + dist * math.sin(a), st.y + dist * math.cos(a)
+        view = self._frame_view or self.view
+        p = info['line']
+        base = project_point(view, self.calib, info['north'], *p)
+        best, best_c = 'x', -1.0
+        for axis in ('x', 'y'):
+            a = AXES[axis]
+            tip = project_point(view, self.calib, info['north'],
+                                p[0] + 0.5 * a[0], p[1] + 0.5 * a[1], p[2] + 0.5 * a[2])
+            if base is None or tip is None:
+                continue
+            vx, vy = tip[0] - base[0], tip[1] - base[1]
+            n = math.hypot(vx, vy)
+            if n < 1e-6:
+                continue
+            c = abs(mx * vx + my * vy) / (n * math.hypot(mx, my))
+            if c > best_c:
+                best, best_c = axis, c
+        return best
 
     def _drag_edit(self, event) -> None:
         kind = self._hs_drag[0]
@@ -4051,30 +4321,175 @@ class BubbleNavApp(_TkBase):
             self.yaw_lbl.config(text=f"{st.yaw_fix:+.2f}°".replace('.', ','))
             self._request_render(interactive=True)
             return
-        if kind == 'pastille':
-            _, idx, dz = self._hs_drag
-            pos = self._ground_target(event.x, event.y, dz)
-            if pos is None:
+        if kind != 'axe':
+            return
+        info = self._hs_drag[1]
+        if info['axis'] is None:
+            axis = self._auto_axis(info, event.x, event.y)
+            if axis is None:
                 return
-            self.corrections.apply(self.stations[idx], x=pos[0], y=pos[1], record=False)
-        elif kind == 'active':
-            _, idx, dz, wx0, wy0, sx0, sy0 = self._hs_drag
-            pos = self._ground_target(event.x, event.y, dz)
-            if pos is None:
+            self._fix_axis(info, axis)
+        axis = info['axis']
+        st = self.stations[info['idx']]
+        if info['active'] and axis == 'z' and info['t0'] is None:
+            # verticale de la bulle active vue d'aplomb : glisser haut/bas
+            d = (info['press'][1] - event.y) * AXIS_Z_PX_M
+        else:
+            if info['t0'] is None:
+                self._set_status(f"Axe {AXIS_NAMES[axis]} vu dans l'axe du regard : "
+                                 "changer de point de vue ou d'axe", COLORS['error'])
                 return
-            st = self.stations[idx]
-            self.corrections.apply(st, x=sx0 + (wx0 - pos[0]), y=sy0 + (wy0 - pos[1]),
-                                   record=False)
+            view = self._frame_view or self.view
+            t = axis_param(screen_ray(view, event.x, event.y, self.calib, info['north']),
+                           info['line'], AXES[axis])
+            if t is None:
+                return
+            d = t - info['t0']
+        d = round(d, 3)                                 # pas du millimètre
+        info['d'] = d
+        # Bulle active : on tire le terrain, la station part en sens inverse.
+        s_ = -d if info['active'] else d
+        x0, y0, dh0, dd0 = info['start']
+        if axis == 'x':
+            self.corrections.apply(st, x=x0 + s_, y=y0, record=False)
+        elif axis == 'y':
+            self.corrections.apply(st, x=x0, y=y0 + s_, record=False)
+        elif info['zkey'] == 'dh':
+            self.corrections.apply(st, dh=dh0 + s_, record=False)
+        else:
+            self.corrections.apply(st, ddelta=dd0 + s_, record=False)
         self._refresh_edit_panel()
         self._draw_overlay()
         self._draw_plan()
 
     def _end_edit_drag(self) -> None:
         kind = self._hs_drag[0] if self._hs_drag else None
+        moved = kind == 'axe' and self._hs_drag[1]['axis'] is not None
         self._hs_drag = None
         if kind is None:
             return
-        self._after_edit(moved=kind in ('pastille', 'active'), turned=kind == 'yaw')
+        if kind == 'axe' and not moved:
+            self._draw_overlay()
+            return
+        self._after_edit(moved=moved, turned=kind == 'yaw')
+
+    # ── repère XYZ ───────────────────────────────────────────────────
+    def _draw_axes(self, view: View) -> None:
+        """Repère X (Est), Y (Nord), Z centré sur la position d'origine du CSV.
+
+        Les axes sont gradués (pas adapté à la distance) ; un trait relie
+        l'origine à la position actuelle et, pendant un geste, le rail de
+        l'axe suivi est prolongé.
+        """
+        self._axis_hits = []
+        self._axis_origin_px = None
+        tgt = self._edit_target()
+        if tgt is None:
+            return
+        fr = self._axis_frame(tgt)
+        if fr is None:
+            return
+        north = fr['north']
+        o = fr['origin']
+        dist = max(0.3, math.sqrt(sum(c * c for c in o)))
+        length = clamp(AXIS_PX * dist / max(1.0, view.focal()), *AXIS_LEN_LIMITS)
+        drag = self._hs_drag[1] if self._hs_drag and self._hs_drag[0] == 'axe' else None
+        hot = (drag['axis'] or drag['want']) if drag else self._locked_axis()
+        c = self.canvas
+
+        def seg(p, q):
+            return project_segment(view, self.calib, north, p, q)
+
+        def at(p, a, t):
+            return (p[0] + a[0] * t, p[1] + a[1] * t, p[2] + a[2] * t)
+
+        # graduation : le plus petit pas lisible (>= 7 px entre traits)
+        px_m = view.focal() / dist
+        grad = next((g for g in (0.05, 0.1, 0.25, 0.5, 1.0) if g * px_m >= 7), 1.0)
+        for axis in ('x', 'y', 'z'):
+            a = AXES[axis]
+            lo = -length
+            hi = length
+            if axis == 'z' and not fr['active']:
+                hi = max(length, fr['eye'][2] - o[2] + 0.15)   # jusqu'à la caméra
+            sg = seg(at(o, a, lo), at(o, a, hi))
+            if sg is None:
+                continue
+            col = AXIS_COLORS[axis]
+            width = 3 if axis == hot else 1.5
+            c.create_line(*sg, fill=col, width=width, tags='hs')
+            self._axis_hits.append((axis, *sg))
+            n = int(length / grad)
+            for k in range(-n, n + 1):
+                if k == 0:
+                    continue
+                pr = project_point(view, self.calib, north, *at(o, a, k * grad))
+                if pr is not None and pr[2] > 0.05:
+                    r = 2.2 if abs(k * grad - round(k * grad)) < 1e-9 else 1.3
+                    c.create_oval(pr[0] - r, pr[1] - r, pr[0] + r, pr[1] + r,
+                                  fill=col, outline='', tags='hs')
+            tip = project_point(view, self.calib, north, *at(o, a, hi))
+            if tip is not None and tip[2] > 0.05:
+                c.create_text(tip[0] + 1, tip[1] - 9, text=axis.upper(), fill='#000000',
+                              font=F_UI_B, tags='hs')
+                c.create_text(tip[0], tip[1] - 10, text=axis.upper(), fill=col,
+                              font=F_UI_B, tags='hs')
+        base = project_point(view, self.calib, north, *o)
+        if base is not None and base[2] > 0.05:
+            self._axis_origin_px = (base[0], base[1])
+            c.create_oval(base[0] - 5, base[1] - 5, base[0] + 5, base[1] + 5,
+                          outline='white', width=1.5, tags='hs')
+        # déplacement depuis l'origine CSV
+        p = fr['point']
+        if any(abs(p[i] - o[i]) > 1e-4 for i in range(3)):
+            sg = seg(o, p)
+            if sg is not None:
+                c.create_line(*sg, fill=COLORS['edit'], width=2, dash=(4, 3), tags='hs')
+        if not fr['active'] and tgt.raised():
+            e0 = (o[0], o[1], o[2] + (tgt.h0 if tgt.h0 is not None else
+                                      float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))))
+            for q, col in ((e0, 'white'), (fr['eye'], COLORS['edit'])):
+                pr = project_point(view, self.calib, north, *q)
+                if pr is not None and pr[2] > 0.05:
+                    c.create_line(pr[0] - 7, pr[1], pr[0] + 7, pr[1], fill=col,
+                                  width=2, tags='hs')
+        # rail de l'axe suivi pendant le geste
+        if drag and drag['axis'] and not (drag['active'] and drag['axis'] == 'z'):
+            a = AXES[drag['axis']]
+            rail = (fr['point'] if drag['axis'] != 'z' or drag['zkey'] == 'ddelta'
+                    else fr['eye'])
+            if drag['active']:
+                rail = o
+            sg = seg(at(rail, a, -3 * length), at(rail, a, 3 * length))
+            if sg is not None:
+                c.create_line(*sg, fill=AXIS_COLORS[drag['axis']], width=1,
+                              dash=(6, 4), tags='hs')
+
+    def _axis_readout(self, view: View) -> None:
+        """Déplacement de la cible depuis le CSV, axe par axe."""
+        tgt = self._edit_target()
+        if tgt is None:
+            return
+        drag = self._hs_drag[1] if self._hs_drag and self._hs_drag[0] == 'axe' else None
+        hot = (drag['axis'] or drag['want']) if drag else self._locked_axis()
+        items = (('x', f"ΔX {tgt.x - tgt.ox:+.3f}"), ('y', f"ΔY {tgt.y - tgt.oy:+.3f}"),
+                 ('z', f"ΔH {tgt.dh:+.3f}  ΔΔ {tgt.ddelta:+.3f}"))
+        x = 14
+        y = view.height - 34
+        head = f"{tgt.locator} / CSV (m)"
+        t = self.canvas.create_text(x, y, text=head, anchor='sw', fill=COLORS['sel'],
+                                    font=F_UI_B, tags='hs')
+        x = self.canvas.bbox(t)[2] + 10
+        for axis, txt in items:
+            t = self.canvas.create_text(x, y, text=txt.replace('.', ','), anchor='sw',
+                                        fill=AXIS_COLORS[axis],
+                                        font=F_UI_B if axis == hot else F_UI, tags='hs')
+            x = self.canvas.bbox(t)[2] + 14
+        mode = f"axe {AXIS_NAMES[hot]}" if hot else "axe auto"
+        if drag and drag['axis']:
+            mode += f" {drag['d']:+.3f}".replace('.', ',')
+        self.canvas.create_text(x, y, text=f"[{mode}]", anchor='sw',
+                                fill=COLORS['text'], font=F_UI, tags='hs')
 
     # ── application par lot ──────────────────────────────────────────
     def _dlg_apply(self) -> None:
@@ -4297,7 +4712,8 @@ class BubbleNavApp(_TkBase):
                     workers=int(self.cfg.get('export_workers', 2)),
                     progress=progress, cancel=cancel)
             except Exception as exc:
-                self._post(lambda: (win.destroy(), messagebox.showerror("Export", str(exc))))
+                msg = str(exc)            # `exc` n'existe plus quand la lambda s'exécute
+                self._post(lambda: (win.destroy(), messagebox.showerror("Export", msg)))
                 return
             failed = {e.split(' : ')[0] for e in errors}
             applied = ({s.key for s in todo if s.photo not in failed}
@@ -4350,6 +4766,11 @@ class BubbleNavApp(_TkBase):
         floor = self.floor_var.get()
         return [s for s in self.stations if s.floor == floor] or self.stations
 
+    def _set_plan_links(self) -> None:
+        self.cfg['plan_links'] = self.plan_links_var.get()
+        save_config(self.cfg)
+        self._draw_plan()
+
     def _plan_fit(self) -> None:
         self._plan_view['fitted'] = False
         self._draw_plan()
@@ -4397,20 +4818,34 @@ class BubbleNavApp(_TkBase):
         to_screen, _ = self._plan_transform(pts, w, h)
         floor = self.floor_var.get()
 
-        # liens du plancher
-        seen = set()
-        for st in pts:
-            for lk in self.links[st.idx] if self.links else []:
-                if lk.kind != 'same':
-                    continue
-                key = (min(st.idx, lk.target), max(st.idx, lk.target))
-                if key in seen:
-                    continue
-                seen.add(key)
+        # Liens du plancher. Le réseau de navigation compte jusqu'à 8 liens
+        # par bulle (12 m) : tracé en entier il devient une toile illisible.
+        # Par défaut le plan n'en montre que le squelette.
+        mode = self.plan_links_var.get() if hasattr(self, 'plan_links_var') else 'squelette'
+        if mode == 'complet':
+            segments = {(min(st.idx, lk.target), max(st.idx, lk.target))
+                        for st in pts for lk in (self.links[st.idx] if self.links else [])
+                        if lk.kind == 'same'}
+        elif mode == 'squelette':
+            segments = [(i, j) for i, j in self.plan_edges
+                        if self.stations[i].floor == floor]
+        else:
+            segments = []
+        for i, j in segments:
+            a, b = self.stations[i], self.stations[j]
+            x1, y1 = to_screen(a.x, a.y)
+            x2, y2 = to_screen(b.x, b.y)
+            self.plan.create_line(x1, y1, x2, y2, fill=COLORS['plan_link'], width=1)
+        # liens de la bulle courante : là où mènent les pastilles affichées
+        cur = self.station()
+        if cur is not None and cur.floor == floor:
+            cx_, cy_ = to_screen(cur.x, cur.y)
+            for lk in self._visible_links(cur.idx):
                 tgt = self.stations[lk.target]
-                x1, y1 = to_screen(st.x, st.y)
-                x2, y2 = to_screen(tgt.x, tgt.y)
-                self.plan.create_line(x1, y1, x2, y2, fill=COLORS['plan_link'], width=1)
+                if tgt.floor == floor:
+                    x2, y2 = to_screen(tgt.x, tgt.y)
+                    self.plan.create_line(cx_, cy_, x2, y2, fill=COLORS['hot'],
+                                          width=1, dash=(3, 2))
 
         for st in pts:
             x, y = to_screen(st.x, st.y)
@@ -4426,6 +4861,17 @@ class BubbleNavApp(_TkBase):
                 if self.edit_mode and self.selected == st.idx:
                     self.plan.create_oval(x - 7, y - 7, x + 7, y + 7,
                                           outline=COLORS['sel'], width=2)
+        if self.edit_mode:
+            tgt = self._edit_target()
+            if tgt is not None and tgt.floor == floor:
+                ox, oy = to_screen(tgt.ox, tgt.oy)
+                hot = self._locked_axis() or getattr(self, '_plan_axis', None)
+                for axis, (dx, dy) in (('x', (1, 0)), ('y', (0, -1))):
+                    self.plan.create_line(ox - 18 * dx, oy - 18 * dy, ox + 18 * dx,
+                                          oy + 18 * dy, fill=AXIS_COLORS[axis],
+                                          width=2.5 if axis == hot else 1)
+                    self.plan.create_text(ox + 25 * dx, oy + 25 * dy, text=axis.upper(),
+                                          fill=AXIS_COLORS[axis], font=F_UI_B)
 
         cur = self.station()
         if cur is not None:
@@ -4557,19 +5003,31 @@ class BubbleNavApp(_TkBase):
         idx = self._plan_nearest(event, 12.0)
         if idx is not None:
             self._set_target(idx)
-            self.corrections.apply(self.stations[idx])   # état avant le geste
+            st = self.stations[idx]
+            self.corrections.apply(st)                   # état avant le geste
             self._plan_hit = idx
+            self._plan_start = (st.x, st.y)
+            self._plan_axis = self._locked_axis()
+            if self._plan_axis == 'z':
+                self._set_status("Axe Z verrouillé : le plan ne règle que X et Y — "
+                                 "glisser dans la vue", COLORS['edit'])
 
     def _on_plan_drag_left(self, event) -> None:
-        """Vue de dessus : positionnement X/Y direct de la cible."""
-        if self._plan_hit is None:
+        """Vue de dessus : déplacement de la cible le long de X ou de Y."""
+        if self._plan_hit is None or self._plan_axis == 'z':
             return
-        pts = self._plan_stations()
-        w = max(50, int(self.plan.winfo_width()))
-        h = max(50, int(self.plan.winfo_height()))
-        _, to_world = self._plan_transform(pts, w, h)
-        wx, wy = to_world(event.x, event.y)
-        self.corrections.apply(self.stations[self._plan_hit], x=wx, y=wy, record=False)
+        mx, my = event.x - self._plan_press[0], event.y - self._plan_press[1]
+        if self._plan_axis is None:
+            if math.hypot(mx, my) < AXIS_AUTO_PX:
+                return
+            self._plan_axis = 'x' if abs(mx) >= abs(my) else 'y'
+        scale = max(1e-9, float(self._plan_view.get('scale', 1.0)))
+        x0, y0 = self._plan_start
+        if self._plan_axis == 'x':
+            x, y = x0 + round(mx / scale, 3), y0
+        else:
+            x, y = x0, y0 - round(my / scale, 3)
+        self.corrections.apply(self.stations[self._plan_hit], x=x, y=y, record=False)
         self._refresh_edit_panel()
         self._draw_plan()
         self._draw_overlay()
@@ -4577,6 +5035,7 @@ class BubbleNavApp(_TkBase):
     def _on_plan_release_left(self, event) -> None:
         if self._plan_hit is not None:
             self._plan_hit = None
+            self._plan_axis = None
             self._after_edit(moved=True)
             return
         press = getattr(self, '_plan_press', None)
@@ -6144,6 +6603,66 @@ def selftest(csv_path: str = '') -> int:
               e[5].floor == e[6].floor == '—')
     finally:
         _sh4.rmtree(tmp4, ignore_errors=True)
+
+    # 14. Repère XYZ, glisser sur un axe, squelette du plan
+    print("\n14) Repère XYZ, glisser sur un axe, squelette du plan")
+    import random as _rnd
+    rng = _rnd.Random(7)
+    err_px = err_t = 0.0
+    n_ok = 0
+    for _ in range(2000):
+        cal = Calib(rng.choice(('colonne', 'centre')), rng.choice((1, -1)), rng.uniform(-40, 40))
+        pct = rng.uniform(0, 100)
+        v = View(rng.uniform(-180, 180), rng.uniform(-60, 10), rng.uniform(60, 110), 1280, 800)
+        p = (rng.uniform(-8, 8), rng.uniform(-8, 8), rng.uniform(-2.5, 0.5))
+        axis = AXES[rng.choice('xyz')]
+        t_true = rng.uniform(-1.5, 1.5)
+        q = tuple(p[i] + axis[i] * t_true for i in range(3))
+        pr = project_point(v, cal, pct, *q)
+        if pr is None or not (0 <= pr[0] <= v.width and 0 <= pr[1] <= v.height):
+            continue
+        ray = screen_ray(v, pr[0], pr[1], cal, pct)
+        back = project_point(v, cal, pct, *(r * 5.0 for r in ray))
+        err_px = max(err_px, math.hypot(back[0] - pr[0], back[1] - pr[1]))
+        t = axis_param(ray, p, axis)
+        if t is None:
+            continue
+        n_ok += 1
+        err_t = max(err_t, abs(t - t_true))
+    check("rayon écran ↔ projection d'un point (aller-retour)", err_px < 1e-6,
+          f"écart max {err_px:.1e} px")
+    check("abscisse sur l'axe retrouvée sous le curseur", n_ok > 100 and err_t < 1e-6,
+          f"{n_ok} cas, écart max {err_t:.1e} m")
+    check("axe vu dans l'axe du regard : geste ignoré",
+          axis_param((0.0, 1.0, 0.0), (0.0, 5.0, -1.6), AXES['y']) is None)
+    grid = [Station(idx=k, photo=f"g{k}", locator=f"G{k}", x=float(k % 6) * 2.0,
+                    y=float(k // 6) * 2.0, z=1.65, north_pct=50.0, floor='P')
+            for k in range(36)]
+    g_links = build_graph(grid, GraphParams(radius=6.0))
+    sk = plan_skeleton(grid, g_links)
+    longest = max(math.hypot(grid[i].x - grid[j].x, grid[i].y - grid[j].y) for i, j in sk)
+    check("squelette d'une grille : maillage de 2 m, sans diagonale",
+          len(sk) == 60 and longest < 2.0 + 1e-9, f"{len(sk)} traits, plus long {longest:.2f} m")
+    if 'links' in locals() and stations:
+        sk = plan_skeleton(stations, links)
+        full = {(min(st.idx, lk.target), max(st.idx, lk.target))
+                for st in stations for lk in links[st.idx] if lk.kind == 'same'}
+
+        def n_comp(edges) -> int:
+            parent = list(range(len(stations)))
+
+            def root(a: int) -> int:
+                while parent[a] != a:
+                    parent[a] = parent[parent[a]]
+                    a = parent[a]
+                return a
+            for i, j in edges:
+                parent[root(i)] = root(j)
+            return len({root(i) for i in range(len(stations))})
+        check("squelette du relevé : connexe comme le réseau, 2 à 4 fois plus léger",
+              set(sk) <= full and n_comp(sk) == n_comp(full)
+              and 2.0 <= len(full) / max(1, len(sk)) <= 4.5,
+              f"{len(full)} → {len(sk)} traits")
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))
