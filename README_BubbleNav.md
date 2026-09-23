@@ -11,7 +11,8 @@ L'outil est **indépendant** d'Orientation-XPhase : un seul fichier Python, rien
 
 ## 1. Démarrer
 
-Double-cliquez sur `BubbleNav.bat` (Windows) ou lancez :
+Double-cliquez sur `BubbleNav_XPhase.py` (Windows, Python installé depuis
+python.org) ou lancez :
 
 ```
 python BubbleNav_XPhase.py
