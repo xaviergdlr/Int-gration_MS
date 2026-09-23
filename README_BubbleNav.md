@@ -169,6 +169,10 @@ relevé déjà renommé.
 | **`Ctrl+Z`** | **annuler la dernière opération**, quelle qu'elle soit : entrée dans une bulle (retour à la bulle quittée, avec le même cap, site et champ), correction, bulle ouverte dans la vue B |
 | `T` | bascule **toutes les bulles du plancher** (défaut) ↔ **réseau élagué** |
 | **`O`** | **regarder d'où l'on vient** : la vue se tourne vers la pastille de la bulle quittée |
+| **`L`** | **seulement les pastilles du local courant** ; le filtre suit la bulle quand on navigue (L de nouveau : tout revoir) |
+| `F` | activer / couper les filtres (panneau « Filtres » : plancher, distance, **local choisi dans une liste**) |
+| `C` / `E` / `V` | comparaison (vue B) / mode édition / afficher le visualiseur |
+| **`F1`** ou `?` (bouton « ? ») | **aide : tous les raccourcis** |
 | Flèches (`Maj` = pas large) | tourner |
 | `Origine` | redresser la vue |
 | `F11` / `Échap` | plein écran |
@@ -227,6 +231,12 @@ Pour rester lisible :
   la sphère, et le survol en donne tout le détail ;
 * une étiquette qui chevaucherait celle d'une pastille plus proche est omise ;
 * le filtre de distance (panneau « Filtres ») limite au besoin l'affichage.
+
+**Un seul local** : la touche **L** (ou la case *local courant* du panneau
+« Filtres ») ne garde que les pastilles du local de la bulle affichée, et suit
+la bulle quand on navigue. Sur le plan, les autres locaux s'estompent. On peut
+aussi **choisir un local dans la liste** « Local » des filtres, ou y saisir
+plusieurs motifs (`K256, W25*`).
 
 **Réseau élagué** (touche **T**, ou menu « Affichage ▾ ») : c'est l'ancien
 comportement, fait pour naviguer de proche en proche. Il garde au plus

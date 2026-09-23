@@ -227,6 +227,7 @@ DEFAULT_CONFIG = {
     'filter_local': '',
     'filter_inter': True,
     'filter_hide_missing': False,
+    'filter_same_local': False,
     'export_workers': 2,       # panoramas 16000x8000 : ~800 Mo par tache
     'corr_paths': {},          # releve -> fichier de corrections choisi
     'viewer_geometry': '',     # taille/position du visualiseur hors plein ecran
@@ -1060,6 +1061,7 @@ class HotspotFilter:
     local: str = ''               # motifs séparés par des virgules, * accepté
     inter_floor: bool = True      # garder les pastilles ▲ / ▼
     hide_missing: bool = False    # masquer les bulles sans image
+    same_local: bool = False      # seulement le local de la bulle courante (touche L)
 
     def match_local(self, target: Station) -> bool:
         motifs = [m.strip().lower()
@@ -1089,6 +1091,10 @@ class HotspotFilter:
             return False
         if self.hide_missing and not has_image:
             return False
+        if self.same_local:
+            mine = current.parts().local or current.locator
+            if (target.parts().local or target.locator) != mine:
+                return False
         return self.match_local(target)
 
     def resume(self) -> str:
@@ -1107,6 +1113,8 @@ class HotspotFilter:
             bits.append("sans ▲▼")
         if self.hide_missing:
             bits.append("images présentes")
+        if self.same_local:
+            bits.append("local courant")
         return ' · '.join(bits) if bits else "actifs (tout passe)"
 
 
@@ -2541,6 +2549,70 @@ class Tooltip:
             self._win = None
 
 
+# Aide générale (F1 ou ?) : tous les raccourcis
+HELP_TEXT = """\
+NAVIGATION  (vue A)
+  Clic sur une pastille ...... aller sur cette bulle
+  Clic droit sur une pastille  l'ouvrir dans la vue B, tournée vers A
+  Glisser .................... tourner la vue
+  Double-clic ................ recentrer la vue sur ce point
+  Molette, + / - ............. champ de vision, 30° à 200° (grand angle > 110°)
+  Flèches (Maj = pas large) .. tourner
+  Origine (Home) ............. redresser la vue
+  Entrée ou Espace ........... avancer vers la pastille la plus centrale
+  Retour arrière ............. revenir à la bulle précédente
+  O .......................... regarder d'où l'on vient
+  Ctrl+Z ..................... annuler la dernière opération (navigation,
+                               correction, bulle ouverte en B)
+
+AFFICHAGE
+  T .......................... toutes les bulles du plancher <-> réseau élagué
+  L .......................... seulement les pastilles du local courant
+  F .......................... activer / couper les filtres
+  Filtres › Local ............ choisir un local dans la liste
+  Menu « Affichage » ......... étiquettes (nom, distance, H / Δ / Z), couleur
+                               par local ou par lien, pastille au sol ou au
+                               point de vue, regarder d'où l'on vient
+  F11 / Échap ................ plein écran
+  V .......................... afficher le visualiseur
+  F1 ou ? .................... cette aide
+
+COMPARAISON  (touche C)
+  C .......................... ouvrir / fermer la vue B
+  « Vue liée » ............... A et B regardent la même direction terrain
+  « Suivi de A » ............. B suit A : même local à un autre plancher, ou
+                               la bulle la plus proche
+  « A → B » / « ⇄ » .......... recopier A dans B / échanger A et B
+  Clic droit dans B .......... ouvrir la bulle dans A
+
+PLAN
+  Clic gauche ................ aller sur la bulle la plus proche
+  Clic droit ................. ouvrir la bulle dans la vue B
+  Clic droit glissé .......... déplacer le plan
+  Molette .................... zoom
+  Survol ..................... nom de la bulle
+  Liste « Plancher » ......... changer de niveau
+
+ÉDITION  (touche E) — rien n'est écrit sur le disque en direct
+  Clic sur une pastille ...... la prendre pour cible
+  Glisser une pastille ....... la déplacer le long d'un axe (auto X ou Y)
+  Glisser un axe du repère ... suivre cet axe
+  X / Y / Z .................. verrouiller l'axe (2e appui : auto)
+  Ctrl + glisser ............. déplacer la bulle active (sur un axe)
+  Maj + glisser .............. tourner l'image (Δ nord)
+  Page haut / bas ............ hauteur station ± pas
+  Maj + Page haut / bas ...... delta plancher ± pas
+  Glisser un point du plan ... le déplacer en X ou en Y
+  Ctrl+Z ..................... annuler
+
+FICHIERS
+  Ctrl+S ..................... « Appliquer / enregistrer » : CSV corrigé (bonnes
+                               valeurs), images orientées dans un autre dossier
+  Les corrections s'enregistrent en continu dans leur propre fichier ;
+  le CSV chargé et les images d'origine ne sont jamais modifiés.
+"""
+
+
 # Aide des boutons, par libellé (un bouton peut aussi recevoir la sienne à la création)
 BUTTON_TIPS: Dict[str, str] = {
     "Relevé CSV…": "Choisir le relevé CSV (positions, orientation, plancher).",
@@ -2553,7 +2625,8 @@ BUTTON_TIPS: Dict[str, str] = {
                                 "par lot, écrire un relevé complet corrigé.",
     "Appliquer / enregistrer…  (Ctrl+S)": "Bilan des corrections : enregistrer, tourner les "
                                           "images par lot, écrire un relevé complet corrigé.",
-    "Aide": "Raccourcis clavier et gestes.",
+    "Aide": "Raccourcis clavier et gestes (F1).",
+    "?": "Aide : tous les raccourcis clavier et gestes (F1).",
     "Quitter": "Fermer le programme (les corrections sont enregistrées).",
     "Module": "Revenir au module principal (fichiers, état, réglages).",
     "Comparer  (C)": "Ouvrir / fermer la seconde vue bulle (B), sous la première.",
@@ -2642,7 +2715,8 @@ class BubbleNavApp(_TkBase):
             max_dist=float(cfg.get('filter_dist', 0.0)),
             local=str(cfg.get('filter_local', '')),
             inter_floor=bool(cfg.get('filter_inter', True)),
-            hide_missing=bool(cfg.get('filter_hide_missing', False)))
+            hide_missing=bool(cfg.get('filter_hide_missing', False)),
+            same_local=bool(cfg.get('filter_same_local', False)))
         self.hidden_count = 0
         self.focus_idx: Optional[int] = None      # bulle décrite dans le panneau
         self.came_from: Optional[int] = None      # bulle quittée (A), pour s'y retourner
@@ -2988,10 +3062,12 @@ class BubbleNavApp(_TkBase):
                            "sans perdre les réglages."),
             ('f_floor', "Pastilles d'un plancher seulement (tous, courant, ou un plancher)."),
             ('f_dist', "Distance maximale des pastilles affichées (0 = sans limite)."),
-            ('f_local', "Locaux à garder, séparés par des virgules (préfixe ou *) : "
-                        "ex. K256, W25*"),
+            ('f_local', "Choisir un local dans la liste, ou saisir des motifs séparés "
+                        "par des virgules (préfixe ou *) : ex. K256, W25*"),
             ('f_inter', "Garder les pastilles ▲▼ vers les planchers voisins."),
             ('f_missing', "Masquer les pastilles dont l'image est absente du dossier."),
+            ('f_same_local', "Seulement les pastilles du local de la bulle courante ; le "
+                             "filtre suit la bulle quand on navigue (touche L)."),
             ('step_var', "Pas des boutons + / − (m)."),
             ('drag_axis_var', "Axe suivi par le glisser : auto (X ou Y selon le geste), "
                               "X Est, Y Nord ou Z. Touches X / Y / Z."),
@@ -3147,6 +3223,7 @@ class BubbleNavApp(_TkBase):
                         ).pack(side='right', padx=(3, 8), pady=4)
         self.fs_btn = self._mk_button(bar, "⛶", self._toggle_fullscreen)
         self.fs_btn.pack(side='right', padx=3, pady=4)
+        self._mk_button(bar, "?", self._dlg_help).pack(side='right', padx=3, pady=4)
         self._mk_button(bar, "Réglages…", self._dlg_settings).pack(side='right', padx=3, pady=4)
 
     def _build_side_panel(self, parent) -> None:
@@ -3260,6 +3337,8 @@ class BubbleNavApp(_TkBase):
             '<v>': self._show_viewer, '<V>': self._show_viewer,
             '<t>': self._toggle_all, '<T>': self._toggle_all,
             '<o>': self.look_back, '<O>': self.look_back,
+            '<l>': self._toggle_same_local, '<L>': self._toggle_same_local,
+            '<F1>': self._dlg_help, '<question>': self._dlg_help,
             '<x>': lambda: self._lock_axis('x'), '<X>': lambda: self._lock_axis('x'),
             '<y>': lambda: self._lock_axis('y'), '<Y>': lambda: self._lock_axis('y'),
             '<z>': lambda: self._lock_axis('z'), '<Z>': lambda: self._lock_axis('z'),
@@ -3360,6 +3439,8 @@ class BubbleNavApp(_TkBase):
         self.floors = sorted({s.floor for s in stations})
         self.floor_cb.config(values=self.floors)
         self.f_floor_cb.config(values=['tous', 'courant'] + self.floors)
+        self.f_local_cb.config(values=sorted({s.parts().local for s in stations
+                                              if s.parts().local}))
         self.by_photo = {s.photo: s for s in stations}
         # altitude du point de vue : plancher + delta + hauteur (avant corrections)
         apply_altimetry(stations, float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
@@ -4394,11 +4475,12 @@ class BubbleNavApp(_TkBase):
         tk.Label(row, text="Local", width=9, anchor='w', font=F_UI,
                  bg=COLORS['card'], fg=COLORS['text']).pack(side='left')
         self.f_local = tk.StringVar(value=self.filters.local)
-        ent = tk.Entry(row, textvariable=self.f_local, font=F_MONO, width=20,
-                       bg=COLORS['bg_light'], fg=COLORS['text'], relief='flat',
-                       insertbackground=COLORS['text'])
-        ent.pack(side='left')
-        ent.bind('<KeyRelease>', self._on_filter_change)
+        # liste des locaux du relevé, et saisie libre (motifs, virgules)
+        self.f_local_cb = ttk.Combobox(row, textvariable=self.f_local, width=20,
+                                       font=F_MONO, values=())
+        self.f_local_cb.pack(side='left')
+        self.f_local_cb.bind('<KeyRelease>', self._on_filter_change)
+        self.f_local_cb.bind('<<ComboboxSelected>>', self._on_local_chosen)
         tk.Label(body, text="ex. K256, W25*  — préfixe suffisant", font=F_UI,
                  bg=COLORS['card'], fg=COLORS['text_muted'], anchor='w'
                  ).pack(fill='x', padx=(70, 0))
@@ -4407,7 +4489,9 @@ class BubbleNavApp(_TkBase):
         row.pack(fill='x', pady=(2, 0))
         self.f_inter = tk.BooleanVar(value=self.filters.inter_floor)
         self.f_missing = tk.BooleanVar(value=self.filters.hide_missing)
-        for text, var in (("liens ▲▼", self.f_inter),
+        self.f_same_local = tk.BooleanVar(value=self.filters.same_local)
+        for text, var in (("local courant (L)", self.f_same_local),
+                          ("liens ▲▼", self.f_inter),
                           ("masquer images absentes", self.f_missing)):
             tk.Checkbutton(row, text=text, variable=var, command=self._on_filter_change,
                            font=F_UI, bg=COLORS['card'], fg=COLORS['text'],
@@ -4503,6 +4587,8 @@ class BubbleNavApp(_TkBase):
         self.filters.local = self.f_local.get()
         self.filters.inter_floor = bool(self.f_inter.get())
         self.filters.hide_missing = bool(self.f_missing.get())
+        self.filters.same_local = bool(self.f_same_local.get())
+        self.cfg['filter_same_local'] = self.filters.same_local
         self.cfg.update({
             'filter_active': self.filters.active, 'filter_floor': self.filters.floor_mode,
             'filter_dist': self.filters.max_dist, 'filter_local': self.filters.local,
@@ -4513,6 +4599,7 @@ class BubbleNavApp(_TkBase):
         self._draw_overlay()
         self._refresh_side()
         self._draw_plan()
+        self._redraw_compare()
 
     def _reset_filters(self) -> None:
         self.filter_var.set(False)
@@ -4521,7 +4608,30 @@ class BubbleNavApp(_TkBase):
         self.f_local.set('')
         self.f_inter.set(True)
         self.f_missing.set(False)
+        self.f_same_local.set(False)
         self._on_filter_change()
+
+    def _on_local_chosen(self, _evt=None) -> None:
+        """Un local choisi dans la liste : filtres activés sur ce seul local."""
+        self.filter_var.set(True)
+        self.f_same_local.set(False)
+        self._on_filter_change()
+        self._set_status(f"Pastilles du local {self.f_local.get()} seulement "
+                         "(Réinitialiser les filtres pour tout revoir)", COLORS['sel'])
+
+    def _toggle_same_local(self) -> None:
+        """Touche L : seulement les pastilles du local de la bulle courante."""
+        on = not (self.filters.active and self.filters.same_local)
+        if on:
+            self.filter_var.set(True)
+        self.f_same_local.set(on)
+        self._on_filter_change()
+        cur = self.station()
+        loc = (cur.parts().local or cur.locator) if cur else ''
+        self._set_status((f"Pastilles du local {loc} seulement — le filtre suit la bulle "
+                          "courante (L pour tout revoir)") if on
+                         else "Toutes les pastilles (filtre « local courant » retiré)",
+                         COLORS['sel'] if on else None)
 
     def _visible_links(self, idx: int) -> List[Link]:
         """Liens retenus par les filtres pour la bulle `idx`."""
@@ -5729,10 +5839,15 @@ class BubbleNavApp(_TkBase):
                     self.plan.create_line(cx_, cy_, x2, y2, fill=COLORS['hot'],
                                           width=1, dash=(3, 2))
 
+        cur_ = self.station()
+        focus_local = ((cur_.parts().local or cur_.locator) if cur_ is not None
+                       and self.filters.active and self.filters.same_local else None)
         for st in pts:
             x, y = to_screen(st.x, st.y)
             if -10 <= x <= w + 10 and -10 <= y <= h + 10:
-                if not self.store.has(st.photo):
+                if focus_local is not None and (st.parts().local or st.locator) != focus_local:
+                    col = '#3a3a3a'               # autre local : estompé
+                elif not self.store.has(st.photo):
                     col = COLORS['plan_missing']
                 elif self.cfg.get('color_mode', 'local') == 'local':
                     col = local_color(st.parts().local or st.floor)
@@ -6349,62 +6464,35 @@ class BubbleNavApp(_TkBase):
                                ('\n…' if len(self.warnings) > 40 else ''))
 
     def _dlg_help(self) -> None:
-        messagebox.showinfo(f"{APP_NAME} v{__version__}", parent=self._dialog_parent(),
-                            message=(
-            "NAVIGATION\n"
-            "  • Clic sur une pastille  : aller sur cette bulle\n"
-            "  • Glisser                : tourner la vue\n"
-            "  • Molette / + −          : champ de vision\n"
-            "  • Double-clic            : recentrer la vue\n"
-            "  • Entrée ou Espace       : avancer vers la pastille centrale\n"
-            "  • Retour arrière         : revenir à la bulle précédente\n"
-            "  • Ctrl+Z                 : annuler la dernière opération (navigation,\n"
-            "                             correction, bulle ouverte en B)\n"
-            "  • T                      : toutes les pastilles, sans élagage\n"
-            "  • O                      : regarder d'où l'on vient\n"
-            "  • Clic droit (pastille)  : ouvrir dans l'autre vue\n"
-            "  • Flèches                : tourner (Maj = pas large)\n"
-            "  • Origine (Home)         : redresser la vue\n"
-            "  • F11 / Échap            : plein écran\n\n"
-            "COMPARAISON  (touche C)\n"
-            "  • Seconde vue bulle dans sa propre fenêtre\n"
-            "  • « Vue liée » : les deux vues regardent la même direction terrain,\n"
-            "    tourner ou zoomer d'un côté agit sur les deux\n"
-            "  • « Suivi de A » : la vue B se place automatiquement sur le même\n"
-            "    local à un autre plancher, ou sur la bulle la plus proche\n"
-            "  • « A → B » recopie la bulle courante · « ⇄ » échange les deux vues\n"
-            "  • Les pastilles de B restent cliquables pour s'y déplacer seul\n"
-            "  • Clic droit sur une pastille : l'ouvrir dans l'autre vue\n"
-            "    (A → B, en ouvrant la comparaison au besoin ; B → A)\n\n"
-            "PLAN\n"
-            "  • Clic gauche            : aller sur la bulle la plus proche\n"
-            "  • Molette                : zoom · clic droit glissé : déplacer\n"
-            "  • Clic droit sur un point : l'ouvrir dans la vue B\n"
-            "  • Liste « Plancher »     : changer de niveau (bulle la plus proche)\n\n"
-            "PASTILLES\n"
-            "  jaune = même plancher · bleu ▲ = niveau au-dessus\n"
-            "  violet ▼ = niveau en dessous · rouge sombre = image absente\n\n"
-            "ÉDITION  (touche E) — rien n'est modifié sur le disque en direct\n"
-            "  • Cible = bulle active, ou pastille cliquée\n"
-            "  • Maj + glisser dans la vue : tourner l'image sous les pastilles.\n"
-            "    L'angle est une DONNÉE, écrite dans le FICHIER DE CORRECTIONS\n"
-            "    (relevé_corrections.csv) et appliquée à l'affichage. Le relevé\n"
-            "    chargé et les images d'origine ne sont jamais modifiés.\n"
-            "  • Glisser une pastille : la déplacer au sol (azimut + éloignement)\n"
-            "  • Ctrl + glisser : déplacer la bulle active elle-même\n"
-            "  • Glisser un point du plan : position X/Y en vue de dessus\n"
-            "  • Champs X/Y/Z, pas réglable, Page haut/bas pour l'altitude\n"
-            "  • Corrections enregistrées en continu dans leur propre fichier ;\n"
-            "    « Fichier… » permet d'en reprendre un autre\n"
-            "  • Ctrl+Z annule · « Réinit. » revient aux valeurs du relevé\n"
-            "  • « Appliquer / enregistrer… » (Ctrl+S) : bilan, puis rotation des\n"
-            "    images dans un NOUVEAU dossier (Δ nord alors remis à 0) et, en\n"
-            "    option, écriture d'un relevé complet corrigé\n"
-            "  • Les croix bleues sont les bulles voisines non retenues comme\n"
-            "    pastilles : elles servent de repères pour juger l'orientation\n\n"
-            "Si les pastilles ne tombent pas au bon endroit, ouvrez « Réglages… »\n"
-            "et ajustez la calibration de l'azimut (effet immédiat)."
-        ))
+        """Aide (F1 ou ?) : tous les raccourcis, dans une fenêtre qui défile."""
+        old = getattr(self, '_help_win', None)
+        if old is not None and old.winfo_exists():
+            old.lift()
+            old.focus_force()
+            return
+        win = tk.Toplevel(self)
+        self._help_win = win
+        win.title(f"{APP_NAME} v{__version__} — raccourcis")
+        win.configure(bg=COLORS['bg_dark'])
+        self._attach_dialog(win)
+        body = tk.Frame(win, bg=COLORS['bg_dark'])
+        body.pack(fill='both', expand=True, padx=10, pady=(10, 4))
+        sb = tk.Scrollbar(body)
+        sb.pack(side='right', fill='y')
+        txt = tk.Text(body, width=78, height=34, font=F_MONO, bg=COLORS['card'],
+                      fg=COLORS['text'], relief='flat', wrap='none', yscrollcommand=sb.set,
+                      padx=10, pady=8)
+        txt.pack(side='left', fill='both', expand=True)
+        sb.config(command=txt.yview)
+        txt.tag_configure('titre', foreground=COLORS['accent'], font=F_UI_B)
+        for line in HELP_TEXT.splitlines():
+            txt.insert('end', line + '\n', 'titre' if line.isupper() or line.startswith(
+                ('NAVIGATION', 'AFFICHAGE', 'COMPARAISON', 'PLAN', 'ÉDITION', 'FICHIERS'))
+                else ())
+        txt.config(state='disabled')
+        self._mk_button(win, "Fermer", win.destroy, bg=COLORS['accent']
+                        ).pack(anchor='e', padx=10, pady=(0, 10))
+        win.bind('<Escape>', lambda e: win.destroy())
 
     # ═════════════════════════════════════════════════════════════════
     # FERMETURE
