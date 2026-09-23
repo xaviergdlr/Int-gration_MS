@@ -285,6 +285,8 @@ class NameParts:
     index: str = ''
     reste: Tuple[str, ...] = ()
     reconnu: bool = False
+    niveau_local: str = ''   # niveau selon le n° du local : chiffre des centaines
+    etage_deduit: bool = False   # étage tiré du n° de local faute de plancher
 
     def date_lisible(self) -> str:
         d = self.date
@@ -447,6 +449,16 @@ class Station:
                               self.floor, re.I)
                 if m:
                     base = dataclasses.replace(base, etage=m.group(1))
+            # Niveau d'après le numéro du local (R712 -> 7, K058 -> 0). Il sert
+            # de repli quand le plancher n'est pas renseigné ; sinon le plancher
+            # fait foi (un local peut s'étendre sur le niveau supérieur).
+            if base.local:
+                m = re.search(r'(\d{3,})', base.local)
+                if m:
+                    niveau = f"{int(m.group(1)) // 100:02d}"
+                    base = dataclasses.replace(base, niveau_local=niveau)
+                    if not base.etage:
+                        base = dataclasses.replace(base, etage=niveau, etage_deduit=True)
             if base.local and base.index:
                 base = dataclasses.replace(base, reconnu=True)
             if self.attrs:
@@ -746,6 +758,40 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
     if not stations:
         raise ValueError("Aucune station exploitable dans le CSV.")
     return stations, warns
+
+
+def floor_z_ranges(stations: Sequence[Station]) -> Dict[str, Tuple[float, float]]:
+    """Plage d'altitudes observée par étage, d'après les planchers renseignés."""
+    zs: Dict[str, List[float]] = defaultdict(list)
+    for st in stations:
+        p = st.parts()
+        if p.etage and not p.etage_deduit:
+            zs[p.etage.zfill(2)].append(st.z)
+    return {e: (min(v), max(v)) for e, v in zs.items() if v}
+
+
+def check_floor_coherence(stations: Sequence[Station], tol: float = 1.0
+                          ) -> Dict[int, str]:
+    """Bulles dont l'étage, déduit du numéro de local, contredit l'altitude.
+
+    Retourne {index de station: explication}. Ne modifie rien : c'est un
+    signalement, la donnée source doit être vérifiée.
+    """
+    plages = floor_z_ranges(stations)
+    out: Dict[int, str] = {}
+    for st in stations:
+        p = st.parts()
+        if not p.etage_deduit:
+            continue
+        plage = plages.get(p.etage.zfill(2))
+        if plage is None:
+            out[st.idx] = (f"étage {p.etage} déduit du local {p.local}, "
+                           f"mais aucun plancher {p.etage} dans le relevé")
+        elif not (plage[0] - tol <= st.z <= plage[1] + tol):
+            out[st.idx] = (f"étage {p.etage} déduit du local {p.local}, mais Z "
+                           f"{st.z:.2f} hors de la plage de ce plancher "
+                           f"({plage[0]:.2f} … {plage[1]:.2f})")
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2102,6 +2148,7 @@ class BubbleNavApp(_TkBase):
         self.by_photo: Dict[str, Station] = {}
         self.by_key: Dict[str, Station] = {}
         self.csv_mapping: Optional[Dict[str, str]] = None   # correspondance imposee
+        self.incoherences: Dict[int, str] = {}     # étage déduit contredit par Z
         self.selected: Optional[int] = None      # bulle en cours de modification
         self._hs_drag = None                     # (idx station, dz, mode)
         self._sync_ui = False                    # garde anti-boucle des widgets
@@ -2678,7 +2725,17 @@ class BubbleNavApp(_TkBase):
         msg = f"{len(stations)} bulles · {len(self.floors)} planchers · {os.path.basename(path)}"
         if warns:
             msg += f" · {len(warns)} ligne(s) ignorée(s)"
-        anomalies = sum(1 for st in stations if st.parts().anomalies())
+        self.incoherences = check_floor_coherence(stations)
+        deduits = sum(1 for st in stations if st.parts().etage_deduit)
+        if deduits:
+            msg += f" · {deduits} étage(s) déduit(s) du n° de local"
+        if self.incoherences:
+            msg += f" · ⚠ {len(self.incoherences)} incohérence(s) étage / Z"
+            locs = sorted({stations[i].parts().local for i in self.incoherences})
+            warns.append(f"{len(self.incoherences)} bulle(s) à l'étage déduit du local "
+                         f"incohérent avec leur altitude : {', '.join(locs)}")
+        anomalies = sum(1 for st in stations
+                        if [a for a in st.parts().anomalies() if a != 'date'])
         if anomalies:
             msg += f" · {anomalies} nom(s) incomplet(s)"
         msg += corr_msg
@@ -3556,9 +3613,15 @@ class BubbleNavApp(_TkBase):
         if repere:
             lignes.append(f"repère   {repere}")
         detail = ' · '.join(f"{k} {v}" for k, v in (
-            ('étage', p.etage), ('local', p.local), ('index', p.index)) if v)
+            ('étage', p.etage + (' (déduit du local)' if p.etage_deduit else '')),
+            ('local', p.local), ('index', p.index)) if v and not v.startswith(' '))
         if detail:
             lignes.append(detail)
+        if p.niveau_local and not p.etage_deduit and p.etage \
+                and p.niveau_local != p.etage.zfill(2):
+            lignes.append(f"local du niveau {p.niveau_local}, sur le plancher {p.etage}")
+        if st.idx in getattr(self, 'incoherences', {}):
+            lignes.append("⚠ " + self.incoherences[st.idx])
         if p.date_lisible():
             lignes.append(f"prise de vue {p.date_lisible()}")
         manque = p.anomalies()
@@ -5760,7 +5823,8 @@ def selftest(csv_path: str = '') -> int:
         ok_names = sum(1 for st in sts if st.parts().reconnu)
         coherent = sum(1 for st in sts
                        if st.parts().locator() == st.locator
-                       and st.parts().etage in st.floor.replace('PLANCHER ', '')[:2])
+                       and (st.parts().etage_deduit
+                            or st.parts().etage in st.floor.replace('PLANCHER ', '')[:2]))
         check("noms reconnus sur le relevé", ok_names == len(sts),
               f"{ok_names}/{len(sts)}")
         check("locator et étage cohérents avec le nom", coherent == len(sts),
@@ -6044,6 +6108,42 @@ def selftest(csv_path: str = '') -> int:
               n5 == 1 and _read_text(out5).splitlines()[1] == "0347;1.500;2.000;3.000")
     finally:
         _sh3.rmtree(tmp3, ignore_errors=True)
+
+    # 13. Étage déduit du numéro de local
+    print("\n13) Étage déduit du numéro de local")
+    import tempfile as _tf4
+    import shutil as _sh4
+    tmp4 = _tf4.mkdtemp(prefix='bubblenav_etage_')
+    try:
+        c = os.path.join(tmp4, 'etages.csv')
+        with open(c, 'w', encoding='utf-8-sig', newline='') as fh:
+            fh.write("Num scan;Nom du Locator;X;Y;Z;% NORD;Plancher\r\n"
+                     "1;R110b_01;0;0;-1.85;50;PLANCHER 01 (-03.50m)\r\n"
+                     "2;R110b_02;1;0;-1.85;50;PLANCHER 01 (-03.50m)\r\n"
+                     "3;R712_01;0;0;21.65;50;PLANCHER 07 (+20.00m)\r\n"
+                     "4;R732_01;0;5;27.65;50;PLANCHER 08 (+24.00m)\r\n"
+                     "5;R715_01;3;0;21.65;50;\r\n"
+                     "6;R712_09;0;9;-6.85;50;\r\n"
+                     "7;R910_01;5;5;-7.15;50;\r\n"
+                     "8;SAP_01;6;6;9.65;50;\r\n")
+        e, _ = read_survey_csv(c)
+        pe = [x.parts() for x in e]
+        check("plancher renseigné prioritaire", pe[0].etage == '01' and not pe[0].etage_deduit)
+        check("local sur deux niveaux signalé (R732 au plancher 08)",
+              pe[3].etage == '08' and pe[3].niveau_local == '07')
+        check("plancher vide : étage déduit du chiffre des centaines",
+              pe[4].etage == '07' and pe[4].etage_deduit, f"R715 → {pe[4].etage}")
+        check("local sans numéro à 3 chiffres : pas de déduction", pe[7].etage == '')
+        inc = check_floor_coherence(e)
+        check("étage déduit cohérent avec Z : aucun signalement", 4 not in inc)
+        check("étage déduit contredit par Z : signalé", 5 in inc and 'hors de la plage' in inc[5],
+              inc.get(5, ''))
+        check("étage déduit sans plancher correspondant : signalé",
+              6 in inc and 'aucun plancher 09' in inc[6], inc.get(6, ''))
+        check("filtre plancher inchangé : les bulles sans plancher restent groupées",
+              e[5].floor == e[6].floor == '—')
+    finally:
+        _sh4.rmtree(tmp4, ignore_errors=True)
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))

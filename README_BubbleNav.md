@@ -55,6 +55,16 @@ d'intitulés (`N° scan`, `Numéro de scan`, `Scan`, `Est`, `Nord`, `Altitude`�
 * **Local, index et étage** se déduisent alors du locator (`R110b_01` → local
   R110b, index 01) et du plancher (`PLANCHER 01 (-03.50m)` → étage 01) : filtres
   et fiche restent complets sans nom projeté.
+* **Plancher non renseigné ?** L'étage est déduit du **chiffre des centaines du
+  numéro de local** (`R712` → 07, `K058` → 00), et marqué « déduit du local ».
+  Le plancher renseigné reste prioritaire : un local peut déborder sur le niveau
+  supérieur (R732 au plancher 08) ou traverser les niveaux (gaines, escaliers),
+  la fiche l'indique alors (« local du niveau 07, sur le plancher 08 »).
+* **Contrôle de cohérence** : un étage déduit est confronté à l'altitude des
+  bulles de ce plancher. S'il la contredit, ou si ce plancher n'existe pas dans
+  le relevé, la bulle est signalée (⚠ dans la fiche, décompte dans la barre
+  d'état, liste des locaux dans les avertissements). Rien n'est corrigé
+  d'office : c'est la donnée source qu'il faut vérifier.
 * **Pas de ligne d'en-tête ?** L'outil le détecte et propose une correspondance
   devinée (1re colonne = identifiant, puis X, Y, Z) à confirmer.
 * **Intitulés inconnus ?** Une boîte « Colonnes du CSV » montre les premières
@@ -406,7 +416,8 @@ plancher le déplaçant, relevé complet mis à jour par composante, ancien form
 le mode num scan (clé immuable, nom projeté, attributs explicites, rattachement des
 photos par numéro, corrections retrouvées après renommage), la lecture souple (N° scan sans colonne
 photo, intitulés variés, fichier sans en-tête, intitulés inconnus, relevé corrigé
-réécrit au même format), la précision du micromètre, l'aller-retour du fichier
+réécrit au même format), l'étage déduit du numéro de local et son contrôle
+de cohérence avec Z, la précision du micromètre, l'aller-retour du fichier
 de corrections (écriture, relecture, ligne orpheline,
 date d'application) avec relevé source inchangé octet pour octet, l'écriture du relevé
 complet corrigé (colonne Δ nord créée puis réutilisée, seules les lignes modifiées
