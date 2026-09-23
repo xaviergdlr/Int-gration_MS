@@ -123,6 +123,8 @@ relevé déjà renommé.
 | Double-clic | recentrer la vue sur ce point |
 | `Entrée` / `Espace` | avancer vers la pastille la plus centrale |
 | `Retour arrière` | revenir à la bulle précédente |
+| **`Ctrl+Z`** | **annuler la dernière opération**, quelle qu'elle soit : entrée dans une bulle (retour à la bulle quittée, avec le même cap, site et champ), correction, bulle ouverte dans la vue B |
+| `T` | **toutes les pastilles** : toutes les bulles à portée, sans limite de nombre ni tri par direction (T de nouveau pour revenir) |
 | Flèches (`Maj` = pas large) | tourner |
 | `Origine` | redresser la vue |
 | `F11` / `Échap` | plein écran |
@@ -160,12 +162,49 @@ La liste « Plancher » change de niveau en rejoignant la bulle la plus proche �
 violet ▼ = niveau en dessous · rouge sombre = image absente du dossier · orange =
 bulle corrigée.
 
-**Étiquettes des pastilles** (bouton « Étiquettes ▾ », chaque ligne se coche à
+**Infobulles** : chaque bouton, liste, curseur ou case affiche son aide après un
+court survol.
+
+**Voir toutes les pastilles** : par défaut, le réseau est **élagué** pour rester
+lisible. Il garde 8 pastilles au plus, à moins de 12 m, et **une seule par
+direction** (25°) : dans un couloir, seule la plus proche des bulles alignées
+apparaît. De plus, la vue ne montre que son champ (105°), soit environ un
+tiers du tour. Pour tout voir :
+* touche **T**, ou menu « Affichage ▾ » → *Toutes les pastilles* : toutes les
+  bulles à portée, sans limite ni tri. Sur GRA6, on passe par exemple de 10 à
+  53 pastilles autour d'une même bulle ;
+* ou **Réglages… → Réseau** : séparation angulaire à 0°, « Pastilles max »
+  (jusqu'à 40), portée. L'effet est immédiat, le nombre de liens s'affiche dans
+  la barre d'état.
+
+**Hauteur des pastilles** (menu « Affichage ▾ ») :
+* **au sol** (par défaut) : la pastille se pose sur le sol de la bulle cible,
+  c'est-à-dire **plancher + Δ = Z − H** ;
+* **au point de vue** : la sphère est à la hauteur de l'appareil (**Z**), et un
+  **mât** la relie à son pied au sol. On lit ainsi H d'un coup d'œil.
+
+Le modèle d'altitude est **Z = plancher + H + Δ**. Quand le relevé n'a pas de
+colonne delta, **Δ est déduit** de l'altitude écrite dans le libellé du plancher
+(« PLANCHER 02 (+00.00m) ») : Δ = Z − plancher − H. H est la colonne
+« H appareil », ou à défaut la **hauteur instrument** des Réglages (1,65 m).
+
+Sur GRA6, 543 bulles sur 693 ont Δ = 0. Les autres ont un Δ de −1,90 m à
++3,60 m : marches, mezzanines, ou bien une erreur de Z. Une pastille qui semble
+« trop haute » ou « trop basse » par rapport au sol de la photo révèle
+justement un de ces Δ. La fiche et les lignes H / Δ / Z sous la pastille le
+montrent :
+
+```
+sol      plancher -8.50 + Δ -0.45 = -8.95
+caméra   sol + H 1.65 = -7.30 (point de vue)
+```
+
+**Étiquettes des pastilles** (menu « Affichage ▾ », chaque ligne se coche à
 part, le choix est mémorisé et vaut aussi pour la vue B) :
 * **au-dessus** : le **nom de la station**, en petit ;
 * **dessous** : la **distance**, puis trois lignes discrètes :
   * `H` : **hauteur de l'appareil** (hauteur du relevé + correction) ;
-  * `Δ` : **delta plancher** (delta du relevé + correction) ;
+  * `Δ` : **delta plancher** (colonne du relevé, ou déduit du plancher, + correction) ;
   * `Z` : **altitude finale du point de vue** (Z caméra = plancher + H + Δ).
 
 Ces valeurs sont relues à chaque image : toute correction, au clavier, par
@@ -252,14 +291,24 @@ recharger les images :
   redressée nord au centre) ou azimut visé par le centre de l'image ;
 * **Sens des azimuts** : horaire (standard) ou anti-horaire si l'image est en miroir ;
 * **Correction nord** : décalage global en degrés ;
-* **Hauteur caméra** : hauteur de prise de vue au-dessus du sol (1,65 m par défaut),
-  elle fixe la hauteur à laquelle les pastilles se posent.
+* **Hauteur instrument** : hauteur de l'appareil au-dessus du sol (1,65 m par
+  défaut), pour les bulles sans colonne « H appareil ». Elle fixe le sol
+  (Z − H), donc la hauteur des pastilles, et le Δ déduit du plancher. L'effet
+  est immédiat dans les deux vues.
+
+Les dialogues (Réglages, bilan…) s'ouvrent **devant le visualiseur**, même en
+plein écran.
 
 Section *Réseau* : portée des liens, nombre maximal de pastilles, séparation angulaire
 minimale (une seule pastille par direction, pour ne pas empiler les bulles alignées) et
 portée des liaisons entre planchers.
 
 ## 5. Comparer deux points de vue  (touche C)
+
+Sur le plan, la vue B a toujours son repère cyan et son cône. Si B est sur un
+autre plancher que celui affiché, son repère devient un cercle pointillé
+marqué « B · PLANCHER nn ».
+
 
 Le bouton « Comparer » ouvre une **seconde vue bulle**, empilée sous la
 première dans le visualiseur (séparation glissante, bouton ✕ pour la refermer).
@@ -370,8 +419,18 @@ cible). Le bouton « Bulle active » revient à la première.
 En mode édition, la cible porte un **repère XYZ** : X Est en rouge, Y Nord en
 vert, Z en bleu. Il est centré sur sa **position d'origine du CSV**. Les axes
 sont **gradués** (5 cm à 1 m selon la distance, point plus gros au mètre).
-Pour une pastille, l'axe Z monte jusqu'à la caméra de la station. Un trait
-orange pointillé relie l'origine à la position actuelle. En bas de la vue, une
+Pour une pastille, l'axe Z monte jusqu'à la caméra de la station.
+
+Dès que la cible a bougé :
+* une **pastille fantôme**, semi-transparente, reste à sa position d'origine
+  (« origine CSV ») ;
+* le déplacement est **décomposé** : un segment rouge ΔX, puis un vert ΔY
+  (puis un bleu ΔZ), chacun avec sa valeur au millimètre. Un fin pointillé
+  orange trace la résultante ;
+* **sur le plan**, un cercle pointillé marque l'origine, et deux segments
+  donnent les composantes ΔX et ΔY avec leurs valeurs.
+
+En bas de la vue, une
 ligne donne le déplacement depuis le CSV, axe par axe : ΔX, ΔY, ΔH (hauteur
 station), ΔΔ (delta plancher), avec la valeur du geste en cours.
 
@@ -434,7 +493,9 @@ tourner, fichiers concernés) et propose deux traitements par lot :
 Tant que le lot n'est pas lancé, tout reste réversible.
 
 ### Filet de sécurité
-* **Ctrl+Z** annule ; un glisser complet compte pour une seule étape ;
+* **Ctrl+Z** annule la dernière opération, correction ou navigation, dans
+  l'ordre inverse. Un glisser complet compte pour une seule étape, et un simple
+  clic de sélection n'en crée aucune ;
 * « Réinit. cible » et « Réinit. tout » ramènent aux valeurs du relevé ;
 * une ligne du fichier de corrections dont la photo n'existe pas dans le relevé
   est signalée et ignorée, jamais bloquante.

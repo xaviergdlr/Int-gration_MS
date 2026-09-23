@@ -42,7 +42,7 @@ import unicodedata
 from bisect import insort
 from collections import OrderedDict, defaultdict
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -230,6 +230,8 @@ DEFAULT_CONFIG = {
     'plan_links': 'squelette',       # réseau du plan : 'squelette' | 'complet' | 'aucun'
     'drag_axis': 'auto',             # axe du glisser en édition : 'auto' | 'x' | 'y' | 'z'
     'drag_z': 'ddelta',              # l'axe Z agit sur 'ddelta' (sol + caméra) ou 'dh'
+    'hotspot_anchor': 'sol',         # pastille au 'sol' ou au point de 'vue' (mât)
+    'all_hotspots': False,           # toutes les bulles à portée, sans élagage
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
 
@@ -396,6 +398,8 @@ class Station:
     #   ddelta : correction « delta plancher »   -> camera ET sol bougent
     h0: Optional[float] = None
     delta0: float = 0.0
+    delta_col: bool = False     # True si le delta vient d'une colonne du CSV
+    floor_alt: Optional[float] = None   # altitude du plancher lue dans son libellé
     dh: float = 0.0
     ddelta: float = 0.0
     key: str = ''          # cle immuable (numero de scan) ; = photo si absente
@@ -412,8 +416,15 @@ class Station:
         """Altitude du sol sous la station (là où se pose la pastille)."""
         return self.z - self.height(eye)
 
-    def delta(self) -> float:
-        """Décalage du sol local par rapport au plancher, correction comprise."""
+    def delta(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
+        """Décalage du sol local par rapport au plancher, correction comprise.
+
+        Sans colonne delta dans le relevé, il se déduit du modèle
+        Z caméra = altitude du plancher + hauteur appareil + delta, avec
+        l'altitude lue dans le libellé du plancher (« PLANCHER 02 (+00.00m) »).
+        """
+        if not self.delta_col and self.floor_alt is not None:
+            return self.z - self.floor_alt - self.height(eye)
         return self.delta0 + self.ddelta
 
     def moved(self, tol: float = 1e-4) -> bool:
@@ -733,7 +744,8 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
             north = 50.0
         dnord = parse_float(cell(row, 'dnord')) or 0.0
         h0 = parse_float(cell(row, 'hcam'))
-        delta0 = parse_float(cell(row, 'delta')) or 0.0
+        delta_val = parse_float(cell(row, 'delta'))
+        delta0 = delta_val or 0.0
         cle = cell(row, 'key') or photo
         target = base_name(cell(row, 'target')) if cell(row, 'target') else ''
         attrs = {k: cell(row, k) for k in ('local', 'etage', 'date', 'index')
@@ -763,12 +775,22 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
             yaw_fix=wrap180(dnord),
             ox=x, oy=y, oz=zv, oyaw=wrap180(dnord),
             key=cle, target=target, attrs=attrs, key_explicit='key' in col,
-            h0=h0, delta0=delta0,
+            h0=h0, delta0=delta0, delta_col=delta_val is not None,
+            floor_alt=floor_altitude(cell(row, 'floor')),
         ))
 
     if not stations:
         raise ValueError("Aucune station exploitable dans le CSV.")
     return stations, warns
+
+
+_FLOOR_ALT_RE = re.compile(r'\(\s*([+-]?\d+(?:[.,]\d+)?)\s*m?\s*\)')
+
+
+def floor_altitude(label: str) -> Optional[float]:
+    """Altitude d'un plancher d'après son libellé : « PLANCHER 02 (+00.00m) » → 0.0."""
+    m = _FLOOR_ALT_RE.search(label or '')
+    return float(m.group(1).replace(',', '.')) if m else None
 
 
 def floor_z_ranges(stations: Sequence[Station]) -> Dict[str, Tuple[float, float]]:
@@ -1298,6 +1320,7 @@ class Corrections:
         self.applied: Dict[str, str] = {}   # photo -> date de rotation des images
         self.dirty = False
         self._undo: List[Tuple[str, dict]] = []
+        self.on_record = None     # appelé à chaque étape annulable (journal commun)
         self._lock = threading.RLock()
 
     @classmethod
@@ -1335,6 +1358,8 @@ class Corrections:
             with self._lock:
                 self._undo.append((st.photo, self.snapshot(st)))
                 del self._undo[:-500]
+            if self.on_record is not None:
+                self.on_record()
         if x is not None:
             st.x = float(x)
         if y is not None:
@@ -1361,6 +1386,15 @@ class Corrections:
 
     def can_undo(self) -> bool:
         return bool(self._undo)
+
+    def drop_if_unchanged(self, st: Station) -> bool:
+        """Retire la dernière étape si le geste n'a rien changé (clic sans glisser)."""
+        with self._lock:
+            if self._undo and self._undo[-1][0] == st.photo \
+                    and self._undo[-1][1] == self.snapshot(st):
+                self._undo.pop()
+                return True
+        return False
 
     def revert(self, st: Station) -> None:
         """Retour aux valeurs du relevé d'origine."""
@@ -1415,7 +1449,7 @@ class Corrections:
                 f"{st.x - st.ox:+.6f}", f"{st.y - st.oy:+.6f}",
                 f"{st.dh:+.6f}", f"{st.ddelta:+.6f}", f"{st.z - st.oz:+.6f}",
                 f"{st.yaw_fix:.4f}",
-                f"{st.height(self.eye):.6f}", f"{st.delta():+.6f}",
+                f"{st.height(self.eye):.6f}", f"{st.delta(self.eye):+.6f}",
                 self.applied.get(st.key, ''), stamp)))
         tmp = self.path + '.tmp'
         try:
@@ -1585,7 +1619,7 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
         if 'hcam' in col:
             out.append(('hcam', st.height(eye)))
         if 'delta' in col:
-            out.append(('delta', st.delta()))
+            out.append(('delta', st.delta(eye)))
         return out
 
     need_yaw = (any(st.has_yaw() or st.turned() for st in stations)
@@ -2082,11 +2116,16 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
                      idx: int, view: View, calib: Calib, filters: HotspotFilter,
                      has_image, eye: float = EYE_HEIGHT_DEFAULT,
                      disc: float = DISC_RADIUS_M, r_min: float = DISC_PX_MIN,
-                     r_max: float = DISC_PX_MAX) -> Tuple[List["Hotspot"], int]:
+                     r_max: float = DISC_PX_MAX, anchor: str = 'sol'
+                     ) -> Tuple[List["Hotspot"], int]:
     """Pastilles projetées dans une vue, filtres compris.
 
     Fonction partagée par la vue principale et la vue de comparaison : les deux
     obtiennent exactement la même géométrie.
+
+    `anchor` : 'sol' pose la pastille au sol de la cible (plancher + delta) ;
+    'vue' la place au point de vue (sol + hauteur appareil), le pied du mât
+    restant au sol.
 
     Retourne (pastilles du plus loin au plus près, nombre de pastilles masquées).
     """
@@ -2101,10 +2140,22 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
     out: List[Hotspot] = []
     for lk in retenus:
         tgt = stations[lk.target]
-        dz = tgt.ground(eye) - st.z        # pastille posée au sol de la cible
         dh = lk.dist_h
-        elev = math.degrees(math.atan2(dz, dh)) if dh > 1e-6 else (90.0 if dz > 0 else -90.0)
-        pr = project(view, calib.pano_yaw(lk.azimuth, st.north_pct), elev)
+        psi = calib.pano_yaw(lk.azimuth, st.north_pct)
+
+        def at(dz: float):
+            elev = (math.degrees(math.atan2(dz, dh)) if dh > 1e-6
+                    else (90.0 if dz > 0 else -90.0))
+            return project(view, psi, elev)
+
+        sol = at(tgt.ground(eye) - st.z)          # sol de la cible : plancher + delta
+        foot = None
+        if anchor == 'vue':
+            pr = at(tgt.z - st.z)                 # point de vue : sol + hauteur appareil
+            if sol is not None:
+                foot = (sol[0], sol[1])
+        else:
+            pr = sol
         if pr is None:
             continue
         col, row, _ = pr
@@ -2112,7 +2163,7 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
             continue
         # rayon a l'ecran = focale x rayon physique / distance, borne des deux cotes
         radius = clamp(f * disc / max(lk.dist, 0.35), r_min, r_max)
-        out.append(Hotspot(lk, col, row, radius, tgt.locator))
+        out.append(Hotspot(lk, col, row, radius, tgt.locator, foot))
     out.sort(key=lambda h: -h.link.dist)     # les plus lointaines dessinees d'abord
     return out, masques
 
@@ -2224,6 +2275,113 @@ def hotspot_hit(hotspots: Sequence["Hotspot"], x: float, y: float,
     return best
 
 
+class Tooltip:
+    """Infobulle d'aide : apparaît après un court survol, disparaît au départ.
+
+    Une seule fenêtre par widget, créée à la demande ; aucun effet sur les
+    liaisons existantes (ajout avec add='+').
+    """
+    DELAY_MS = 450
+
+    def __init__(self, widget, text: str):
+        self.widget, self.text = widget, text
+        self._job = None
+        self._win = None
+        widget._bn_tip = text
+        widget.bind('<Enter>', self._schedule, add='+')
+        widget.bind('<Leave>', self._hide, add='+')
+        widget.bind('<ButtonPress>', self._hide, add='+')
+
+    def _schedule(self, _e=None) -> None:
+        self._cancel()
+        self._job = self.widget.after(self.DELAY_MS, self._show)
+
+    def _cancel(self) -> None:
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _show(self) -> None:
+        self._job = None
+        if self._win is not None or not self.text:
+            return
+        try:
+            x, y = self.widget.winfo_pointerxy()
+            win = tk.Toplevel(self.widget)
+            win.wm_overrideredirect(True)
+            win.attributes('-topmost', True)
+            tk.Label(win, text=self.text, justify='left', font=F_UI, wraplength=380,
+                     bg='#fff8dc', fg='#202020', relief='solid', bd=1, padx=6, pady=3
+                     ).pack()
+            win.update_idletasks()
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+            win.geometry(f"+{max(0, min(x + 14, sw - w - 4))}+{max(0, min(y + 18, sh - h - 4))}")
+            self._win = win
+        except Exception:
+            self._win = None
+
+    def _hide(self, _e=None) -> None:
+        self._cancel()
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+            self._win = None
+
+
+# Aide des boutons, par libellé (un bouton peut aussi recevoir la sienne à la création)
+BUTTON_TIPS: Dict[str, str] = {
+    "Relevé CSV…": "Choisir le relevé CSV (positions, orientation, plancher).",
+    "Dossier images…": "Choisir le dossier des images bulles (JPEG équirectangulaires).",
+    "Corrections…": "Choisir le fichier de corrections (séparé du relevé, jamais écrasé).",
+    "Ouvrir le visualiseur  (V)": "Afficher la fenêtre des vues bulle, du plan et des outils.",
+    "Réglages…": "Calibration du nord, hauteur instrument, taille des pastilles, "
+                 "réseau (portée, nombre, séparation), mémoire.",
+    "Appliquer / enregistrer…": "Bilan des corrections : enregistrer, tourner les images "
+                                "par lot, écrire un relevé complet corrigé.",
+    "Appliquer / enregistrer…  (Ctrl+S)": "Bilan des corrections : enregistrer, tourner les "
+                                          "images par lot, écrire un relevé complet corrigé.",
+    "Aide": "Raccourcis clavier et gestes.",
+    "Quitter": "Fermer le programme (les corrections sont enregistrées).",
+    "Module": "Revenir au module principal (fichiers, état, réglages).",
+    "Comparer  (C)": "Ouvrir / fermer la seconde vue bulle (B), sous la première.",
+    "Édition  (E)": "Mode édition : orientation, position XY, hauteur station, delta "
+                    "plancher. Rien n'est écrit dans les images.",
+    "✕": "Masquer le visualiseur (touche V pour le rouvrir).",
+    "⛶": "Plein écran (F11), Échap pour en sortir.",
+    "Recadrer": "Recadrer le plan sur tout le plancher affiché.",
+    "◀ Retour": "Revenir à la bulle précédente (Retour arrière, ou Ctrl+Z).",
+    "▸": "Déplier / replier les réglages de filtre.",
+    "Réinitialiser les filtres": "Remettre tous les filtres à zéro.",
+    "Bulle active": "Prendre la bulle affichée comme cible d'édition.",
+    "−": "Diminuer d'un pas (liste « pas ») la valeur de cette ligne.",
+    "+": "Augmenter d'un pas (liste « pas ») la valeur de cette ligne.",
+    "Appliquer les valeurs saisies": "Appliquer X, Y, hauteur station et delta saisis "
+                                     "(Entrée dans un champ fait de même).",
+    "−0,5°": "Tourner l'image de −0,5° (correction Δ nord).",
+    "−0,05°": "Tourner l'image de −0,05° (correction Δ nord).",
+    "+0,05°": "Tourner l'image de +0,05° (correction Δ nord).",
+    "+0,5°": "Tourner l'image de +0,5° (correction Δ nord).",
+    "ce plancher": "Appliquer le Δ nord de cette bulle à tout son plancher.",
+    "tout le relevé": "Appliquer le Δ nord de cette bulle à tout le relevé.",
+    "Fichier…": "Choisir un autre fichier de corrections.",
+    "Annuler (Ctrl+Z)": "Annuler la dernière opération : correction ou déplacement "
+                        "d'une bulle à l'autre.",
+    "Réinit. cible": "Rendre à la cible ses valeurs du relevé (annulable).",
+    "Réinit. tout": "Annuler toutes les corrections (confirmation demandée).",
+    "⇄ Échanger": "Échanger les bulles des vues A et B.",
+    "A → B": "Afficher dans B la bulle de la vue A.",
+    "Parcourir…": "Choisir le dossier de sortie.",
+    "Enregistrer les corrections maintenant": "Écrire tout de suite le fichier de "
+                                              "corrections (sinon automatique).",
+}
+
+
 @dataclass
 class Hotspot:
     """Pastille projetee dans la vue."""
@@ -2232,6 +2390,7 @@ class Hotspot:
     row: float
     radius: float
     label: str
+    foot: Optional[Tuple[float, float]] = None   # pied du mât (pastille au point de vue)
 
 
 class BubbleNavApp(_TkBase):
@@ -2246,6 +2405,11 @@ class BubbleNavApp(_TkBase):
         self.floors: List[str] = []
         self.current: int = -1
         self.history: List[int] = []
+        # Journal commun des opérations annulables par Ctrl+Z, de la plus
+        # ancienne à la plus récente : ('edit',) une correction ;
+        # ('nav', idx, yaw, pitch, fov) un passage d'une bulle à l'autre dans A ;
+        # ('nav_b', idx, yaw, pitch, fov) la même chose dans la vue B.
+        self.journal: List[tuple] = []
         self.csv_path: str = ''
         self.images_dir: str = ''
         self.warnings: List[str] = []
@@ -2277,6 +2441,7 @@ class BubbleNavApp(_TkBase):
         self._hover: Optional[int] = None
         # Edition
         self.corrections = Corrections()
+        self.corrections.on_record = self._journal_edit
         self.by_photo: Dict[str, Station] = {}
         self.by_key: Dict[str, Station] = {}
         self.csv_mapping: Optional[Dict[str, str]] = None   # correspondance imposee
@@ -2284,6 +2449,7 @@ class BubbleNavApp(_TkBase):
         self.selected: Optional[int] = None      # bulle en cours de modification
         self._hs_drag = None                     # geste d'édition en cours
         self._axis_hits: List[Tuple[str, float, float, float, float]] = []
+        self._axis_labels: List[Tuple[float, float, str, str]] = []
         self._axis_origin_px: Optional[Tuple[float, float]] = None
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
@@ -2368,6 +2534,7 @@ class BubbleNavApp(_TkBase):
 
         self._build_module()
         self._build_viewer()
+        self._attach_tips(self)
         self._bind_keys()
 
     # ── fenêtre-module ───────────────────────────────────────────────
@@ -2487,6 +2654,20 @@ class BubbleNavApp(_TkBase):
             self.canvas.bind(seq, self._on_right_click)
         self._build_status(self.viewer)
 
+    def _dialog_parent(self):
+        """Fenêtre devant laquelle ouvrir un dialogue : le visualiseur s'il est affiché."""
+        return self.viewer if self._viewer_visible() else self
+
+    def _attach_dialog(self, win) -> None:
+        """Un dialogue s'ouvre devant la fenêtre utilisée, même en plein écran."""
+        parent = self._dialog_parent()
+        try:
+            win.transient(parent)
+            win.lift(parent)
+            win.after_idle(win.focus_force)
+        except Exception:
+            pass
+
     def _viewer_visible(self) -> bool:
         try:
             return self.viewer.state() != 'withdrawn'
@@ -2564,7 +2745,7 @@ class BubbleNavApp(_TkBase):
         self._refresh_module()
         self.lift()
 
-    def _mk_button(self, parent, text, cmd, bg=None, width=None):
+    def _mk_button(self, parent, text, cmd, bg=None, width=None, tip=None):
         b = tk.Button(parent, text=text, command=cmd,
                       bg=bg or COLORS['bg_light'], fg=COLORS['text'],
                       activebackground=COLORS['accent'], activeforeground='white',
@@ -2572,7 +2753,81 @@ class BubbleNavApp(_TkBase):
                       cursor='hand2', highlightthickness=0)
         if width:
             b.config(width=width)
+        tip = tip or BUTTON_TIPS.get(text)
+        if tip:
+            Tooltip(b, tip)
         return b
+
+    def tip(self, widget, text: str):
+        """Infobulle d'aide sur un contrôle (renvoie le contrôle)."""
+        if widget is not None and text and not hasattr(widget, '_bn_tip'):
+            Tooltip(widget, text)
+        return widget
+
+    def _attach_tips(self, root) -> int:
+        """Infobulles des contrôles sans libellé explicite, d'après leur variable
+        ou leur texte. Retourne le nombre d'infobulles posées."""
+        by_var = {}
+        pairs = (
+            ('floor_var', "Plancher affiché sur le plan ; en changer rejoint la bulle "
+                          "la plus proche à l'aplomb."),
+            ('fov_var', "Champ de vision (zoom), aussi à la molette ou + / −."),
+            ('qual_var', "Largeur de décodage des images : plus grand = plus net, "
+                         "plus lent et plus gourmand en mémoire."),
+            ('plan_links_var', "Réseau dessiné sur le plan : squelette (lisible), "
+                               "complet (tous les liens) ou aucun."),
+            ('filter_var', "Activer / désactiver les filtres de pastilles (F), "
+                           "sans perdre les réglages."),
+            ('f_floor', "Pastilles d'un plancher seulement (tous, courant, ou un plancher)."),
+            ('f_dist', "Distance maximale des pastilles affichées (0 = sans limite)."),
+            ('f_local', "Locaux à garder, séparés par des virgules (préfixe ou *) : "
+                        "ex. K256, W25*"),
+            ('f_inter', "Garder les pastilles ▲▼ vers les planchers voisins."),
+            ('f_missing', "Masquer les pastilles dont l'image est absente du dossier."),
+            ('step_var', "Pas des boutons + / − (m)."),
+            ('drag_axis_var', "Axe suivi par le glisser : auto (X ou Y selon le geste), "
+                              "X Est, Y Nord ou Z. Touches X / Y / Z."),
+            ('drag_z_var', "L'axe Z corrige le delta plancher (sol et caméra bougent) "
+                           "ou la hauteur station (caméra seule)."),
+            ('yaw_var', "Δ nord de la bulle active (°) : l'image tourne sous les "
+                        "pastilles, rien n'est écrit dans l'image."),
+        )
+        for attr, text in pairs:
+            var = getattr(self, attr, None)
+            if var is not None:
+                by_var[str(var)] = text
+        for axis, text in (('x', "X (Est) de la cible, en m."), ('y', "Y (Nord) de la cible, en m."),
+                           ('dh', "Hauteur station : la caméra bouge, le sol reste."),
+                           ('ddelta', "Delta plancher : caméra et sol bougent "
+                                      "(marche, faux plancher).")):
+            var = getattr(self, 'pos_vars', {}).get(axis)
+            if var is not None:
+                by_var[str(var)] = text
+        n = 0
+        stack = [root]
+        while stack:
+            w = stack.pop()
+            stack.extend(w.winfo_children())
+            if hasattr(w, '_bn_tip'):
+                continue
+            text = None
+            for opt in ('textvariable', 'variable'):
+                try:
+                    v = str(w.cget(opt))
+                except Exception:
+                    continue
+                if v and v in by_var:
+                    text = by_var[v]
+                    break
+            if text is None:
+                try:
+                    text = BUTTON_TIPS.get(str(w.cget('text')))
+                except Exception:
+                    text = None
+            if text:
+                Tooltip(w, text)
+                n += 1
+        return n
 
     def _build_toolbar(self, parent) -> None:
         bar = tk.Frame(parent, bg=COLORS['bg_medium'])
@@ -2627,7 +2882,7 @@ class BubbleNavApp(_TkBase):
         self.names_var = tk.BooleanVar(value=bool(self.cfg.get('show_names', True)))
         self.heights_var = tk.BooleanVar(value=bool(self.cfg.get('show_heights', True)))
         # Un seul bouton pour les étiquettes : la barre reste courte.
-        mb = tk.Menubutton(bar, text="Étiquettes ▾", font=F_UI, relief='flat',
+        mb = tk.Menubutton(bar, text="Affichage ▾", font=F_UI, relief='flat',
                            bg=COLORS['bg_light'], fg=COLORS['text'],
                            activebackground=COLORS['accent'],
                            activeforeground='white', padx=8, pady=3)
@@ -2639,7 +2894,21 @@ class BubbleNavApp(_TkBase):
                          ("Hauteur appareil, delta, altitude (H / Δ / Z)",
                           self.heights_var)):
             menu.add_checkbutton(label=txt, variable=var, command=self._on_marks)
+        menu.add_separator()
+        self.anchor_var = tk.StringVar(value=self.anchor())
+        menu.add_radiobutton(label="Pastille posée au sol (plancher + Δ)", value='sol',
+                             variable=self.anchor_var, command=self._set_anchor)
+        menu.add_radiobutton(label="Pastille au point de vue (sol + H), mât au sol",
+                             value='vue', variable=self.anchor_var, command=self._set_anchor)
+        menu.add_separator()
+        self.all_var = tk.BooleanVar(value=bool(self.cfg.get('all_hotspots')))
+        menu.add_checkbutton(label="Toutes les pastilles, sans élagage  (T)",
+                             variable=self.all_var,
+                             command=lambda: self._toggle_all(bool(self.all_var.get())))
         mb.config(menu=menu)
+        self.display_btn = mb
+        Tooltip(mb, "Étiquettes des pastilles (distance, nom, H / Δ / Z), "
+                    "hauteur des pastilles (sol ou point de vue), toutes les pastilles (T).")
         mb.pack(side='left', padx=8, pady=4)
 
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
@@ -2769,10 +3038,12 @@ class BubbleNavApp(_TkBase):
             '<f>': self._toggle_filters, '<F>': self._toggle_filters,
             '<e>': self._toggle_edit, '<E>': self._toggle_edit,
             '<v>': self._show_viewer, '<V>': self._show_viewer,
+            '<t>': self._toggle_all, '<T>': self._toggle_all,
             '<x>': lambda: self._lock_axis('x'), '<X>': lambda: self._lock_axis('x'),
             '<y>': lambda: self._lock_axis('y'), '<Y>': lambda: self._lock_axis('y'),
             '<z>': lambda: self._lock_axis('z'), '<Z>': lambda: self._lock_axis('z'),
-            '<Control-z>': self._undo_edit, '<Control-s>': self._dlg_apply,
+            '<Control-z>': self.undo, '<Control-Z>': self.undo,
+            '<Control-s>': self._dlg_apply,
             '<Prior>': lambda: self._bump('dh', +1), '<Next>': lambda: self._bump('dh', -1),
             '<Shift-Prior>': lambda: self._bump('ddelta', +1),
             '<Shift-Next>': lambda: self._bump('ddelta', -1),
@@ -2885,6 +3156,8 @@ class BubbleNavApp(_TkBase):
             except Exception as exc:
                 messagebox.showwarning("Fichier de corrections",
                                        f"{self.corrections.path}\n\n{exc}")
+        self.journal.clear()
+        self.corrections.on_record = self._journal_edit
         self.rebuild_graph()
 
         msg = f"{len(stations)} bulles · {len(self.floors)} planchers · {os.path.basename(path)}"
@@ -2952,7 +3225,7 @@ class BubbleNavApp(_TkBase):
 
     def rebuild_graph(self) -> None:
         t0 = time.perf_counter()
-        self.links = build_graph(self.stations, self.params)
+        self.links = build_graph(self.stations, self.graph_params())
         self.plan_edges = plan_skeleton(self.stations, self.links)
         dt = (time.perf_counter() - t0) * 1000.0
         n_links = sum(len(v) for v in self.links)
@@ -2979,6 +3252,8 @@ class BubbleNavApp(_TkBase):
         if push and self.current >= 0:
             self.history.append(self.current)
             del self.history[:-200]
+            self._journal_push(('nav', self.current, self.view.yaw, self.view.pitch,
+                                self.view.fov))
         self.current = idx
         self.selected = None
         self.focus_idx = None
@@ -2994,7 +3269,74 @@ class BubbleNavApp(_TkBase):
 
     def go_back(self) -> None:
         if self.history:
-            self.goto(self.history.pop(), keep_heading=True, push=False)
+            idx = self.history.pop()
+            for k in range(len(self.journal) - 1, -1, -1):   # retour = annulation
+                if self.journal[k][0] == 'nav':
+                    del self.journal[k]
+                    break
+            self.goto(idx, keep_heading=True, push=False)
+
+    # ── annulation universelle (Ctrl+Z) ──────────────────────────────
+    def _journal_push(self, entry: tuple) -> None:
+        self.journal.append(entry)
+        del self.journal[:-600]
+
+    def _journal_edit(self) -> None:
+        self._journal_push(('edit',))
+
+    def undo(self) -> None:
+        """Ctrl+Z : annule la dernière opération, quelle qu'elle soit.
+
+        Correction (position, altitude, orientation) ou passage d'une bulle à
+        l'autre, dans la vue A comme dans la vue B : on revient à la bulle
+        quittée, avec le cap, le site et le champ qu'elle avait.
+        """
+        while self.journal:
+            entry = self.journal.pop()
+            kind = entry[0]
+            if kind == 'edit':
+                st = self.corrections.undo(self.by_photo)
+                if st is None:
+                    continue
+                self._after_edit(moved=True, turned=True)
+                self._set_status(f"Annulé : correction sur {st.locator}", COLORS['edit'])
+                return
+            _, idx, yaw, pitch, fov = entry
+            if not (0 <= idx < len(self.stations)):
+                continue
+            if kind == 'nav':
+                if self.history and self.history[-1] == idx:
+                    self.history.pop()
+                self.goto(idx, keep_heading=False, push=False)
+                self.view.yaw, self.view.pitch, self.view.fov = yaw, pitch, fov
+                self._sync_fov_widgets()
+                self._request_render(force=True)
+                self._set_status(f"Annulé : retour à {self.stations[idx].locator}",
+                                 COLORS['sel'])
+                return
+            if kind == 'nav_b' and self.compare is not None:
+                cv = self.compare
+                cv.goto(idx, keep_heading=False)
+                cv.view.yaw, cv.view.pitch, cv.view.fov = yaw, pitch, fov
+                cv.request_render(force=True)
+                self._cone_sig = None
+                self._set_status(f"Annulé : vue B revenue à {self.stations[idx].locator}",
+                                 COLORS['sel'])
+                return
+        # plus rien au journal : dernier recours, la pile propre aux corrections
+        st = self.corrections.undo(self.by_photo)
+        if st is not None:
+            self._after_edit(moved=True, turned=True)
+            self._set_status(f"Annulé : correction sur {st.locator}", COLORS['edit'])
+        else:
+            self._set_status("Rien à annuler")
+
+    def _sync_fov_widgets(self) -> None:
+        try:
+            self.fov_var.set(self.view.fov)
+            self.fov_lbl.config(text=f"{self.view.fov:.0f}°")
+        except Exception:
+            pass
 
     def _go_forward(self) -> None:
         """Rejoint la pastille la plus proche du centre de la vue."""
@@ -3156,19 +3498,24 @@ class BubbleNavApp(_TkBase):
         out, masques = compute_hotspots(
             self.stations, self.links, self.current, view, self.calib, self.filters,
             self.store.has, float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
-            float(self.cfg.get('disc_radius', DISC_RADIUS_M)), *self.disc_bounds())
+            float(self.cfg.get('disc_radius', DISC_RADIUS_M)), *self.disc_bounds(),
+            anchor=self.anchor())
         self.hidden_count = masques
         return out
 
-    def _sprite(self, color: str, r: float, hover: bool = False):
-        """Sphère ombrée prête à afficher, mise en cache par couleur et taille."""
+    def _sprite(self, color: str, r: float, hover: bool = False, alpha: float = 1.0):
+        """Sphère ombrée prête à afficher, mise en cache par couleur, taille, opacité."""
         rq = max(3, int(round(r / 2.0) * 2))          # pas de 2 px : cache compact
-        key = (color, rq, hover)
+        alpha = round(clamp(alpha, 0.05, 1.0), 2)
+        key = (color, rq, hover, alpha)
         hit = self._sprites.get(key)
         if hit is not None:
             return hit
         from PIL import ImageTk
         img, (ax, ay) = sphere_sprite(color, rq, hover)
+        if alpha < 1.0:                               # fantôme : opacité réduite
+            a = img.getchannel('A').point(lambda v: int(v * alpha))
+            img.putalpha(a)
         entry = (ImageTk.PhotoImage(img), ax, ay)
         if len(self._sprites) >= 400:
             self._sprites.pop(next(iter(self._sprites)))
@@ -3178,10 +3525,52 @@ class BubbleNavApp(_TkBase):
     def relief(self) -> bool:
         return bool(self.cfg.get('disc_3d', True))
 
+    def anchor(self) -> str:
+        """Hauteur des pastilles : 'sol' (plancher + delta) ou 'vue' (+ hauteur)."""
+        return 'vue' if self.cfg.get('hotspot_anchor') == 'vue' else 'sol'
+
+    def _set_anchor(self) -> None:
+        self.cfg['hotspot_anchor'] = self.anchor_var.get()
+        save_config(self.cfg)
+        self._draw_overlay()
+        self._redraw_compare()
+        self._set_status("Pastilles " + ("au point de vue (sol + hauteur appareil), "
+                                         "mât jusqu'au sol" if self.anchor() == 'vue'
+                                         else "posées au sol (plancher + delta)"))
+
+    def graph_params(self) -> GraphParams:
+        """Paramètres du réseau ; « toutes les pastilles » lève l'élagage."""
+        if self.cfg.get('all_hotspots'):
+            return dc_replace(self.params, kmax=10 ** 6, ang_min=0.0)
+        return self.params
+
+    def _toggle_all(self, on: Optional[bool] = None) -> None:
+        """Touche T : toutes les bulles à portée, sans limite ni tri angulaire."""
+        if on is None:
+            on = not bool(self.cfg.get('all_hotspots'))
+        self.cfg['all_hotspots'] = on
+        if hasattr(self, 'all_var'):
+            self.all_var.set(on)
+        save_config(self.cfg)
+        self.rebuild_graph()
+        n = len(self.links[self.current]) if 0 <= self.current < len(self.links) else 0
+        self._set_status(
+            (f"Toutes les pastilles : {n} bulle(s) à moins de {self.params.radius:g} m "
+             "(T pour revenir au réseau élagué)") if on else
+            (f"Réseau élagué : {self.params.kmax} pastilles max, une par direction "
+             f"({self.params.ang_min:g}°) — {n} ici"), COLORS['sel'] if on else None)
+
     def draw_hotspot(self, canvas, hs: "Hotspot", color: str, hovered: bool,
                      selected: bool = False) -> None:
         """Dessine une pastille (relief ou plate) sur un canevas."""
         r = hs.radius * (1.25 if hovered else 1.0)
+        if hs.foot is not None:                 # mât : du sol au point de vue
+            fx, fy = hs.foot
+            canvas.create_line(fx, fy, hs.col, hs.row, fill='#000000', width=4, tags='hs')
+            canvas.create_line(fx, fy, hs.col, hs.row, fill=color, width=2, tags='hs')
+            e = max(3.0, 0.45 * r)
+            canvas.create_oval(fx - e, fy - e * 0.4, fx + e, fy + e * 0.4,
+                               outline=color, width=1.5, tags='hs')
         if self.relief():
             photo, ax, ay = self._sprite(color, r, hovered)
             canvas.create_image(hs.col - ax, hs.row - ay, anchor='nw', image=photo,
@@ -3252,7 +3641,7 @@ class BubbleNavApp(_TkBase):
             nd = 3 if self.edit_mode else 2
             for label, val, fix, signed in (
                     ("H", tgt.height(eye), tgt.raised(), False),
-                    ("Δ", tgt.delta(), tgt.shifted(), True),
+                    ("Δ", tgt.delta(eye), tgt.shifted(), True),
                     ("Z", tgt.z, tgt.z_changed(), False)):
                 val_txt = f"{val:+.{nd}f}" if signed else f"{val:.{nd}f}"
                 text(hs.col, y, f"{label} {val_txt}", COLORS['edit'] if fix else MARK_TEXT,
@@ -3304,6 +3693,11 @@ class BubbleNavApp(_TkBase):
             selected = self.edit_mode and self.selected == tgt.idx
             self.draw_hotspot(self.canvas, hs, color, hovered, selected=selected)
             self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing)
+        if self.edit_mode:
+            for x, y, txt, col in self._axis_labels:
+                self.canvas.create_text(x + 1, y + 1, text=txt, fill='#000000',
+                                        font=F_UI_B, tags='hs')
+                self.canvas.create_text(x, y, text=txt, fill=col, font=F_UI_B, tags='hs')
         self._draw_hud(view)
         if self._hover is not None and getattr(self, '_hover_xy', None):
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
@@ -3731,7 +4125,7 @@ class BubbleNavApp(_TkBase):
             # le suivi de A ne doit pas remplacer aussitôt la bulle demandée
             self._last_current = self.current
         else:
-            self.compare.goto(idx)
+            self.compare.goto(idx, record=True)
         self._cone_sig = None
         self._set_status(f"{self.stations[idx].locator} ouvert dans la vue B",
                          COLORS['sel'])
@@ -3873,8 +4267,10 @@ class BubbleNavApp(_TkBase):
         if st.has_yaw():
             lignes.append(f"Δ nord   {st.yaw_fix:+.3f}°  (à appliquer à l'image)")
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        lignes.append(f"sol      {st.ground(eye):.2f}  ·  hauteur {st.height(eye):.2f}"
-                      + (f"  ·  delta {st.delta():+.2f}" if st.delta() else ''))
+        plancher = (f"plancher {st.floor_alt:+.2f} + " if st.floor_alt is not None
+                    and not st.delta_col else '')
+        lignes.append(f"sol      {plancher}Δ {st.delta(eye):+.2f} = {st.ground(eye):.2f}")
+        lignes.append(f"caméra   sol + H {st.height(eye):.2f} = {st.z:.2f} (point de vue)")
         if st.moved():
             lignes.append(f"DÉPLACÉE en plan de {math.hypot(st.x - st.ox, st.y - st.oy):.2f} m")
         if st.raised():
@@ -4137,7 +4533,7 @@ class BubbleNavApp(_TkBase):
         self.pos_vars['ddelta'].set(f"{st.ddelta:+.3f}")
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         self.z_lbl.config(text=(f"Z caméra {st.z:.3f}  ·  sol {st.ground(eye):.3f}  ·  "
-                                f"hauteur {st.height(eye):.2f}  ·  delta {st.delta():+.2f}"))
+                                f"hauteur {st.height(eye):.2f}  ·  delta {st.delta(eye):+.2f}"))
         self._sync_ui = True
         try:
             self.yaw_var.set(round(self.stations[self.current].yaw_fix, 2)
@@ -4269,12 +4665,7 @@ class BubbleNavApp(_TkBase):
                          COLORS['edit'])
 
     def _undo_edit(self) -> None:
-        st = self.corrections.undo(self.by_photo)
-        if st is None:
-            self._set_status("Rien à annuler")
-            return
-        self._after_edit(moved=True, turned=True)
-        self._set_status(f"Annulation sur {st.locator}", COLORS['edit'])
+        self.undo()
 
     def _revert_target(self) -> None:
         st = self._edit_target()
@@ -4363,7 +4754,9 @@ class BubbleNavApp(_TkBase):
         zkey = self.drag_z_var.get() if hasattr(self, 'drag_z_var') else 'ddelta'
         self._hs_drag = ('axe', {
             'idx': tgt.idx, 'active': fr['active'], 'axis': None, 'want': axis,
-            'line': fr['origin'] if on_origin else fr['point'],
+            'line': (fr['origin'] if on_origin else
+                     fr['eye'] if self.anchor() == 'vue' and not fr['active']
+                     else fr['point']),
             'press': (event.x, event.y), 't0': None, 'north': fr['north'],
             'start': (tgt.x, tgt.y, tgt.dh, tgt.ddelta),
             'zkey': zkey if zkey in ('dh', 'ddelta') else 'ddelta', 'd': 0.0})
@@ -4460,8 +4853,16 @@ class BubbleNavApp(_TkBase):
     def _end_edit_drag(self) -> None:
         kind = self._hs_drag[0] if self._hs_drag else None
         moved = kind == 'axe' and self._hs_drag[1]['axis'] is not None
+        idx = (self._hs_drag[1]['idx'] if kind == 'axe' else
+               self._hs_drag[1] if kind == 'yaw' else None)
         self._hs_drag = None
         if kind is None:
+            return
+        if idx is not None and 0 <= idx < len(self.stations) \
+                and self.corrections.drop_if_unchanged(self.stations[idx]):
+            if self.journal and self.journal[-1] == ('edit',):
+                self.journal.pop()          # clic sans effet : aucune étape à annuler
+            self._draw_overlay()
             return
         if kind == 'axe' and not moved:
             self._draw_overlay()
@@ -4477,6 +4878,7 @@ class BubbleNavApp(_TkBase):
         l'axe suivi est prolongé.
         """
         self._axis_hits = []
+        self._axis_labels = []
         self._axis_origin_px = None
         tgt = self._edit_target()
         if tgt is None:
@@ -4534,12 +4936,30 @@ class BubbleNavApp(_TkBase):
             self._axis_origin_px = (base[0], base[1])
             c.create_oval(base[0] - 5, base[1] - 5, base[0] + 5, base[1] + 5,
                           outline='white', width=1.5, tags='hs')
-        # déplacement depuis l'origine CSV
+        # déplacement depuis l'origine CSV, décomposé : ΔX puis ΔY puis ΔZ
         p = fr['point']
         if any(abs(p[i] - o[i]) > 1e-4 for i in range(3)):
+            self._draw_ghost(view, tgt, fr, o)
             sg = seg(o, p)
-            if sg is not None:
-                c.create_line(*sg, fill=COLORS['edit'], width=2, dash=(4, 3), tags='hs')
+            if sg is not None:                 # résultante, fine
+                c.create_line(*sg, fill=COLORS['edit'], width=1, dash=(4, 3), tags='hs')
+            d = (p[0] - o[0], p[1] - o[1], p[2] - o[2])
+            k1 = (o[0] + d[0], o[1], o[2])
+            k2 = (o[0] + d[0], o[1] + d[1], o[2])
+            for axis, q0, q1, val in (('x', o, k1, d[0]), ('y', k1, k2, d[1]),
+                                      ('z', k2, p, d[2])):
+                if abs(val) < 1e-4:
+                    continue
+                sg = seg(q0, q1)
+                if sg is None:
+                    continue
+                col = AXIS_COLORS[axis]
+                c.create_line(*sg, fill='#000000', width=5, tags='hs')
+                c.create_line(*sg, fill=col, width=3, tags='hs')
+                mx, my = (sg[0] + sg[2]) / 2.0, (sg[1] + sg[3]) / 2.0
+                # valeurs écrites après les pastilles, pour rester lisibles
+                self._axis_labels.append((mx, my - 10, f"Δ{axis.upper()} {val:+.3f}"
+                                          .replace('.', ','), col))
         if not fr['active'] and tgt.raised():
             e0 = (o[0], o[1], o[2] + (tgt.h0 if tgt.h0 is not None else
                                       float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))))
@@ -4559,6 +4979,31 @@ class BubbleNavApp(_TkBase):
             if sg is not None:
                 c.create_line(*sg, fill=AXIS_COLORS[drag['axis']], width=1,
                               dash=(6, 4), tags='hs')
+
+    def _draw_ghost(self, view: View, tgt: Station, fr: Dict[str, object],
+                    o: Sequence[float]) -> None:
+        """Pastille fantôme, semi-transparente, à la position d'origine du CSV."""
+        if fr['active']:
+            return                  # la bulle active n'a pas de pastille dans sa vue
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        h0 = tgt.h0 if tgt.h0 is not None else eye
+        q = (o[0], o[1], o[2] + h0) if self.anchor() == 'vue' else tuple(o)
+        pr = project_point(view, self.calib, fr['north'], *q)
+        if pr is None or pr[2] < 0.05:
+            return
+        dist = max(0.35, math.sqrt(sum(v * v for v in q)))
+        r_min, r_max = self.disc_bounds()
+        r = clamp(view.focal() * float(self.cfg.get('disc_radius', DISC_RADIUS_M)) / dist,
+                  r_min, r_max)
+        if self.relief():
+            photo, ax, ay = self._sprite(COLORS['hot'], r, False, alpha=0.38)
+            self.canvas.create_image(pr[0] - ax, pr[1] - ay, anchor='nw', image=photo,
+                                     tags='hs')
+        else:
+            self.canvas.create_oval(pr[0] - r, pr[1] - r * 0.55, pr[0] + r, pr[1] + r * 0.55,
+                                    outline=COLORS['hot'], dash=(2, 2), tags='hs')
+        self.canvas.create_text(pr[0], pr[1] + r * 0.6 + 9, text="origine CSV",
+                                fill=MARK_TEXT, font=F_TINY, tags='hs')
 
     def _axis_readout(self, view: View) -> None:
         """Déplacement de la cible depuis le CSV, axe par axe."""
@@ -4601,7 +5046,7 @@ class BubbleNavApp(_TkBase):
         win = tk.Toplevel(self)
         win.title("Corrections — bilan et application")
         win.configure(bg=COLORS['bg_dark'])
-        win.transient(self)
+        self._attach_dialog(win)
         win.resizable(False, False)
 
         tk.Label(win, text="Bilan des corrections", font=F_UI_B, bg=COLORS['bg_dark'],
@@ -4785,7 +5230,7 @@ class BubbleNavApp(_TkBase):
         win = tk.Toplevel(self)
         win.title("Application de l'orientation aux images")
         win.configure(bg=COLORS['bg_dark'])
-        win.transient(self)
+        self._attach_dialog(win)
         win.resizable(False, False)
         lbl = tk.Label(win, text=f"0 / {len(todo)}", font=F_UI, bg=COLORS['bg_dark'],
                        fg=COLORS['text'], padx=24, pady=10)
@@ -4960,6 +5405,24 @@ class BubbleNavApp(_TkBase):
             tgt = self._edit_target()
             if tgt is not None and tgt.floor == floor:
                 ox, oy = to_screen(tgt.ox, tgt.oy)
+                if tgt.moved():                  # fantôme + composantes ΔX / ΔY
+                    tx, ty = to_screen(tgt.x, tgt.y)
+                    self.plan.create_oval(ox - 5, oy - 5, ox + 5, oy + 5,
+                                          outline=COLORS['hot'], dash=(2, 2))
+                    for axis, (x1, y1, x2, y2), val in (
+                            ('x', (ox, oy, tx, oy), tgt.x - tgt.ox),
+                            ('y', (tx, oy, tx, ty), tgt.y - tgt.oy)):
+                        if abs(val) < 1e-4:
+                            continue
+                        self.plan.create_line(x1, y1, x2, y2, fill=AXIS_COLORS[axis],
+                                              width=2)
+                        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                        dx_, dy_ = (0, -9) if axis == 'x' else (6, 0)
+                        self.plan.create_text(mx + dx_, my + dy_, font=F_TINY_B,
+                                              anchor='s' if axis == 'x' else 'w',
+                                              fill=AXIS_COLORS[axis],
+                                              text=f"Δ{axis.upper()} {val:+.3f}"
+                                              .replace('.', ','))
                 hot = self._locked_axis() or getattr(self, '_plan_axis', None)
                 for axis, (dx, dy) in (('x', (1, 0)), ('y', (0, -1))):
                     self.plan.create_line(ox - 18 * dx, oy - 18 * dy, ox + 18 * dx,
@@ -5031,48 +5494,58 @@ class BubbleNavApp(_TkBase):
         if cur is None or not self.stations:
             return
         floor = self.floor_var.get()
-        if floor and cur.floor != floor:
-            return                       # le plan montre un autre niveau
         pts = self._plan_stations()
         if not pts:
             return
         w = max(50, int(self.plan.winfo_width()))
         h = max(50, int(self.plan.winfo_height()))
         to_screen, _ = self._plan_transform(pts, w, h)
-        x, y = to_screen(cur.x, cur.y)
-        view = self.view              # état courant : le cône ne suit pas le rendu
-        az = self.calib.azimuth(view.yaw, cur.north_pct)
-        half = view.fov / 2.0
         rad = 34.0
-        plist = [x, y]
-        for k in range(9):
-            a = math.radians(az - half + k * (2 * half / 8))
-            plist += [x + rad * math.sin(a), y - rad * math.cos(a)]
-        self.plan.create_polygon(plist, fill=COLORS['plan_cone'], outline='',
-                                 stipple='gray25', tags='cone')
-        a = math.radians(az)             # axe de visée
-        self.plan.create_line(x, y, x + rad * math.sin(a), y - rad * math.cos(a),
-                              fill=COLORS['plan_cone'], width=1, tags='cone')
-        self.plan.create_oval(x - 5, y - 5, x + 5, y + 5, fill=COLORS['plan_here'],
-                              outline='#000000', tags='cone')
 
-        cmp_view = self.compare      # repère de la seconde vue, si elle est ouverte
-        b = cmp_view.station() if cmp_view is not None else None
-        if b is not None and b.floor == floor:
-            bx, by = to_screen(b.x, b.y)
-            azb = self.calib.azimuth(cmp_view.view.yaw, b.north_pct)
-            halfb = cmp_view.view.fov / 2.0
-            plb = [bx, by]
+        def cone(x, y, az, fov, fill, stipple):
+            half = fov / 2.0
+            plist = [x, y]
             for k in range(9):
-                ab = math.radians(azb - halfb + k * (2 * halfb / 8))
-                plb += [bx + rad * math.sin(ab), by - rad * math.cos(ab)]
-            self.plan.create_polygon(plb, fill=COLORS['sel'], outline='',
-                                     stipple='gray12', tags='cone')
-            self.plan.create_line(x, y, bx, by, fill=COLORS['sel'], width=1,
-                                  dash=(3, 3), tags='cone')
-            self.plan.create_oval(bx - 5, by - 5, bx + 5, by + 5, fill=COLORS['sel'],
+                a = math.radians(az - half + k * (2 * half / 8))
+                plist += [x + rad * math.sin(a), y - rad * math.cos(a)]
+            self.plan.create_polygon(plist, fill=fill, outline='', stipple=stipple,
+                                     tags='cone')
+            a = math.radians(az)             # axe de visée
+            self.plan.create_line(x, y, x + rad * math.sin(a), y - rad * math.cos(a),
+                                  fill=fill, width=1, tags='cone')
+
+        # vue A (le plan montre son plancher, sauf choix contraire dans la liste)
+        x, y = to_screen(cur.x, cur.y)
+        a_ici = not floor or cur.floor == floor
+        view = self.view              # état courant : le cône ne suit pas le rendu
+        if a_ici:
+            cone(x, y, self.calib.azimuth(view.yaw, cur.north_pct), view.fov,
+                 COLORS['plan_cone'], 'gray25')
+            self.plan.create_oval(x - 5, y - 5, x + 5, y + 5, fill=COLORS['plan_here'],
                                   outline='#000000', tags='cone')
-            self.plan.create_text(bx, by - 11, text="B", fill=COLORS['sel'],
+
+        # vue B : toujours accrochée au plan, même sur un autre plancher
+        cmp_view = self.compare
+        b = cmp_view.station() if cmp_view is not None else None
+        if b is not None:
+            bx, by = to_screen(b.x, b.y)
+            b_ici = not floor or b.floor == floor
+            cone(bx, by, self.calib.azimuth(cmp_view.view.yaw, b.north_pct),
+                 cmp_view.view.fov, COLORS['sel'], 'gray12')
+            if a_ici:
+                self.plan.create_line(x, y, bx, by, fill=COLORS['sel'], width=1,
+                                      dash=(3, 3), tags='cone')
+            if b_ici:
+                self.plan.create_oval(bx - 5, by - 5, bx + 5, by + 5, fill=COLORS['sel'],
+                                      outline='#000000', tags='cone')
+                label = "B"
+            else:                          # autre niveau : repère creux + son plancher
+                self.plan.create_oval(bx - 6, by - 6, bx + 6, by + 6, outline=COLORS['sel'],
+                                      width=2, dash=(2, 2), tags='cone')
+                label = f"B · {b.floor.split('(')[0].strip() or b.floor}"
+            self.plan.create_text(bx + 1, by - 10, text=label, fill='#000000',
+                                  font=F_UI_B, tags='cone')
+            self.plan.create_text(bx, by - 11, text=label, fill=COLORS['sel'],
                                   font=F_UI_B, tags='cone')
         self._cone_sig = self._cone_signature()
         self.plan.tag_raise('plan_tip')
@@ -5175,8 +5648,13 @@ class BubbleNavApp(_TkBase):
 
     def _on_plan_release_left(self, event) -> None:
         if self._plan_hit is not None:
+            st = self.stations[self._plan_hit]
             self._plan_hit = None
             self._plan_axis = None
+            if self.corrections.drop_if_unchanged(st):      # simple clic : pas d'étape
+                if self.journal and self.journal[-1] == ('edit',):
+                    self.journal.pop()
+                return
             self._after_edit(moved=True)
             return
         press = getattr(self, '_plan_press', None)
@@ -5229,7 +5707,7 @@ class BubbleNavApp(_TkBase):
         win = tk.Toplevel(self)
         win.title("Colonnes du CSV")
         win.configure(bg=COLORS['bg_dark'])
-        win.transient(self)
+        self._attach_dialog(win)
         win.resizable(True, False)
         tk.Label(win, text=os.path.basename(path), font=F_UI_B, bg=COLORS['bg_dark'],
                  fg=COLORS['accent']).pack(anchor='w', padx=14, pady=(12, 0))
@@ -5323,7 +5801,7 @@ class BubbleNavApp(_TkBase):
         win = tk.Toplevel(self)
         win.title("Réglages")
         win.configure(bg=COLORS['bg_dark'])
-        win.transient(self)
+        self._attach_dialog(win)
         win.resizable(False, False)
 
         def section(title: str) -> tk.Frame:
@@ -5363,6 +5841,9 @@ class BubbleNavApp(_TkBase):
             self.cfg['eye_height'] = float(eye_var.get())
             self._draw_overlay()
             self._draw_plan()
+            self._redraw_compare()
+            if self.current >= 0:
+                self._refresh_side()
 
         for text, value in (("« % NORD » = colonne du nord dans l'image (50 % = centre)", 'colonne'),
                             ("« % NORD » = azimut visé par le centre de l'image", 'centre')):
@@ -5384,7 +5865,12 @@ class BubbleNavApp(_TkBase):
                            activeforeground=COLORS['text'], bd=0, highlightthickness=0
                            ).pack(side='left', padx=4)
         slider(cal, "Correction nord (°)", off_var, -180, 180, 0.5, apply_calib)
-        slider(cal, "Hauteur caméra (m)", eye_var, 0.0, 3.0, 0.05, apply_calib)
+        slider(cal, "Hauteur instrument (m)", eye_var, 0.0, 3.0, 0.01, apply_calib)
+        tk.Label(cal, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'], anchor='w',
+                 justify='left',
+                 text="Hauteur de l'appareil au-dessus du sol, pour les bulles sans colonne\n"
+                      "« H appareil ». Z = plancher + H + Δ : le Δ de chaque bulle se déduit\n"
+                      "de l'altitude du plancher ; la pastille se pose à Z − H.").pack(fill='x')
         disc_var = tk.DoubleVar(value=float(self.cfg.get('disc_radius', DISC_RADIUS_M)))
         dmin_var = tk.DoubleVar(value=self.disc_bounds()[0])
         dmax_var = tk.DoubleVar(value=self.disc_bounds()[1])
@@ -5445,9 +5931,15 @@ class BubbleNavApp(_TkBase):
             pending['job'] = self.after(220, run)
 
         slider(net, "Portée des liens (m)", rad_var, 2, 40, 0.5, apply_graph)
-        slider(net, "Pastilles max", kmax_var, 1, 24, 1, apply_graph)
+        slider(net, "Pastilles max", kmax_var, 1, 40, 1, apply_graph)
         slider(net, "Séparation angulaire (°)", ang_var, 0, 60, 1, apply_graph)
         slider(net, "Portée inter-plancher (m)", fr_var, 0, 20, 0.5, apply_graph)
+        tk.Label(net, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'], anchor='w',
+                 justify='left',
+                 text="Une seule pastille par direction (séparation angulaire) : mettre 0° et\n"
+                      "augmenter « Pastilles max » pour tout voir, ou touche T (toutes les\n"
+                      "pastilles, sans élagage). Le champ de vision limite aussi l'affichage."
+                 ).pack(fill='x')
 
         # ── Performance ─────────────────────────────────────────────
         perf = section("Performance")
@@ -5506,7 +5998,8 @@ class BubbleNavApp(_TkBase):
                                ('\n…' if len(self.warnings) > 40 else ''))
 
     def _dlg_help(self) -> None:
-        messagebox.showinfo(f"{APP_NAME} v{__version__}", (
+        messagebox.showinfo(f"{APP_NAME} v{__version__}", parent=self._dialog_parent(),
+                            message=(
             "NAVIGATION\n"
             "  • Clic sur une pastille  : aller sur cette bulle\n"
             "  • Glisser                : tourner la vue\n"
@@ -5514,6 +6007,10 @@ class BubbleNavApp(_TkBase):
             "  • Double-clic            : recentrer la vue\n"
             "  • Entrée ou Espace       : avancer vers la pastille centrale\n"
             "  • Retour arrière         : revenir à la bulle précédente\n"
+            "  • Ctrl+Z                 : annuler la dernière opération (navigation,\n"
+            "                             correction, bulle ouverte en B)\n"
+            "  • T                      : toutes les pastilles, sans élagage\n"
+            "  • Clic droit (pastille)  : ouvrir dans l'autre vue\n"
             "  • Flèches                : tourner (Maj = pas large)\n"
             "  • Origine (Home)         : redresser la vue\n"
             "  • F11 / Échap            : plein écran\n\n"
@@ -5656,20 +6153,26 @@ class CompareView(tk.Frame if _TK_OK else object):
                                   fg=COLORS['text'])
         self.title_lbl.pack(side='left', padx=4)
 
-        self.app._mk_button(bar, "✕", self.close).pack(side='right', padx=(4, 8), pady=4)
+        self.app._mk_button(bar, "✕", self.close,
+                            tip="Fermer la vue B (touche C).").pack(side='right',
+                                                                     padx=(4, 8), pady=4)
         self.app._mk_button(bar, "⇄ Échanger", self.swap).pack(side='right', padx=4, pady=4)
         self.app._mk_button(bar, "A → B", self.copy_from_a).pack(side='right', padx=4, pady=4)
-        tk.Checkbutton(bar, text="Vue liée", variable=self.linked,
+        self.app.tip(tk.Checkbutton(bar, text="Vue liée", variable=self.linked,
                        command=self._on_linked, font=F_UI, bg=COLORS['bg_medium'],
                        fg=COLORS['text'], selectcolor=COLORS['bg_light'], bd=0,
                        highlightthickness=0, activebackground=COLORS['bg_medium'],
-                       activeforeground=COLORS['text']).pack(side='right', padx=6)
+                       activeforeground=COLORS['text']),
+                     "Vue liée : B regarde la même direction terrain que A ; tourner "
+                     "ou zoomer d'un côté agit sur les deux.").pack(side='right', padx=6)
         tk.Label(bar, text="Suivi de A", font=F_UI, bg=COLORS['bg_medium'],
                  fg=COLORS['text_muted']).pack(side='right', padx=(8, 2))
         cb = ttk.Combobox(bar, textvariable=self.follow, state='readonly', width=18,
                           style='BN.TCombobox', values=self.FOLLOW_MODES)
         cb.pack(side='right', pady=4)
         cb.bind('<<ComboboxSelected>>', lambda e: self.follow_a(self.app.current))
+        self.app.tip(cb, "Quand A change de bulle, B suit : même local à un autre "
+                         "plancher, ou la bulle la plus proche (aucun = B reste).")
 
         self.canvas = tk.Canvas(self, bg='#101010', highlightthickness=0, cursor='fleur')
         self.canvas.pack(fill='both', expand=True)
@@ -5694,10 +6197,13 @@ class CompareView(tk.Frame if _TK_OK else object):
         sts = self.app.stations
         return sts[self.idx] if 0 <= self.idx < len(sts) else None
 
-    def goto(self, idx: int, keep_heading: bool = True) -> None:
+    def goto(self, idx: int, keep_heading: bool = True, record: bool = False) -> None:
         if not (0 <= idx < len(self.app.stations)) or idx == self.idx:
             return
         prev = self.station()
+        if record and prev is not None:          # geste de l'utilisateur : annulable
+            self.app._journal_push(('nav_b', self.idx, self.view.yaw, self.view.pitch,
+                                    self.view.fov))
         if keep_heading and prev is not None and not self.linked.get():
             az = self.app.calib.azimuth(self.view.yaw, prev.north_pct)
             self.view.yaw = self.app.calib.pano_yaw(az, self.app.stations[idx].north_pct)
@@ -5709,7 +6215,7 @@ class CompareView(tk.Frame if _TK_OK else object):
                                 if idx < len(self.app.links) else [])
 
     def copy_from_a(self) -> None:
-        self.goto(self.app.current)
+        self.goto(self.app.current, record=True)
 
     def swap(self) -> None:
         """Échange les points de vue des deux fenêtres."""
@@ -5855,7 +6361,8 @@ class CompareView(tk.Frame if _TK_OK else object):
         self.hotspots, self.hidden_count = compute_hotspots(
             app.stations, app.links, self.idx, view, app.calib, app.filters,
             app.store.has, float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
-            float(app.cfg.get('disc_radius', DISC_RADIUS_M)), *app.disc_bounds())
+            float(app.cfg.get('disc_radius', DISC_RADIUS_M)), *app.disc_bounds(),
+            anchor=app.anchor())
         for i, hs in enumerate(self.hotspots):
             tgt = app.stations[hs.link.target]
             color = {'same': COLORS['hot'], 'up': COLORS['hot_up'],
@@ -5943,7 +6450,7 @@ class CompareView(tk.Frame if _TK_OK else object):
         if moved <= 4:
             hit = self._hotspot_at(event.x, event.y)
             if hit is not None:
-                self.goto(self.hotspots[hit].link.target)
+                self.goto(self.hotspots[hit].link.target, record=True)
                 return
         self.request_render(force=True)
 
