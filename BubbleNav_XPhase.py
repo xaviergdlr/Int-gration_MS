@@ -231,6 +231,7 @@ DEFAULT_CONFIG = {
     'drag_axis': 'auto',             # axe du glisser en édition : 'auto' | 'x' | 'y' | 'z'
     'drag_z': 'ddelta',              # l'axe Z agit sur 'ddelta' (sol + caméra) ou 'dh'
     'hotspot_anchor': 'sol',         # pastille au 'sol' ou au point de 'vue' (mât)
+    'z_source': 'calcul',            # Z du point de vue : plancher + Δ + H, ou Z du CSV
     'all_hotspots': False,           # toutes les bulles à portée, sans élagage
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
@@ -399,7 +400,9 @@ class Station:
     h0: Optional[float] = None
     delta0: float = 0.0
     delta_col: bool = False     # True si le delta vient d'une colonne du CSV
-    floor_alt: Optional[float] = None   # altitude du plancher lue dans son libellé
+    floor_alt: Optional[float] = None   # altitude du plancher (colonne, sinon libellé)
+    floor_alt_src: str = ''     # 'colonne' | 'libellé' | ''
+    z_csv: Optional[float] = None       # Z lu dans le CSV : un contrôle, pas une base
     dh: float = 0.0
     ddelta: float = 0.0
     key: str = ''          # cle immuable (numero de scan) ; = photo si absente
@@ -424,6 +427,7 @@ class Station:
         l'altitude lue dans le libellé du plancher (« PLANCHER 02 (+00.00m) »).
         """
         if not self.delta_col and self.floor_alt is not None:
+            # avec Z calculé, oz = plancher + H : le delta se réduit à sa correction
             return self.z - self.floor_alt - self.height(eye)
         return self.delta0 + self.ddelta
 
@@ -523,9 +527,16 @@ COL_ALIASES = {
     'y': ('y', 'n', 'nord', 'northing', 'ym', 'coordy'),
     'z': ('z', 'altitude', 'alt', 'elevation', 'zm', 'coordz', 'zcamera'),
     'hcam': ('hauteurappareil', 'hauteurcamera', 'hauteurstation', 'hcam',
+             'hauteurinstrument', 'hauteurdinstrument', 'hinstrument', 'hinst', 'hi',
+             'hauteurinstrumentm', 'hauteurappareilm',
              'hauteur', 'h', 'hcamera', 'happareil'),
     'delta': ('delta', 'deltaplancher', 'decalageplancher', 'deltasol',
-              'surelevation', 'marche', 'deltaz'),
+              'surelevation', 'marche', 'deltaz', 'deltam'),
+    # Altitude du plancher : base du calcul Z = plancher + delta + hauteur
+    'zfloor': ('zplancher', 'altitudeplancher', 'altplancher', 'zdalle',
+               'altitudedalle', 'zniveau', 'altitudeniveau', 'niveauplancher',
+               'coteplancher', 'cotedalle', 'zplancherm', 'altitudeplancherm',
+               'zfloor', 'floorz', 'floorelevation'),
     'dh': ('dhstation', 'dh', 'dhauteur', 'correctionhauteur', 'dhauteurstation'),
     'ddelta': ('ddeltaplancher', 'ddelta', 'correctiondelta', 'ddeltasol'),
     'north': ('pctnord', 'nordpct', 'pct', 'nordpourcent', 'cap', 'heading',
@@ -599,7 +610,8 @@ class ColumnMappingNeeded(ValueError):
 
 # Ordre d'attribution : une colonne ne sert qu'a un seul champ, les plus
 # importants choisissent en premier.
-_FIELD_ORDER = ('photo', 'key', 'x', 'y', 'z', 'target', 'locator', 'north', 'floor',
+_FIELD_ORDER = ('photo', 'key', 'x', 'y', 'z', 'zfloor', 'target', 'locator', 'north',
+                'floor',
                 'dnord', 'hcam', 'delta', 'dh', 'ddelta', 'local', 'etage', 'date', 'index')
 
 # Champs proposes dans la boite de correspondance (champ, libelle, obligatoire)
@@ -607,6 +619,8 @@ MAPPING_FIELDS = (('key', "Identifiant / N° scan", True),
                   ('photo', "Fichier photo (si différent)", False),
                   ('x', "X (Est)", True), ('y', "Y (Nord)", True), ('z', "Z", False),
                   ('north', "% Nord", False), ('floor', "Plancher", False),
+                  ('zfloor', "Z plancher", False), ('hcam', "Hauteur instrument", False),
+                  ('delta', "Delta ±", False),
                   ('target', "Nom projeté", False), ('locator', "Nom du locator", False))
 
 
@@ -744,6 +758,7 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
             north = 50.0
         dnord = parse_float(cell(row, 'dnord')) or 0.0
         h0 = parse_float(cell(row, 'hcam'))
+        zfl = parse_float(cell(row, 'zfloor'))
         delta_val = parse_float(cell(row, 'delta'))
         delta0 = delta_val or 0.0
         cle = cell(row, 'key') or photo
@@ -776,12 +791,52 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
             ox=x, oy=y, oz=zv, oyaw=wrap180(dnord),
             key=cle, target=target, attrs=attrs, key_explicit='key' in col,
             h0=h0, delta0=delta0, delta_col=delta_val is not None,
-            floor_alt=floor_altitude(cell(row, 'floor')),
+            floor_alt=zfl if zfl is not None else floor_altitude(cell(row, 'floor')),
+            floor_alt_src=('colonne' if zfl is not None else
+                           'libellé' if floor_altitude(cell(row, 'floor')) is not None
+                           else ''),
+            z_csv=z,
         ))
 
     if not stations:
         raise ValueError("Aucune station exploitable dans le CSV.")
     return stations, warns
+
+
+Z_SOURCES = ('calcul', 'csv')
+Z_TOL = 0.02     # m — au-delà, le Z du CSV est signalé comme différent du calcul
+
+
+def apply_altimetry(stations: Sequence[Station], eye: float = EYE_HEIGHT_DEFAULT,
+                    source: str = 'calcul') -> int:
+    """Altitude du point de vue de chaque bulle, avant corrections (`oz`).
+
+    'calcul' : Z = Z plancher + delta + hauteur instrument. Le Z du CSV n'est
+    pas une base : il peut être faux, c'est justement ce qu'on vérifie ; il
+    reste lisible comme contrôle (écart affiché). Une bulle sans altitude de
+    plancher (ni colonne, ni libellé) garde son Z du CSV.
+    'csv' : Z du CSV, tel quel.
+
+    Les corrections (hauteur station, delta plancher) s'ajoutent ensuite.
+    Retourne le nombre de bulles dont le Z du CSV diffère du calcul.
+    """
+    ecarts = 0
+    for st in stations:
+        base = st.z_csv if st.z_csv is not None else st.oz
+        if source == 'calcul' and st.floor_alt is not None:
+            base = st.floor_alt + st.delta0 + (st.h0 if st.h0 is not None else eye)
+            if st.z_csv is not None and abs(st.z_csv - base) > Z_TOL:
+                ecarts += 1
+        st.oz = base
+        st.z = st.oz + st.dh + st.ddelta
+    return ecarts
+
+
+def z_ecart(st: Station) -> Optional[float]:
+    """Z du CSV moins Z calculé sans corrections (None si non comparable)."""
+    if st.z_csv is None:
+        return None
+    return st.z_csv - st.oz
 
 
 _FLOOR_ALT_RE = re.compile(r'\(\s*([+-]?\d+(?:[.,]\d+)?)\s*m?\s*\)')
@@ -3140,6 +3195,9 @@ class BubbleNavApp(_TkBase):
         self.floor_cb.config(values=self.floors)
         self.f_floor_cb.config(values=['tous', 'courant'] + self.floors)
         self.by_photo = {s.photo: s for s in stations}
+        # altitude du point de vue : plancher + delta + hauteur (avant corrections)
+        self.z_ecarts = apply_altimetry(stations, float(self.cfg.get(
+            'eye_height', EYE_HEIGHT_DEFAULT)), self.z_source())
         self.by_key = {s.key.lower(): s for s in stations}
         custom = self.cfg.get('corr_paths', {}).get(path, '')
         self.corrections = Corrections(path, custom if isinstance(custom, str) else '',
@@ -3172,6 +3230,11 @@ class BubbleNavApp(_TkBase):
             locs = sorted({stations[i].parts().local for i in self.incoherences})
             warns.append(f"{len(self.incoherences)} bulle(s) à l'étage déduit du local "
                          f"incohérent avec leur altitude : {', '.join(locs)}")
+        if self.z_source() == 'calcul':
+            calc = sum(1 for st in stations if st.floor_alt is not None)
+            msg += f" · Z = plancher + Δ + H ({calc} bulles)"
+            if self.z_ecarts:
+                msg += f" · {self.z_ecarts} Z du CSV ≠ calcul"
         anomalies = sum(1 for st in stations
                         if [a for a in st.parts().anomalies() if a != 'date'])
         if anomalies:
@@ -3525,6 +3588,32 @@ class BubbleNavApp(_TkBase):
     def relief(self) -> bool:
         return bool(self.cfg.get('disc_3d', True))
 
+    def z_source(self) -> str:
+        """Altitude du point de vue : 'calcul' (plancher + Δ + H) ou 'csv' (Z lu)."""
+        v = self.cfg.get('z_source', 'calcul')
+        return v if v in Z_SOURCES else 'calcul'
+
+    def refresh_altimetry(self, delay_ms: int = 0) -> None:
+        """Recalcule les altitudes (hauteur instrument ou source changée)."""
+        job = getattr(self, '_alti_job', None)
+        if job:
+            self.after_cancel(job)
+            self._alti_job = None
+        if delay_ms:
+            self._alti_job = self.after(delay_ms, self.refresh_altimetry)
+            return
+        if not self.stations:
+            return
+        self.z_ecarts = apply_altimetry(self.stations, float(self.cfg.get(
+            'eye_height', EYE_HEIGHT_DEFAULT)), self.z_source())
+        self.rebuild_graph()          # les liens entre planchers dépendent des Z
+        self._redraw_compare()
+        self._refresh_edit_panel()
+        if self.z_source() == 'calcul' and self.z_ecarts:
+            self._set_status(f"Z = plancher + Δ + H · {self.z_ecarts} bulle(s) dont le Z "
+                             f"du CSV diffère du calcul (> {Z_TOL * 100:.0f} cm)",
+                             COLORS['warning'])
+
     def anchor(self) -> str:
         """Hauteur des pastilles : 'sol' (plancher + delta) ou 'vue' (+ hauteur)."""
         return 'vue' if self.cfg.get('hotspot_anchor') == 'vue' else 'sol'
@@ -3639,13 +3728,19 @@ class BubbleNavApp(_TkBase):
         if self.heights_var.get() and (near or hovered or selected):
             eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
             nd = 3 if self.edit_mode else 2
+            ec = z_ecart(tgt)
+            diff = (self.z_source() == 'calcul' and tgt.floor_alt is not None
+                    and ec is not None and abs(ec) > Z_TOL)
             for label, val, fix, signed in (
                     ("H", tgt.height(eye), tgt.raised(), False),
                     ("Δ", tgt.delta(eye), tgt.shifted(), True),
                     ("Z", tgt.z, tgt.z_changed(), False)):
                 val_txt = f"{val:+.{nd}f}" if signed else f"{val:.{nd}f}"
-                text(hs.col, y, f"{label} {val_txt}", COLORS['edit'] if fix else MARK_TEXT,
-                     F_TINY)
+                txt, col = f"{label} {val_txt}", COLORS['edit'] if fix else MARK_TEXT
+                if label == 'Z' and diff:          # le Z du CSV ne suit pas le calcul
+                    txt += f"  (CSV {tgt.z_csv:.{nd}f})"
+                    col = COLORS['edit'] if fix else COLORS['warning']
+                text(hs.col, y, txt, col, F_TINY)
                 y += 11
 
     def label_y(self, hs: "Hotspot", hovered: bool) -> float:
@@ -4268,9 +4363,14 @@ class BubbleNavApp(_TkBase):
             lignes.append(f"Δ nord   {st.yaw_fix:+.3f}°  (à appliquer à l'image)")
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         plancher = (f"plancher {st.floor_alt:+.2f} + " if st.floor_alt is not None
-                    and not st.delta_col else '')
+                    else '')
         lignes.append(f"sol      {plancher}Δ {st.delta(eye):+.2f} = {st.ground(eye):.2f}")
         lignes.append(f"caméra   sol + H {st.height(eye):.2f} = {st.z:.2f} (point de vue)")
+        ec = z_ecart(st)
+        if self.z_source() == 'calcul' and st.floor_alt is not None and ec is not None:
+            lignes.append(f"Z CSV    {st.z_csv:.2f}  " + (
+                f"⚠ écart {ec:+.2f} m avec le calcul" if abs(ec) > Z_TOL
+                else "= calcul"))
         if st.moved():
             lignes.append(f"DÉPLACÉE en plan de {math.hypot(st.x - st.ox, st.y - st.oy):.2f} m")
         if st.raised():
@@ -4532,8 +4632,14 @@ class BubbleNavApp(_TkBase):
         self.pos_vars['dh'].set(f"{st.dh:+.3f}")
         self.pos_vars['ddelta'].set(f"{st.ddelta:+.3f}")
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        self.z_lbl.config(text=(f"Z caméra {st.z:.3f}  ·  sol {st.ground(eye):.3f}  ·  "
-                                f"hauteur {st.height(eye):.2f}  ·  delta {st.delta(eye):+.2f}"))
+        ec = z_ecart(st)
+        csv_txt = (f"\nZ CSV {st.z_csv:.3f}  ·  écart {ec:+.3f} avec le calcul"
+                   if ec is not None and self.z_source() == 'calcul'
+                   and st.floor_alt is not None and abs(ec) > Z_TOL else '')
+        base = (f"plancher {st.floor_alt:.3f} + " if st.floor_alt is not None
+                and self.z_source() == 'calcul' else '')
+        self.z_lbl.config(text=(f"{base}Δ {st.delta(eye):+.3f} + H {st.height(eye):.3f} "
+                                f"= Z {st.z:.3f}  ·  sol {st.ground(eye):.3f}{csv_txt}"))
         self._sync_ui = True
         try:
             self.yaw_var.set(round(self.stations[self.current].yaw_fix, 2)
@@ -5838,7 +5944,12 @@ class BubbleNavApp(_TkBase):
             self.cfg['north_mode'] = self.calib.mode
             self.cfg['north_sense'] = self.calib.sense
             self.cfg['north_offset'] = self.calib.offset
+            eye_changed = abs(float(eye_var.get()) - float(self.cfg.get(
+                'eye_height', EYE_HEIGHT_DEFAULT))) > 1e-9
             self.cfg['eye_height'] = float(eye_var.get())
+            if eye_changed:
+                self.corrections.eye = float(eye_var.get())
+                self.refresh_altimetry(delay_ms=250)
             self._draw_overlay()
             self._draw_plan()
             self._redraw_compare()
@@ -5869,8 +5980,29 @@ class BubbleNavApp(_TkBase):
         tk.Label(cal, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'], anchor='w',
                  justify='left',
                  text="Hauteur de l'appareil au-dessus du sol, pour les bulles sans colonne\n"
-                      "« H appareil ». Z = plancher + H + Δ : le Δ de chaque bulle se déduit\n"
-                      "de l'altitude du plancher ; la pastille se pose à Z − H.").pack(fill='x')
+                      "de hauteur instrument.").pack(fill='x')
+        zrow = tk.Frame(cal, bg=COLORS['bg_dark'])
+        zrow.pack(fill='x', pady=(4, 0))
+        tk.Label(zrow, text="Altitude du point de vue", width=22, anchor='w', font=F_UI,
+                 bg=COLORS['bg_dark'], fg=COLORS['text']).pack(side='left')
+        zsrc_var = tk.StringVar(value=self.z_source())
+
+        def apply_zsrc():
+            self.cfg['z_source'] = zsrc_var.get()
+            self.refresh_altimetry()
+
+        for text, value in (("Z plancher + Δ + H (calcul)", 'calcul'),
+                            ("Z du CSV", 'csv')):
+            self.tip(tk.Radiobutton(zrow, text=text, variable=zsrc_var, value=value,
+                                    command=apply_zsrc, font=F_UI,
+                                    bg=COLORS['bg_dark'], fg=COLORS['text'],
+                                    selectcolor=COLORS['bg_light'],
+                                    activebackground=COLORS['bg_dark'],
+                                    activeforeground=COLORS['text'], bd=0,
+                                    highlightthickness=0),
+                     "Calcul : Z = Z plancher (colonne, sinon libellé du plancher) + delta "
+                     "+ hauteur instrument ; le Z du CSV n'est qu'un contrôle. "
+                     "Z du CSV : altitude lue telle quelle.").pack(side='left', padx=4)
         disc_var = tk.DoubleVar(value=float(self.cfg.get('disc_radius', DISC_RADIUS_M)))
         dmin_var = tk.DoubleVar(value=self.disc_bounds()[0])
         dmax_var = tk.DoubleVar(value=self.disc_bounds()[1])
@@ -7332,6 +7464,50 @@ def selftest(csv_path: str = '') -> int:
               set(sk) <= full and n_comp(sk) == n_comp(full)
               and 2.0 <= len(full) / max(1, len(sk)) <= 4.5,
               f"{len(full)} → {len(sk)} traits")
+
+    # 15. Altimétrie : Z = Z plancher + delta + hauteur instrument
+    print("\n15) Altimétrie : Z plancher + delta + hauteur instrument")
+    import tempfile as _tf5
+    import shutil as _sh5
+    tmp5 = _tf5.mkdtemp(prefix='bubblenav_alti_')
+    try:
+        c = os.path.join(tmp5, 'alti.csv')
+        with open(c, 'w', encoding='utf-8-sig', newline='') as fh:
+            fh.write("Num scan;Nom du Locator;X;Y;Z;Z plancher;Delta;Hauteur instrument;"
+                     "% NORD;Plancher\r\n"
+                     "1;R110_01;0;0;1.650;0.00;0;1.65;50;PLANCHER 01 (+00.00m)\r\n"
+                     "2;R110_02;3;0;1.900;0.00;+0.25;1.65;50;PLANCHER 01 (+00.00m)\r\n"
+                     "3;R110_03;6;0;2.500;0.00;-0.10;1.50;50;PLANCHER 01 (+00.00m)\r\n"
+                     "4;R210_01;0;5;5.650;4.00;0;;50;PLANCHER 02 (+04.00m)\r\n")
+        a, _ = read_survey_csv(c)
+        check("colonnes Z plancher / Delta / Hauteur instrument reconnues",
+              a[1].floor_alt == 0.0 and a[1].floor_alt_src == 'colonne'
+              and a[1].delta_col and a[1].delta0 == 0.25 and a[2].h0 == 1.50)
+        n = apply_altimetry(a, 1.60, 'calcul')
+        check("Z = plancher + Δ + H (Z du CSV ignoré)",
+              abs(a[1].z - 1.90) < 1e-9 and abs(a[2].z - 1.40) < 1e-9
+              and abs(a[3].z - 5.60) < 1e-9,
+              f"{a[1].z:.2f} / {a[2].z:.2f} / {a[3].z:.2f} (H défaut 1.60)")
+        check("Z du CSV faux : écart signalé", n == 2 and abs(z_ecart(a[2]) - 1.10) < 1e-9
+              and abs(z_ecart(a[1])) < 1e-9, f"{n} écart(s)")
+        corr = Corrections(c, eye=1.60)
+        corr.apply(a[2], ddelta=+0.05)
+        corr.apply(a[2], dh=+0.02)
+        check("corrections : Δ et H s'ajoutent au calcul",
+              abs(a[2].z - 1.47) < 1e-9 and abs(a[2].delta(1.60) + 0.05) < 1e-9
+              and abs(a[2].height(1.60) - 1.52) < 1e-9 and abs(a[2].ground(1.60) + 0.05) < 1e-9)
+        out = os.path.join(tmp5, 'alti_corrige.csv')
+        write_corrected_csv(c, out, a, eye=1.60)
+        b, _ = read_survey_csv(out)
+        check("relevé corrigé : Z, Delta et Hauteur réécrits",
+              abs(b[2].z_csv - 1.47) < 5e-4 and abs(b[2].delta0 + 0.05) < 5e-4
+              and abs(b[2].h0 - 1.52) < 5e-4 and abs(b[0].z_csv - 1.65) < 5e-4,
+              f"Z {b[2].z_csv} Δ {b[2].delta0} H {b[2].h0}")
+        apply_altimetry(a, 1.60, 'csv')
+        check("source « Z du CSV » : Z lu, corrections conservées",
+              abs(a[2].z - (2.50 + 0.07)) < 1e-9)
+    finally:
+        _sh5.rmtree(tmp5, ignore_errors=True)
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))

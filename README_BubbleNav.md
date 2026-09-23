@@ -78,10 +78,43 @@ Colonnes reconnues :
 | `Fichier photo` ou `N° scan` | identifiant ; nom de l'image, avec ou sans extension | l'un des deux |
 | `X` | coordonnée **Est** (m) | oui |
 | `Y` | coordonnée **Nord** (m) | oui |
-| `Z` | altitude de la caméra (m) | recommandé |
+| `Z` | altitude **finale** du point de vue, telle que produite (m) : sert de **contrôle** | recommandé |
 | `% NORD` | position du nord dans l'image, en % de la largeur (50 % = centre) | recommandé |
 | `Nom du Locator` | nom affiché de la bulle | facultatif |
 | `Plancher` | niveau, sert au plan et aux liens verticaux | facultatif |
+| `Z plancher` | altitude du plancher (m) ; à défaut, lue dans le libellé « PLANCHER 02 (+00.00m) » | recommandé |
+| `Delta` | décalage **±** du sol local par rapport au plancher (marche, faux plancher, mezzanine) | facultatif (0) |
+| `Hauteur instrument` | hauteur de l'appareil au-dessus du sol local | facultatif (Réglages, 1,65 m) |
+
+Intitulés reconnus, entre autres : `Z plancher`, `Altitude plancher`, `Z dalle` ;
+`Delta`, `Delta plancher` ; `Hauteur instrument`, `H instrument`, `HI`,
+`H appareil`.
+
+**Altitude du point de vue : calculée, jamais recopiée.** Le programme calcule
+
+```
+Z point de vue = Z plancher + Delta + Hauteur instrument
+```
+
+Le `Z` du CSV peut être faux : c'est justement ce qu'on veut vérifier. Il n'est
+donc pas utilisé pour placer les pastilles ; il est **comparé** au calcul :
+* au chargement, la barre d'état indique combien de bulles ont un Z du CSV
+  différent du calcul (écart de plus de 2 cm) ;
+* la fiche de la bulle affiche `Z CSV … ⚠ écart …` ;
+* sous la pastille, la ligne Z devient orange : `Z 1.65  (CSV 3.15)`.
+
+Les corrections de l'édition portent sur les deux composantes, jamais sur le Z
+lui-même :
+* **hauteur station** : seule la caméra bouge ;
+* **delta plancher** : caméra et sol bougent.
+
+Le Z final se recalcule. Le relevé corrigé réécrit `Z`, `Delta` et
+`Hauteur instrument` pour les bulles corrigées. `X` et `Y` se corrigent à part,
+pour la position et la cohérence d'orientation entre points de vue.
+
+Une bulle sans altitude de plancher (ni colonne, ni libellé) garde son Z du
+CSV. Réglages → *Altitude du point de vue* permet aussi de revenir au Z du CSV
+tel quel, pour comparaison.
 
 Les lignes inexploitables sont ignorées et listées dans « Réglages… → Voir les
 avertissements CSV » — jamais bloquantes.
@@ -183,21 +216,19 @@ tiers du tour. Pour tout voir :
 * **au point de vue** : la sphère est à la hauteur de l'appareil (**Z**), et un
   **mât** la relie à son pied au sol. On lit ainsi H d'un coup d'œil.
 
-Le modèle d'altitude est **Z = plancher + H + Δ**. Quand le relevé n'a pas de
-colonne delta, **Δ est déduit** de l'altitude écrite dans le libellé du plancher
-(« PLANCHER 02 (+00.00m) ») : Δ = Z − plancher − H. H est la colonne
-« H appareil », ou à défaut la **hauteur instrument** des Réglages (1,65 m).
-
-Sur GRA6, 543 bulles sur 693 ont Δ = 0. Les autres ont un Δ de −1,90 m à
-+3,60 m : marches, mezzanines, ou bien une erreur de Z. Une pastille qui semble
-« trop haute » ou « trop basse » par rapport au sol de la photo révèle
-justement un de ces Δ. La fiche et les lignes H / Δ / Z sous la pastille le
-montrent :
+Le point de vue se calcule toujours de la même façon, **Z = plancher + Δ + H**
+(voir § 2). La fiche détaille le calcul et le compare au Z du CSV :
 
 ```
-sol      plancher -8.50 + Δ -0.45 = -8.95
-caméra   sol + H 1.65 = -7.30 (point de vue)
+sol      plancher -8.50 + Δ +0.00 = -8.50
+caméra   sol + H 1.65 = -6.85 (point de vue)
+Z CSV    -7.30  ⚠ écart -0.45 m avec le calcul
 ```
+
+Les relevés actuels (GRA6, BUG_BR) n'ont encore ni colonne delta ni colonne
+hauteur : tout y est calculé avec Δ = 0 et H = 1,65 m. Sur GRA6, 150 bulles
+ont un Z du CSV qui diffère de ce calcul. Ce sont les marches, les mezzanines
+ou les erreurs à examiner.
 
 **Étiquettes des pastilles** (menu « Affichage ▾ », chaque ligne se coche à
 part, le choix est mémorisé et vaut aussi pour la vue B) :
@@ -292,9 +323,10 @@ recharger les images :
 * **Sens des azimuts** : horaire (standard) ou anti-horaire si l'image est en miroir ;
 * **Correction nord** : décalage global en degrés ;
 * **Hauteur instrument** : hauteur de l'appareil au-dessus du sol (1,65 m par
-  défaut), pour les bulles sans colonne « H appareil ». Elle fixe le sol
-  (Z − H), donc la hauteur des pastilles, et le Δ déduit du plancher. L'effet
-  est immédiat dans les deux vues.
+  défaut), pour les bulles sans colonne de hauteur. Elle entre dans le calcul
+  Z = plancher + Δ + H, avec un effet immédiat dans les deux vues ;
+* **Altitude du point de vue** : *Z plancher + Δ + H* (calcul, par défaut) ou
+  *Z du CSV* (lu tel quel, pour comparaison).
 
 Les dialogues (Réglages, bilan…) s'ouvrent **devant le visualiseur**, même en
 plein écran.
