@@ -3955,9 +3955,12 @@ class BubbleNavApp(_TkBase):
         # Pastilles lointaines (à leur taille minimale) : la sphère seule, pour
         # que tout le plancher reste lisible ; le survol donne tout.
         near = labels and hs.radius > self.disc_bounds()[0] + 0.5
-        name = tgt.locator
-        if tgt.key_explicit and tgt.key and tgt.key != tgt.locator:
-            name += f" · {tgt.key}"                 # n° de scan : nom de l'image
+        # Mode num scan : le n° de scan (nom de l'image) au-dessus de la pastille ;
+        # le survol ajoute le locator.
+        scan = tgt.key_explicit and tgt.key and tgt.key != tgt.locator
+        name = tgt.key if scan else tgt.locator
+        if scan and (hovered or selected):
+            name += f" · {tgt.locator}"
         if (self.names_var.get() and near) or hovered or tag or selected:
             text(hs.col, top, (tag + '  ' if tag else '') + name,
                  'white' if hovered or tag else MARK_TEXT,
@@ -4044,7 +4047,7 @@ class BubbleNavApp(_TkBase):
             text=f"cap {az:+07.1f}°  |  site {view.pitch:+05.1f}°  |  champ {view.fov:.0f}°")
         title = f"{st.locator}   ({st.floor})"
         if st.key_explicit and st.key and st.key != st.locator:
-            title = f"{st.locator} · scan {st.key}   ({st.floor})"
+            title = f"{st.key} · {st.locator}   ({st.floor})"
         if st.turned():
             title += f"   Δnord {st.yaw_fix:+.2f}°"
         self.canvas.create_text(15, 13, text=title, anchor='nw', fill='#000000',
@@ -5916,8 +5919,8 @@ class BubbleNavApp(_TkBase):
         h = max(50, int(self.plan.winfo_height()))
         to_screen, _ = self._plan_transform(self._plan_stations(), w, h)
         x, y = to_screen(st.x, st.y)
-        name = st.locator + (f"  ({st.key})" if st.key_explicit and st.key != st.locator
-                             else '')
+        name = (f"{st.key} · {st.locator}" if st.key_explicit and st.key
+                and st.key != st.locator else st.locator)
         self.plan.create_oval(x - 5, y - 5, x + 5, y + 5, outline='white', width=1.5,
                               tags='plan_tip')
         item = self.plan.create_text(x, y - 10, text=name, anchor='s', font=F_UI_B,

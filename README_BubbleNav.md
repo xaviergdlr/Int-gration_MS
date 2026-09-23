@@ -256,7 +256,9 @@ caméra   sol + H 1.65 = -6.85 (point de vue)
 
 **Étiquettes des pastilles** (menu « Affichage ▾ », chaque ligne se coche à
 part, le choix est mémorisé et vaut aussi pour la vue B) :
-* **au-dessus** : le **nom de la station**, en petit ;
+* **au-dessus** : le **nom de la station**, en petit. En mode num scan, c'est le
+  **n° de scan** (« 1001 »), c'est-à-dire le nom de l'image ; le survol ajoute le
+  locator (« 1001 · R110b_01 »), comme le titre et le survol du plan ;
 * **dessous** : la **distance**, puis trois lignes discrètes :
   * `H` : **hauteur de l'appareil** (hauteur du relevé + correction) ;
   * `Δ` : **delta plancher** (colonne du relevé, ou déduit du plancher, + correction) ;
