@@ -127,6 +127,9 @@ F_UI = ('Segoe UI', 9)
 F_UI_B = ('Segoe UI', 9, 'bold')
 F_TITLE = ('Segoe UI', 11, 'bold')
 F_MONO = ('Consolas', 9)
+F_TINY = ('Segoe UI', 8)
+F_TINY_B = ('Segoe UI', 8, 'bold')
+MARK_TEXT = '#d9dee2'          # étiquettes discrètes des pastilles
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,6 +210,8 @@ DEFAULT_CONFIG = {
     'ang_min': ANG_MIN_DEFAULT,
     'floor_radius': FLOOR_RADIUS_DEFAULT,
     'show_labels': True,
+    'show_names': True,        # nom de la station au-dessus des pastilles
+    'show_heights': True,      # hauteur appareil / delta / altitude sous les pastilles
     'keep_heading': True,
     'disc_radius': DISC_RADIUS_M,
     'disc_min_px': DISC_PX_MIN,
@@ -2285,6 +2290,7 @@ class BubbleNavApp(_TkBase):
         self._cmp_sig = None                     # état de synchro de la vue B
         self._last_current = -1
         self._plan_hit = None                    # deplacement sur le plan
+        self._plan_hover: Optional[int] = None   # station survolée sur le plan
         self._plan_axis: Optional[str] = None    # axe du glisser sur le plan
         self._plan_start = (0.0, 0.0)
         self._autosave_job = None
@@ -2614,12 +2620,23 @@ class BubbleNavApp(_TkBase):
         qual.bind('<<ComboboxSelected>>', self._on_quality)
 
         self.labels_var = tk.BooleanVar(value=bool(self.cfg.get('show_labels', True)))
-        tk.Checkbutton(bar, text="Étiquettes", variable=self.labels_var,
-                       command=lambda: self._draw_overlay(),
-                       bg=COLORS['bg_medium'], fg=COLORS['text'], font=F_UI,
-                       selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_medium'],
-                       activeforeground=COLORS['text'], bd=0, highlightthickness=0
-                       ).pack(side='left', padx=8)
+        self.names_var = tk.BooleanVar(value=bool(self.cfg.get('show_names', True)))
+        self.heights_var = tk.BooleanVar(value=bool(self.cfg.get('show_heights', True)))
+        # Un seul bouton pour les étiquettes : la barre reste courte.
+        mb = tk.Menubutton(bar, text="Étiquettes ▾", font=F_UI, relief='flat',
+                           bg=COLORS['bg_light'], fg=COLORS['text'],
+                           activebackground=COLORS['accent'],
+                           activeforeground='white', padx=8, pady=3)
+        menu = tk.Menu(mb, tearoff=False, bg=COLORS['bg_light'], fg=COLORS['text'],
+                       activebackground=COLORS['accent'], activeforeground='white',
+                       selectcolor=COLORS['text'], font=F_UI)
+        for txt, var in (("Distance sous la pastille", self.labels_var),
+                         ("Nom de la station au-dessus", self.names_var),
+                         ("Hauteur appareil, delta, altitude (H / Δ / Z)",
+                          self.heights_var)):
+            menu.add_checkbutton(label=txt, variable=var, command=self._on_marks)
+        mb.config(menu=menu)
+        mb.pack(side='left', padx=8, pady=4)
 
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
                                                          padx=8, pady=6)
@@ -2654,6 +2671,8 @@ class BubbleNavApp(_TkBase):
         self.plan.bind('<B1-Motion>', self._on_plan_drag_left)
         self.plan.bind('<ButtonRelease-1>', self._on_plan_release_left)
         self.plan.bind('<Double-Button-1>', self._on_plan_double)
+        self.plan.bind('<Motion>', self._on_plan_motion)
+        self.plan.bind('<Leave>', lambda e: self._set_plan_hover(None))
         self.plan.bind('<ButtonPress-3>', self._on_plan_press)
         self.plan.bind('<B3-Motion>', self._on_plan_drag)
         self.plan.bind('<MouseWheel>', self._on_plan_wheel)
@@ -3179,6 +3198,62 @@ class BubbleNavApp(_TkBase):
                            hs.col + r * 0.22, hs.row + r * 0.12,
                            fill=COLORS['hot_edge'], outline='', tags='hs')
 
+    def _on_marks(self) -> None:
+        """Cases Distances / Noms / Hauteurs : mémorisées, appliquées aux deux vues."""
+        self.cfg['show_labels'] = bool(self.labels_var.get())
+        self.cfg['show_names'] = bool(self.names_var.get())
+        self.cfg['show_heights'] = bool(self.heights_var.get())
+        save_config(self.cfg)
+        self._draw_overlay()
+        if self.compare is not None:
+            self.compare._draw_overlay()
+
+    def draw_marks(self, canvas, hs: "Hotspot", tgt: Station, color: str,
+                   hovered: bool, selected: bool = False, missing: bool = False) -> None:
+        """Étiquettes d'une pastille, lues à chaque dessin (donc toujours à jour).
+
+        Au-dessus : le nom de la station. Dessous : la distance, puis trois
+        lignes discrètes — hauteur de l'appareil, delta plancher et altitude
+        finale du point de vue (Z caméra). Une valeur corrigée passe en
+        orange. Les lignes d'altitude sont réservées aux pastilles proches
+        (non réduites à leur taille minimale), à la pastille survolée et à
+        la cible d'édition, pour ne pas encombrer le lointain.
+        """
+        lk = hs.link
+        top = self.glyph_y(hs, hovered)
+        if lk.kind != 'same':
+            canvas.create_text(hs.col, top, text='▲' if lk.kind == 'up' else '▼',
+                               fill=color, font=('Segoe UI', 11, 'bold'), tags='hs')
+            top -= 13
+
+        def text(x, y, txt, fill, font):
+            canvas.create_text(x + 1, y + 1, text=txt, fill='#000000', font=font, tags='hs')
+            canvas.create_text(x, y, text=txt, fill=fill, font=font, tags='hs')
+
+        if self.names_var.get() or hovered:
+            text(hs.col, top, tgt.locator, 'white' if hovered else MARK_TEXT,
+                 F_TINY_B if hovered or selected else F_TINY)
+        y = self.label_y(hs, hovered)
+        if self.labels_var.get() or hovered:
+            txt = human_dist(lk.dist)
+            if hovered and missing:
+                txt += " · image absente"
+            text(hs.col, y, txt, 'white' if hovered else '#e8e8e8',
+                 F_UI_B if hovered else F_UI)
+            y += 13
+        near = hs.radius > self.disc_bounds()[0] + 0.5
+        if self.heights_var.get() and (near or hovered or selected):
+            eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+            nd = 3 if self.edit_mode else 2
+            for label, val, fix, signed in (
+                    ("H", tgt.height(eye), tgt.raised(), False),
+                    ("Δ", tgt.delta(), tgt.shifted(), True),
+                    ("Z", tgt.z, tgt.z_changed(), False)):
+                val_txt = f"{val:+.{nd}f}" if signed else f"{val:.{nd}f}"
+                text(hs.col, y, f"{label} {val_txt}", COLORS['edit'] if fix else MARK_TEXT,
+                     F_TINY)
+                y += 11
+
     def label_y(self, hs: "Hotspot", hovered: bool) -> float:
         r = hs.radius * (1.25 if hovered else 1.0)
         return hs.row + (SHADOW_RY * r if self.relief() else 0.55 * r) + 10
@@ -3205,7 +3280,6 @@ class BubbleNavApp(_TkBase):
         if view is None or self.current < 0:
             return
         self.hotspots = self._compute_hotspots(view)
-        show_lbl = bool(self.labels_var.get())
         if self.edit_mode:
             self._draw_edit_refs(view)
             self._draw_axes(view)
@@ -3222,24 +3296,9 @@ class BubbleNavApp(_TkBase):
             if tgt.modified():
                 color = COLORS['edit']
             hovered = (i == self._hover)
-            self.draw_hotspot(self.canvas, hs, color, hovered,
-                              selected=self.edit_mode and self.selected == tgt.idx)
-            if lk.kind != 'same':
-                self.canvas.create_text(hs.col, self.glyph_y(hs, hovered),
-                                        text='▲' if lk.kind == 'up' else '▼',
-                                        fill=color, font=('Segoe UI', 11, 'bold'), tags='hs')
-            if show_lbl or hovered:
-                txt = human_dist(lk.dist)
-                if hovered:
-                    txt = f"{hs.label} · {txt}"
-                    if missing:
-                        txt += " · image absente"
-                ty = self.label_y(hs, hovered)
-                self.canvas.create_text(hs.col + 1, ty + 1, text=txt, fill='#000000',
-                                        font=F_UI, tags='hs')
-                self.canvas.create_text(hs.col, ty, text=txt,
-                                        fill='white' if hovered else '#e8e8e8',
-                                        font=F_UI_B if hovered else F_UI, tags='hs')
+            selected = self.edit_mode and self.selected == tgt.idx
+            self.draw_hotspot(self.canvas, hs, color, hovered, selected=selected)
+            self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing)
         self._draw_hud(view)
         if self._hover is not None and getattr(self, '_hover_xy', None):
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
@@ -4087,9 +4146,15 @@ class BubbleNavApp(_TkBase):
         self._refresh_side()
         self._draw_overlay()
         self._draw_plan()
+        self._redraw_compare()
         if self._autosave_job:
             self.after_cancel(self._autosave_job)
         self._autosave_job = self.after(1200, self._autosave)
+
+    def _redraw_compare(self) -> None:
+        """La vue B montre les mêmes stations : ses pastilles suivent les corrections."""
+        if self.compare is not None:
+            self.compare._draw_overlay()
 
     def _rebuild_after_move(self) -> None:
         self._graph_job = None
@@ -4361,6 +4426,7 @@ class BubbleNavApp(_TkBase):
         self._refresh_edit_panel()
         self._draw_overlay()
         self._draw_plan()
+        self._redraw_compare()
 
     def _end_edit_drag(self) -> None:
         kind = self._hs_drag[0] if self._hs_drag else None
@@ -4889,6 +4955,7 @@ class BubbleNavApp(_TkBase):
         self.plan.create_line(w - 16, 26, w - 16, 40, fill='#ff6b6b', width=2)
         self.plan.create_text(8, h - 10, anchor='w', font=F_UI, fill=COLORS['text_muted'],
                               text=f"{len(pts)} bulles · molette: zoom · clic droit: déplacer")
+        self._draw_plan_tip()
 
     def _cone_signature(self) -> Optional[tuple]:
         """Tout ce dont dépend le camembert : point de vue, cap, champ, plan."""
@@ -4979,6 +5046,51 @@ class BubbleNavApp(_TkBase):
             self.plan.create_text(bx, by - 11, text="B", fill=COLORS['sel'],
                                   font=F_UI_B, tags='cone')
         self._cone_sig = self._cone_signature()
+        self.plan.tag_raise('plan_tip')
+
+    # ── survol du plan : nom de la station ───────────────────────────
+    def _on_plan_motion(self, event) -> None:
+        self._set_plan_hover(self._plan_nearest(event, 9.0))
+
+    def _set_plan_hover(self, idx: Optional[int]) -> None:
+        if idx != self._plan_hover:
+            self._plan_hover = idx
+            self._draw_plan_tip()
+
+    def _draw_plan_tip(self) -> None:
+        """Nom de la station survolée, en bulle, au-dessus de son point."""
+        self.plan.delete('plan_tip')
+        idx = self._plan_hover
+        if idx is None or not (0 <= idx < len(self.stations)):
+            return
+        st = self.stations[idx]
+        if st.floor != self.floor_var.get():
+            return
+        w = max(50, int(self.plan.winfo_width()))
+        h = max(50, int(self.plan.winfo_height()))
+        to_screen, _ = self._plan_transform(self._plan_stations(), w, h)
+        x, y = to_screen(st.x, st.y)
+        name = st.locator + (f"  ({st.key})" if st.key_explicit and st.key != st.locator
+                             else '')
+        self.plan.create_oval(x - 5, y - 5, x + 5, y + 5, outline='white', width=1.5,
+                              tags='plan_tip')
+        item = self.plan.create_text(x, y - 10, text=name, anchor='s', font=F_UI_B,
+                                     fill=COLORS['text'], tags='plan_tip')
+        x1, y1, x2, y2 = self.plan.bbox(item)
+        dx = 4 - x1 if x1 < 4 else (w - 4 - x2 if x2 > w - 4 else 0)
+        dy = 4 - y1 if y1 < 4 else 0
+        if dy:                                   # trop haut : sous le point
+            self.plan.itemconfigure(item, anchor='n')
+            self.plan.coords(item, x, y + 10)
+            x1, y1, x2, y2 = self.plan.bbox(item)
+        if dx:
+            self.plan.move(item, dx, 0)
+            x1, x2 = x1 + dx, x2 + dx
+        rect = self.plan.create_rectangle(x1 - 4, y1 - 1, x2 + 4, y2 + 1,
+                                          fill=COLORS['tip_bg'], outline=COLORS['sel'],
+                                          tags='plan_tip')
+        self.plan.tag_lower(rect, item)
+        self.plan.tag_raise('plan_tip')
 
     def _plan_nearest(self, event, max_px: float = 20.0) -> Optional[int]:
         pts = self._plan_stations()
@@ -5416,6 +5528,8 @@ class BubbleNavApp(_TkBase):
         try:
             self.cfg['fov'] = self.view.fov
             self.cfg['show_labels'] = bool(self.labels_var.get())
+            self.cfg['show_names'] = bool(self.names_var.get())
+            self.cfg['show_heights'] = bool(self.heights_var.get())
             if self._viewer_visible() and not self._viewer_fullscreen():
                 self.cfg['viewer_geometry'] = self.viewer.geometry()
             save_config(self.cfg)
@@ -5709,13 +5823,8 @@ class CompareView(tk.Frame if _TK_OK else object):
                 color = COLORS['edit']
             hovered = i == self._hover
             app.draw_hotspot(self.canvas, hs, color, hovered)
-            txt = f"{hs.label} · {human_dist(hs.link.dist)}" if hovered \
-                else human_dist(hs.link.dist)
-            ty = app.label_y(hs, hovered)
-            self.canvas.create_text(hs.col + 1, ty + 1, text=txt, fill='#000000',
-                                    font=F_UI, tags='hs')
-            self.canvas.create_text(hs.col, ty, text=txt, fill='#e8e8e8',
-                                    font=F_UI, tags='hs')
+            app.draw_marks(self.canvas, hs, tgt, color, hovered,
+                           missing=not app.store.has(tgt.photo))
         if self._hover is not None and self._hover_xy:
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
         st = self.station()

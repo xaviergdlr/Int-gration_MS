@@ -126,7 +126,8 @@ relevé déjà renommé.
 | `Origine` | redresser la vue |
 | `F11` / `Échap` | plein écran |
 
-**Plan du plancher** (à droite) : clic gauche = aller à la bulle la plus proche,
+**Plan du plancher** (à droite) : le **survol** d'un point affiche le nom de la
+station (et son n° de scan en mode num scan) ; clic gauche = aller à la bulle la plus proche,
 molette = zoom, clic droit glissé = déplacer. Le **camembert jaune** donne la
 position, la direction de visée et l'ouverture du champ. Il est **entièrement
 dynamique** : une veille compare 60 fois par seconde l'état dont il dépend (point
@@ -156,6 +157,22 @@ La liste « Plancher » change de niveau en rejoignant la bulle la plus proche �
 **Couleur des pastilles** : jaune = même plancher · bleu ▲ = niveau au-dessus ·
 violet ▼ = niveau en dessous · rouge sombre = image absente du dossier · orange =
 bulle corrigée.
+
+**Étiquettes des pastilles** (bouton « Étiquettes ▾ », chaque ligne se coche à
+part, le choix est mémorisé et vaut aussi pour la vue B) :
+* **au-dessus** : le **nom de la station**, en petit ;
+* **dessous** : la **distance**, puis trois lignes discrètes :
+  * `H` : **hauteur de l'appareil** (hauteur du relevé + correction) ;
+  * `Δ` : **delta plancher** (delta du relevé + correction) ;
+  * `Z` : **altitude finale du point de vue** (Z caméra = plancher + H + Δ).
+
+Ces valeurs sont relues à chaque image : toute correction, au clavier, par
+saisie ou en glissant un axe, s'affiche aussitôt. Une composante corrigée passe
+en **orange**. En mode édition, les valeurs sont au millimètre, sinon au
+centimètre. Les trois lignes d'altitude sont réservées aux pastilles proches,
+c'est-à-dire celles qui ne sont pas réduites à leur taille minimale. La pastille
+survolée et la cible d'édition les affichent toujours, pour ne pas encombrer
+le lointain.
 
 **Aspect des pastilles** : chaque pastille est une **sphère ombrée** posée sur son
 ombre portée — éclairage en haut à gauche, reflet, ombre douce au pied — générée
