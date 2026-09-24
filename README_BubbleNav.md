@@ -173,7 +173,7 @@ relevé déjà renommé.
 | Glisser | tourner la vue |
 | Molette, `+` / `−` | champ de vision, de 30° à **200°** (105° par défaut), avec un **cran à 120°** ; au-delà de 110°, passage progressif en **grand angle** |
 | Bouton **120°** (à côté du champ) | les **deux vues** à 120° |
-| **Espace + glisser** | **déplacer en plan la station active**, librement dans toutes les directions (X / Y verrouillent un axe). Sans passer par le mode édition. Un **appui bref** sur Espace avance vers la pastille centrale |
+| **Espace + glisser** (vue B) | **déplacer en plan la station active** : saisir sa pastille dans B, librement dans toutes les directions (X / Y verrouillent un axe). Sans passer par le mode édition. Un **appui bref** sur Espace avance vers la pastille centrale |
 | Double-clic | recentrer la vue sur ce point |
 | `Entrée` / `Espace` | avancer vers la pastille la plus centrale |
 | `Retour arrière` | revenir à la bulle précédente |
@@ -275,12 +275,12 @@ voisine est représentée **là où était l'appareil**, à sa hauteur (Z = plan
 profondeur :
 * la **sphère** : l'appareil, de taille réelle (environ 25 cm de rayon), donc
   d'autant plus petite qu'elle est loin ;
-* le **mât** : la verticale du point de vue, du sol de la bulle jusqu'au
-  **pôle sud** de la sphère. En perspective, la verticale se projette sur la
+* le **mât** : la verticale du point de vue, **ancrée au Z plancher** de la
+  bulle, jusqu'au **pôle sud** de la sphère (Z final = plancher + Δ + H). En perspective, la verticale se projette sur la
   droite qui va du sol au centre de la sphère : le mât y entre exactement par
   en dessous. Quand la bulle porte une mire, **la mire est ce mât**, gradué
   tous les 10 cm ;
-* l'**ombre au sol** : une ombre douce, posée à plat sous la bulle, en
+* l'**ombre au sol** : une ombre douce, posée à plat sur le plancher, en
   perspective. Aplatie quand elle est loin, plus ronde quand elle est proche
   et vue d'en haut.
 
@@ -438,16 +438,19 @@ dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
    fois l'appareil et son sol. La bulle de l'autre vue (et la pastille
    survolée) porte
    une **empreinte au sol** et une **mire graduée** :
-   * l'empreinte est un cercle de 50 cm posé sur son sol, vu en perspective ;
-     il doit s'inscrire à plat sur le sol de la photo ;
-   * la mire monte du sol à la caméra, graduée tous les 10 cm (trait plus long
-     tous les 50 cm) ;
-   * les valeurs sont affichées : sol, Δ, H, Z.
+   * l'**ancrage est fixe, au Z plancher** : l'empreinte (cercle de 50 cm, vue
+     en perspective), l'ombre et le pied du mât y restent, quels que soient
+     Δ et H ;
+   * au-dessus, le **tronçon Δ** (rose) monte ou descend du plancher au sol
+     local (plancher + Δ), marqué d'un trait « Δ +0,45 » ;
+   * puis la **mire H**, graduée tous les 10 cm (trait plus long tous les
+     50 cm), va du sol local à la caméra ;
+   * la sphère est au **Z final = plancher + Δ + H**, affiché à côté avec H.
 3. **Corriger** en continu — **seule la station active (celle de la vue A)
    est modifiable**, où que soit le curseur, dans A comme dans B :
-   * **Alt + molette** : son **Δ** (sol et caméra montent ou descendent
-     ensemble) ;
-   * **Maj + molette** : sa **H** (la caméra seule) ;
+   * **Alt + molette** : son **Δ** — le tronçon Δ s'allonge ou raccourcit, la
+     sphère monte ou descend, l'ancrage au plancher ne bouge pas ;
+   * **Maj + molette** : sa **H** — la mire H s'allonge, la sphère suit ;
    * la molette agit aussi quand le curseur est **dans B** : c'est toujours la
      station active qui bouge, et on voit sa pastille monter ou descendre dans
      B — comme Espace + glisser dans B, qui déplace la pastille de la station
@@ -477,21 +480,21 @@ les commandes qui **lient les deux vues** : ⇆ Face à face · ⇄ Inverser ·
 A → B · B → A · Suivi de A · Vue liée. Les valeurs corrigées passent en orange.
 
 **Déplacer en plan sans le mode édition** — toujours la **station active**,
-en X / Y seulement (le Z se règle à la molette) :
-* **dans A** : maintenir **Espace** et glisser en saisissant le sol ou une
-  pastille. Ce que l'on saisit **reste sous le curseur** et le monde suit la
-  main, dans **toutes les directions** ; les pastilles d'avant le geste restent
-  affichées **en transparence** (sphère et mât pointillé) ;
-* **dans B** (après un Ctrl+clic sur une voisine) : Espace + glisser **sur la
-  pastille de la station active** (sphère, mât ou ombre) — ailleurs, le geste
-  est refusé. Sphère, mât, ombre et mire suivent le curseur **en direct** ; le
-  **point de départ** reste en transparence (sphère, mât et empreinte
+en X / Y seulement (le Z se règle à la molette), et **dans la vue B** :
+* Ctrl+clic sur une voisine l'ouvre en B ; dans B, maintenir **Espace** et
+  glisser **la pastille de la station active** (sphère, mât ou ombre) —
+  ailleurs, le geste est refusé. Son pied suit le curseur sur le plancher,
+  **en direct**, dans toutes les directions ; sphère, mât, ombre et mire
+  suivent ;
+* le **point de départ** reste en transparence (sphère, mât et empreinte
   pointillés, flèche vers la nouvelle position), comme l'origine CSV ;
-* le geste se calcule toujours sur le sol (jamais en visée rasante vers
-  l'horizon, au-delà de 30 m) : ce qui est lâché reste là où on l'a posé ;
+* **pendant le geste, la vue A reste figée** (seule sa fiche se met à jour),
+  puis se recale au lâcher. Espace + glisser **dans A est refusé** : A est la
+  vue prise *depuis* la station active, la déplacer y décale toutes les
+  pastilles (jusqu'à 110 px en bordure d'écran) et l'on croirait les voisines
+  modifiées — elles ne le sont jamais ;
 * **X / Y** verrouillent un axe si besoin (2e appui : libre) ;
-* la lecture ΔX / ΔY par rapport au CSV s'affiche pendant le geste ; le geste
-  entier s'annule d'un **Ctrl+Z**.
+* le geste entier s'annule d'un **Ctrl+Z**.
 Avec Alt / Maj + molette pour Δ / H, tout se corrige donc sans changer de mode.
 
 **Bulle corrigée** : elle garde la couleur de son local ; ce sont son nom et
