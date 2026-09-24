@@ -100,15 +100,18 @@ FLOOR_DZ_MAX = 12.0            # m — denivele max d'un lien inter-plancher
 EYE_HEIGHT_DEFAULT = 1.65      # m — hauteur de la camera au-dessus du sol
 
 # Pastilles
-DISC_RADIUS_M = 0.32           # m — rayon physique de la pastille au sol
+DISC_RADIUS_M = 0.20           # m — rayon physique de référence de la pastille
                                # (le rayon a l'ecran vaut f x rayon / distance)
-DISC_PX_MIN, DISC_PX_MAX = 10.0, 36.0   # bornes d'affichage (px) : jamais
-                               # minuscule (donc cliquable), jamais envahissante
-DISC_PX_LIMITS = (5.0, 90.0)   # bornes admises pour le reglage utilisateur
+DISC_PX_MIN, DISC_PX_MAX = 3.0, 60.0    # bornes d'affichage (px), larges : la
+                               # taille reste À L'ÉCHELLE, la distance se lit juste
+                               # (une taille plancher ferait paraître proche le lointain)
+DISC_PX_LIMITS = (2.0, 120.0)  # bornes admises pour le reglage utilisateur
+FADE_NEAR_M, FADE_FAR_M, FADE_MIN = 6.0, 35.0, 0.40   # estompage avec la distance
+LABEL_NEAR_M = 12.0            # au-delà, la pastille ne porte pas d'étiquette
 HIT_SLACK_PX = 10.0            # tolerance de clic autour de la pastille
 
 PLAN_H = 250                   # hauteur du plan (px)
-PLAN_H_EDIT = 190              # reduite en mode edition, pour loger le panneau
+PLAN_H_SMALL = 190             # réduite quand les filtres sont ouverts
 
 # Couleurs (theme sombre, coherent avec Orientation-XPhase)
 COLORS = {
@@ -246,8 +249,7 @@ DEFAULT_CONFIG = {
     'viewer_geometry': '',     # taille/position du visualiseur hors plein ecran
     'viewer_start': 'plein écran',   # 'plein écran' | 'maximisé' | 'mémorisé'
     'plan_links': 'squelette',       # réseau du plan : 'squelette' | 'complet' | 'aucun'
-    'drag_axis': 'auto',             # axe du glisser en édition : 'auto' | 'x' | 'y' | 'z'
-    'drag_z': 'ddelta',              # l'axe Z agit sur 'ddelta' (sol + caméra) ou 'dh'
+    'yaw_step': 1.0,                 # pas de Ctrl + molette pour l'orientation (deg)
     'bubble_anchor': 'vue',          # bulle au point de 'vue' (appareil, mât, ombre) ou au 'sol'
     'hotspots_mode': 'plancher',     # 'plancher' : toutes les bulles du plancher ;
                                      # 'reseau' : réseau élagué (portée, nombre, direction)
@@ -255,6 +257,8 @@ DEFAULT_CONFIG = {
     'show_mire': True,               # mire de hauteur sur les bulles comparées
     'show_tooltip': True,            # infobulle au survol des pastilles
     'show_card': True,               # fiche de la station active : sol, Δ, H, Z
+    'show_floor_net': True,          # réseau dessiné au sol dans la vue bulle
+    'size_version': 1,               # migration des tailles de pastilles
     'show_img_center': True,         # trait du centre de l'image (nord image)
     'wheel_step': 0.05,              # pas de la molette pour H / Δ (m) : 0,05 ou 0,01
     'view_scope': SCOPE_DEFAULT,     # pastilles : 'local' | 'voisins' | 'chaine' | 'distance'
@@ -291,6 +295,12 @@ def load_config() -> dict:
                 elif isinstance(ref, dict) and isinstance(v, dict):
                     cfg[k] = {str(a): str(b) for a, b in v.items()
                               if isinstance(b, str)}
+            if not isinstance(data.get('size_version'), int) or data['size_version'] < 1:
+                # une fois : pastilles à l'échelle (l'ancienne taille plancher
+                # faisait paraître proches les stations lointaines)
+                for k in ('disc_radius', 'disc_min_px', 'disc_max_px'):
+                    cfg[k] = DEFAULT_CONFIG[k]
+                cfg['size_version'] = 1
             if not isinstance(data.get('scope_version'), int) or data['scope_version'] < 1:
                 # une fois : le nouveau défaut « de proche en proche » remplace
                 # le choix « Voir » enregistré par une version précédente
@@ -422,22 +432,20 @@ class Station:
     z: float            # Altitude camera (m)
     north_pct: float    # colonne du nord dans l'image, en % de la largeur
     floor: str
-    yaw_fix: float = 0.0   # correction d'orientation, PORTEE PAR LE CSV (deg)
+    yaw_fix: float = 0.0   # orientation de l'image (deg) : appliquée à l'image, jamais au CSV
     ox: float = 0.0        # valeurs lues dans le CSV (reference pour annuler)
     oy: float = 0.0
     oz: float = 0.0
     oyaw: float = 0.0
-    # Altitude : Z camera = altitude du plancher + hauteur appareil + delta.
-    #   h0     : hauteur appareil lue dans le CSV (None = reglage global)
-    #   delta0 : decalage local du sol lu dans le CSV (marche, faux plancher)
-    #   dh     : correction « hauteur station »  -> la camera bouge, le sol reste
-    #   ddelta : correction « delta plancher »   -> camera ET sol bougent
+    # Altimétrie — UN SEUL MODÈLE :  Z = plancher + Δ + H
+    #   plancher_z : altitude du plancher, fixe (jamais corrigée)
+    #   delta0, h0 : Δ et hauteur instrument lus dans le CSV (h0 None = réglage)
+    #   ddelta, dh : corrections (Alt + molette, Maj + molette)
     h0: Optional[float] = None
     delta0: float = 0.0
-    delta_col: bool = False     # True si le delta vient d'une colonne du CSV
-    floor_alt: Optional[float] = None   # altitude du plancher (colonne, sinon libellé)
-    floor_alt_src: str = ''     # 'colonne' | 'libellé' | ''
-    z_csv: Optional[float] = None       # Z lu dans le CSV (repli sans altitude de plancher)
+    plancher_z: float = 0.0
+    plancher_src: str = ''      # 'colonne' | 'libellé' | 'Z CSV' | ''
+    z_csv: Optional[float] = None       # Z final lu dans le CSV (contrôle seulement)
     dh: float = 0.0
     ddelta: float = 0.0
     key: str = ''          # cle immuable (numero de scan) ; = photo si absente
@@ -447,29 +455,25 @@ class Station:
     _parts: Optional[NameParts] = field(default=None, repr=False, compare=False)
 
     def height(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
-        """Hauteur de l'appareil au-dessus du sol local, correction comprise."""
+        """Hauteur instrument (H), correction comprise."""
         return (self.h0 if self.h0 is not None else eye) + self.dh
 
-    def ground(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
-        """Altitude du sol sous la station (là où se pose la pastille)."""
-        return self.z - self.height(eye)
+    def delta(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
+        """Δ : décalage du sol local par rapport au plancher, correction comprise."""
+        return self.delta0 + self.ddelta
 
     def plancher(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
-        """Altitude du plancher sous la station : l'ancrage fixe, que ni Δ ni H ne
-        déplacent. Z final = plancher + Δ + H."""
-        return self.ground(eye) - self.delta(eye)
+        """Altitude du plancher : l'ancrage fixe, que ni Δ ni H ne déplacent."""
+        return self.plancher_z
 
-    def delta(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
-        """Décalage du sol local par rapport au plancher, correction comprise.
+    def ground(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
+        """Sol local sous la station : plancher + Δ."""
+        return self.plancher_z + self.delta(eye)
 
-        Sans colonne delta dans le relevé, il se déduit du modèle
-        Z caméra = altitude du plancher + hauteur appareil + delta, avec
-        l'altitude lue dans le libellé du plancher (« PLANCHER 02 (+00.00m) »).
-        """
-        if not self.delta_col and self.floor_alt is not None:
-            # avec Z calculé, oz = plancher + H : le delta se réduit à sa correction
-            return self.z - self.floor_alt - self.height(eye)
-        return self.delta0 + self.ddelta
+    def compute_z(self, eye: float = EYE_HEIGHT_DEFAULT) -> float:
+        """Z final = plancher + Δ + H, au micromètre (pas de bruit de calcul)."""
+        self.z = round(self.plancher_z + self.delta(eye) + self.height(eye), 6)
+        return self.z
 
     def moved(self, tol: float = 1e-4) -> bool:
         """Position en plan différente de celle lue dans le CSV (2D)."""
@@ -565,11 +569,10 @@ COL_ALIASES = {
                 'nomdupoint', 'nom', 'id'),
     'x': ('x', 'e', 'est', 'easting', 'xm', 'coordx'),
     'y': ('y', 'n', 'nord', 'northing', 'ym', 'coordy'),
-    # Z du point de vue. Un « Z corrigé / final / appareil » passe avant un Z
-    # nu : dans ce cas le Z nu est l'altitude du plancher (voir 'zfloor').
+    # Z final (point de vue = plancher + Δ + H) : seulement sous un nom explicite.
+    # Un Z nu est TOUJOURS l'altitude du plancher (voir 'zfloor').
     'z': ('zcorrige', 'zcorriger', 'zcorr', 'zfinal', 'zappareil', 'zcamera',
-          'zinstrument', 'zpointdevue', 'zpdv', 'zstation',
-          'z', 'altitude', 'alt', 'elevation', 'zm', 'coordz'),
+          'zinstrument', 'zpointdevue', 'zpdv', 'zstation'),
     'hcam': ('hauteurappareil', 'hauteurcamera', 'hauteurstation', 'hcam',
              'hauteurinstrument', 'hauteurdinstrument', 'hinstrument', 'hinst', 'hi',
              'hauteurinstrumentm', 'hauteurappareilm',
@@ -583,8 +586,8 @@ COL_ALIASES = {
                'altitudedalle', 'zniveau', 'altitudeniveau', 'niveauplancher',
                'coteplancher', 'cotedalle', 'zplancherm', 'altitudeplancherm',
                'zfloor', 'floorz', 'floorelevation',
-               # Z nu resté libre : le point de vue a sa propre colonne (Z corrigé)
-               'z', 'altitude'),
+               # Z nu : l'altitude du plancher
+               'z', 'altitude', 'alt', 'elevation', 'zm', 'coordz'),
     'dh': ('dhstation', 'dh', 'dhauteur', 'correctionhauteur', 'dhauteurstation'),
     'ddelta': ('ddeltaplancher', 'ddelta', 'correctiondelta', 'ddeltasol'),
     'north': ('pctnord', 'nordpct', 'pct', 'nordpourcent', 'cap', 'heading',
@@ -612,6 +615,10 @@ COL_ALIASES = {
 }
 
 YAW_COLUMN = 'Delta Nord (deg)'
+# Bornes de sécurité des corrections (toujours relatives au CSV d'origine)
+BOUND_XY_M = 5.0               # déplacement en plan maxi depuis la position du CSV
+H_MIN_M, H_MAX_M = 0.10, 3.00  # hauteur instrument admise
+DELTA_MAX_M = 3.00             # |Δ| admis
 ROUNDING_TOL = 5e-4   # m — sous le demi-millimètre, un écart relu est un arrondi   # intitule ecrit si la colonne n'existe pas
 
 
@@ -848,7 +855,10 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
         delta_val = parse_float(cell(row, 'delta'))
         if delta_val is not None:
             delta_val *= d_scale
-        delta0 = delta_val or 0.0
+        delta0 = round(delta_val or 0.0, 6)
+        if h0 is not None:
+            h0 = round(h0, 6)
+        zlib = floor_altitude(cell(row, 'floor'))
         cle = cell(row, 'key') or photo
         target = base_name(cell(row, 'target')) if cell(row, 'target') else ''
         attrs = {k: cell(row, k) for k in ('local', 'etage', 'date', 'index')
@@ -878,11 +888,10 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
             yaw_fix=wrap180(dnord),
             ox=x, oy=y, oz=zv, oyaw=wrap180(dnord),
             key=cle, target=target, attrs=attrs, key_explicit='key' in col,
-            h0=h0, delta0=delta0, delta_col=delta_val is not None,
-            floor_alt=zfl if zfl is not None else floor_altitude(cell(row, 'floor')),
-            floor_alt_src=('colonne' if zfl is not None else
-                           'libellé' if floor_altitude(cell(row, 'floor')) is not None
-                           else ''),
+            h0=h0, delta0=delta0,
+            plancher_z=zfl if zfl is not None else (zlib if zlib is not None else 0.0),
+            plancher_src=('colonne' if zfl is not None else
+                          'libellé' if zlib is not None else ''),
             z_csv=z,
         ))
 
@@ -891,20 +900,32 @@ def read_survey_csv(path: str, mapping: Optional[Dict[str, str]] = None
     return stations, warns
 
 
-def apply_altimetry(stations: Sequence[Station], eye: float = EYE_HEIGHT_DEFAULT) -> None:
-    """Altitude du point de vue de chaque bulle, avant corrections (`oz`) :
-    Z = Z plancher + delta + hauteur instrument.
+def apply_altimetry(stations: Sequence[Station], eye: float = EYE_HEIGHT_DEFAULT
+                    ) -> List[str]:
+    """Z = plancher + Δ + H pour chaque bulle (`oz` : valeur du CSV, `z` :
+    corrections comprises).
 
-    Le Z lu dans le CSV n'entre pas dans le calcul ; il ne sert que pour une
-    bulle sans altitude de plancher (ni colonne, ni libellé). Les corrections
-    (hauteur station, delta plancher) s'ajoutent ensuite.
+    Le plancher vient de sa colonne (« Z »), à défaut du libellé du plancher
+    (« PLANCHER 02 (+00.00m) »), à défaut il se déduit du Z final lu
+    (Z − Δ − H). Retourne les incohérences relevées : Z final lu dans le CSV
+    différent du Z recalculé (plus de 5 mm), plancher introuvable.
     """
+    notes: List[str] = []
     for st in stations:
-        if st.floor_alt is not None:
-            st.oz = st.floor_alt + st.delta0 + (st.h0 if st.h0 is not None else eye)
-        elif st.z_csv is not None:
-            st.oz = st.z_csv
-        st.z = st.oz + st.dh + st.ddelta
+        h = st.h0 if st.h0 is not None else eye
+        if st.plancher_src in ('', 'Z CSV'):
+            if st.z_csv is not None:
+                st.plancher_z = round(st.z_csv - st.delta0 - h, 6)
+                st.plancher_src = 'Z CSV'
+            else:
+                notes.append(f"{st.label()} : ni plancher ni Z — plancher pris à 0")
+        st.oz = round(st.plancher_z + st.delta0 + h, 6)
+        st.compute_z(eye)
+        if st.z_csv is not None and st.plancher_src != 'Z CSV' \
+                and abs(st.z_csv - st.oz) > 0.005:
+            notes.append(f"{st.label()} : Z lu {st.z_csv:.3f} ≠ plancher + Δ + H "
+                         f"{st.oz:.3f}")
+    return notes
 
 
 _FLOOR_ALT_RE = re.compile(r'\(\s*([+-]?\d+(?:[.,]\d+)?)\s*m?\s*\)')
@@ -1408,30 +1429,6 @@ def project_segment(view: View, calib: Calib, north_pct: float,
     return first[0], first[1], last[0], last[1]
 
 
-AXES: Dict[str, Tuple[float, float, float]] = {
-    'x': (1.0, 0.0, 0.0), 'y': (0.0, 1.0, 0.0), 'z': (0.0, 0.0, 1.0)}
-
-
-def axis_param(ray: Sequence[float], p0: Sequence[float], axis: Sequence[float],
-               max_abs: float = 60.0) -> Optional[float]:
-    """Abscisse, sur la droite p0 + t·axe, du point le plus proche du rayon.
-
-    Le rayon part de l'observateur (origine). Retourne None si le rayon est
-    presque parallèle à l'axe, s'il regarde à l'opposé ou si le point est
-    déraisonnablement loin : le geste est alors simplement ignoré.
-    """
-    b = sum(r * a for r, a in zip(ray, axis))
-    den = 1.0 - b * b
-    if den < 1e-4:
-        return None
-    dr = sum(r * c for r, c in zip(ray, p0))
-    ar = sum(a * c for a, c in zip(axis, p0))
-    t = (b * dr - ar) / den
-    if dr + b * t <= 0 or abs(t) > max_abs:
-        return None
-    return t
-
-
 def alt_down(state: int) -> bool:
     """Touche Alt (Option sous macOS) enfoncée, selon la plateforme de Tk."""
     if sys.platform == 'win32':
@@ -1637,24 +1634,28 @@ class Corrections:
         return {'x': st.x, 'y': st.y, 'dh': st.dh, 'ddelta': st.ddelta,
                 'yaw_fix': st.yaw_fix}
 
-    @staticmethod
-    def restore(st: Station, snap: dict) -> None:
+    def restore(self, st: Station, snap: dict) -> None:
         st.x = float(snap.get('x', st.x))
         st.y = float(snap.get('y', st.y))
         st.dh = float(snap.get('dh', st.dh))
         st.ddelta = float(snap.get('ddelta', st.ddelta))
-        st.z = st.oz + st.dh + st.ddelta
         st.yaw_fix = float(snap.get('yaw_fix', st.yaw_fix))
+        st.compute_z(self.eye)
 
     # ── modifications ────────────────────────────────────────────────
     def apply(self, st: Station, *, x: float = None, y: float = None,
               dh: float = None, ddelta: float = None, yaw_fix: float = None,
-              record: bool = True) -> None:
+              record: bool = True) -> str:
         """Applique une correction, en empilant l'état précédent (annulation).
 
-        Les deux composantes en Z sont distinctes : `dh` (hauteur station) ne
-        déplace que la caméra, `ddelta` (delta plancher) déplace caméra et sol.
-        L'altitude caméra `z` est toujours recalculée : oz + dh + ddelta.
+        Tout est borné et arrondi, relativement au CSV d'origine :
+          * X, Y : déplacement au micromètre (la coordonnée d'origine reste
+            exacte), à BOUND_XY_M au plus de la position du CSV ;
+          * H (hauteur instrument) au mm, entre H_MIN_M et H_MAX_M ;
+          * Δ au mm, |Δ| ≤ DELTA_MAX_M ;
+          * orientation au centième de degré, dans ]-180, 180].
+        Z est TOUJOURS recalculé : plancher + Δ + H.
+        Retourne '' ou le nom de la borne atteinte (pour l'afficher).
         """
         if record:
             with self._lock:
@@ -1662,18 +1663,34 @@ class Corrections:
                 del self._undo[:-500]
             if self.on_record is not None:
                 self.on_record()
-        if x is not None:
-            st.x = float(x)
-        if y is not None:
-            st.y = float(y)
+        borne = ''
+        if x is not None or y is not None:
+            nx = float(x) if x is not None else st.x
+            ny = float(y) if y is not None else st.y
+            dx, dy = nx - st.ox, ny - st.oy
+            d = math.hypot(dx, dy)
+            if d > BOUND_XY_M:
+                k = BOUND_XY_M / d
+                dx, dy = dx * k, dy * k
+                borne = f"déplacement limité à {BOUND_XY_M:g} m du CSV"
+            st.x = st.ox + round(dx, 6) if abs(dx) >= 5e-7 else st.ox
+            st.y = st.oy + round(dy, 6) if abs(dy) >= 5e-7 else st.oy
         if dh is not None:
-            st.dh = float(dh)
+            h0 = st.h0 if st.h0 is not None else self.eye
+            h = clamp(h0 + float(dh), H_MIN_M, H_MAX_M)
+            if abs(h - (h0 + float(dh))) > 1e-9:
+                borne = f"hauteur limitée à {H_MIN_M:g} – {H_MAX_M:g} m"
+            st.dh = round(h - h0, 3)
         if ddelta is not None:
-            st.ddelta = float(ddelta)
-        st.z = st.oz + st.dh + st.ddelta
+            dv = clamp(st.delta0 + float(ddelta), -DELTA_MAX_M, DELTA_MAX_M)
+            if abs(dv - (st.delta0 + float(ddelta))) > 1e-9:
+                borne = f"Δ limité à ±{DELTA_MAX_M:g} m"
+            st.ddelta = round(dv - st.delta0, 3)
         if yaw_fix is not None:
-            st.yaw_fix = wrap180(float(yaw_fix))
+            st.yaw_fix = round(wrap180(float(yaw_fix)), 2)
+        st.compute_z(self.eye)
         self.dirty = True
+        return borne
 
     def undo(self, by_photo: Dict[str, Station]) -> Optional[Station]:
         with self._lock:
@@ -1815,12 +1832,6 @@ class Corrections:
                     values[axis] = origine if abs(v - origine) < ROUNDING_TOL else v
             dh = parse_float(cell('dh'))
             dd = parse_float(cell('ddelta'))
-            if dh is None and dd is None:
-                # ancien format : seule l'altitude camera etait ecrite ; on la
-                # range en hauteur de station, la lecture la plus courante
-                z = parse_float(cell('z'))
-                if z is not None:
-                    dh = z - st.oz
             if dh is not None and abs(dh) < ROUNDING_TOL:
                 dh = 0.0
             if dd is not None and abs(dd) < ROUNDING_TOL:
@@ -1857,40 +1868,27 @@ def _format_like(sample: str, value: float, default_decimals: int = 3) -> str:
     return out.replace('.', sep) if sep == ',' else out
 
 
-def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
-                        write_yaw: Optional[bool] = None,
-                        eye: float = EYE_HEIGHT_DEFAULT,
-                        mapping: Optional[Dict[str, str]] = None,
-                        import_format: bool = False) -> Tuple[int, int, bool]:
-    """Écrit le CSV corrigé : chaque bulle avec ses bonnes valeurs.
+def write_survey_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
+                     eye: float = EYE_HEIGHT_DEFAULT,
+                     mapping: Optional[Dict[str, str]] = None) -> Tuple[int, int]:
+    """Écrit le CSV de sortie : LE MÊME que le CSV d'entrée, corrections comprises.
 
-    `import_format` : CSV recalculé IDENTIQUE à l'import — mêmes colonnes, pas
-    une de plus, valeurs recalculées (X, Y, Z et, s'il en a les colonnes,
-    delta et hauteur) ; aucun élément d'orientation (ni Δ nord, ni % NORD
-    modifié).
+    Mêmes colonnes (pas une de plus), même ordre, même séparateur, même
+    encodage, mêmes fins de ligne, mêmes unités (« Hauteur/cm ») et mêmes
+    décimales. Seules les lignes des bulles corrigées (XY, Δ ou H) changent,
+    et dans ces lignes seulement : X, Y, Delta, Hauteur instrument et le Z
+    final (colonne « Zcorrige ») = plancher + Δ + H. Le Z plancher n'est
+    jamais modifié. L'orientation n'entre JAMAIS dans le CSV : elle
+    s'applique aux images.
 
-    X / Y corrigés, Z = plancher + delta + hauteur instrument (corrections
-    comprises), delta et hauteur dans leurs colonnes (ajoutées si une
-    correction les demande et qu'elles manquent), Δ nord.
-
-    Rien n'est destructif : le fichier source n'est pas touché, les images non
-    plus. La correction d'orientation est rangée dans une colonne dédiée
-    (« Delta Nord (deg) », créée si elle manque) ; la colonne « % NORD » garde
-    sa valeur d'origine. Tout le reste est recopié à l'identique : colonnes,
-    ordre, séparateur, encodage, fins de ligne, décimales, lignes intactes.
-
-    `write_yaw` : None = colonne écrite dès qu'une bulle porte un Δ nord.
-
-    Retourne (lignes modifiées, lignes recopiées, colonne Δ nord ajoutée).
+    Retourne (lignes modifiées, lignes recopiées à l'identique).
     """
     text, enc = _read_text_enc(src_csv)
     lines = text.splitlines(keepends=True)
     if not lines:
         raise ValueError("CSV source vide.")
-
     delim = _sniff_delimiter(text)
     head_body = lines[0].rstrip('\r\n')
-    head_eol = lines[0][len(head_body):]
     head_cells = next(csv.reader([head_body], delimiter=delim))
     n_num = sum(1 for c in head_cells if parse_float(c) is not None)
     headerless = n_num >= 2 and n_num >= len([c for c in head_cells if c.strip()]) - 1
@@ -1905,114 +1903,70 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
             elif not headerless and norm_key(ref) in header:
                 col[field_name] = header.index(norm_key(ref))
     elif not headerless:
-        col = {k: v for k, v in auto_columns(header).items()
-               if k in ('photo', 'x', 'y', 'z', 'dnord', 'key', 'hcam', 'delta')}
-    # unités d'origine (« Hauteur/cm ») : on réécrit dans la même unité
-    scale = {f: (unit_scale(head_cells[col[f]]) if f in col and not headerless
-                 and col[f] < len(head_cells) else 1.0) for f in ('hcam', 'delta')}
+        col = auto_columns(header)
     if 'photo' not in col and 'key' in col:
         col['photo'] = col['key']
     if 'photo' not in col:
         raise ValueError("Identifiant (« Fichier photo » ou « N° scan ») introuvable "
                          "dans le CSV source.")
-    if headerless:
-        # pas d'en-tete : la 1re ligne est une donnee, on la traite comme les autres
-        lines = [''] + lines
-        head_body, head_eol = '', ''
+    scale = {f: (unit_scale(head_cells[col[f]]) if f in col and not headerless
+                 and col[f] < len(head_cells) else 1.0) for f in ('hcam', 'delta')}
+    start = 0 if headerless else 1
     by_key = {st.key.lower(): st for st in stations}
     by_photo = {st.photo.lower(): st for st in stations}
 
-    def valeurs(st: Station):
-        """Bonnes valeurs d'une bulle : position, altitude calculée et ses composantes."""
-        out = [('x', st.x), ('y', st.y), ('z', st.z)]
-        if 'hcam' in col:
-            out.append(('hcam', st.height(eye) / scale['hcam']))
-        if 'delta' in col:
-            out.append(('delta', st.delta(eye) / scale['delta']))
-        return out
-
-    # Colonnes ajoutées au besoin : Δ nord, et les composantes d'altitude
-    # corrigées que le relevé ne porte pas encore.
-    need_yaw = (any(st.has_yaw() or st.turned() for st in stations)
-                if write_yaw is None else bool(write_yaw)) and not import_format
-    extras: List[Tuple[str, str, object]] = []
-    if need_yaw and 'dnord' not in col:
-        extras.append(('dnord', YAW_COLUMN, lambda st: st.yaw_fix))
-    if 'delta' not in col and any(st.shifted() for st in stations):
-        extras.append(('delta', 'Delta', lambda st: st.delta(eye)))
-    if 'hcam' not in col and any(st.raised() for st in stations):
-        extras.append(('hcam', 'Hauteur instrument', lambda st: st.height(eye)))
-    if import_format:
-        extras = []                            # colonnes de l'import, pas une de plus
-
-    out: List[str] = ([] if headerless else
-                      [head_body + ''.join(delim + h for _, h, _ in extras) + head_eol])
+    out: List[str] = lines[:start]
     n_mod = n_keep = 0
-    for raw in lines[1:]:
+    for raw in lines[start:]:
         body = raw.rstrip('\r\n')
         eol = raw[len(body):]
         if not body.strip():
             out.append(raw)
             continue
         quoted = '"' in body
-        try:
-            fields = (next(csv.reader([body], delimiter=delim)) if quoted
-                      else body.split(delim))
-        except Exception:
-            out.append(body + delim * len(extras) + eol)
-            n_keep += 1
-            continue
+        fields = (next(csv.reader([body], delimiter=delim)) if quoted
+                  else body.split(delim))
         st = None
         if 'key' in col and col['key'] < len(fields) and fields[col['key']].strip():
             st = by_key.get(fields[col['key']].strip().lower())
         if st is None and col['photo'] < len(fields):
             st = by_photo.get(base_name(fields[col['photo']]).lower())
-
+        if st is None or not (st.moved() or st.z_changed()):
+            out.append(raw)                    # ligne recopiée à l'identique
+            n_keep += 1
+            continue
+        valeurs = [('x', st.x), ('y', st.y), ('z', st.z),
+                   ('hcam', st.height(eye) / scale['hcam']),
+                   ('delta', st.delta(eye) / scale['delta'])]
         changed = False
-        if st is not None:
-            # chaque cellule reçoit sa bonne valeur, au format d'origine
-            for name, value in valeurs(st):
-                if import_format and name == 'dnord':
-                    continue
-                i = col.get(name, -1)
-                if 0 <= i < len(fields):
-                    if not fields[i].strip() and (
-                            (name == 'delta' and abs(value) < 5e-4)
-                            or (name == 'hcam' and st.h0 is None and not st.raised())):
-                        continue              # cellule vide = valeur par défaut : on la laisse
-                    txt = _format_like(fields[i], value)
-                    if txt != fields[i].strip():
-                        fields[i] = txt
-                        changed = True
-            if need_yaw and 0 <= col.get('dnord', -1) < len(fields):
-                txt = _format_like(fields[col['dnord']], st.yaw_fix, default_decimals=4)
-                if txt != fields[col['dnord']].strip():
-                    fields[col['dnord']] = txt
-                    changed = True
-        if not changed and not extras:
+        for name, value in valeurs:
+            i = col.get(name, -1)
+            if not (0 <= i < len(fields)):
+                continue
+            if name == 'delta' and not fields[i].strip() and abs(value) < 5e-4:
+                continue                       # Δ vide = 0 : on le laisse vide
+            txt = _format_like(fields[i], value)
+            if txt != fields[i].strip():
+                fields[i] = txt
+                changed = True
+        if not changed:
             out.append(raw)
             n_keep += 1
             continue
-        for _name, _head, fn in extras:
-            fields.append(_format_like('', fn(st), default_decimals=4 if _name == 'dnord'
-                                       else 3) if st is not None else '')
-        if quoted:                             # ligne avec guillemets : réécriture csv
+        if quoted:
             import io
             buf = io.StringIO()
             csv.writer(buf, delimiter=delim, lineterminator='').writerow(fields)
             out.append(buf.getvalue() + eol)
-        else:                                  # cas courant : substitution en place
-            out.append(delim.join(fields) + eol)
-        if changed or (st is not None and st.modified()):
-            n_mod += 1
         else:
-            n_keep += 1
+            out.append(delim.join(fields) + eol)
+        n_mod += 1
 
     tmp = dst_csv + '.tmp'
     with open(tmp, 'w', encoding=enc, newline='') as fh:
         fh.write(''.join(out))
     os.replace(tmp, dst_csv)
-    return n_mod, n_keep, bool(extras)
+    return n_mod, n_keep
 
 
 def rotate_pano_file(src_path: str, dst_path: str, delta_deg: float) -> Tuple[int, int]:
@@ -2452,10 +2406,10 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
     Fonction partagée par la vue principale et la vue de comparaison : les deux
     obtiennent exactement la même géométrie.
 
-    `anchor` : 'sol' pose la pastille au sol local de la cible (plancher + Δ),
-    comme le repère du mode édition ; 'vue' la place au point de vue
-    (plancher + Δ + H), le pied du mât, l'ombre et l'empreinte restant ancrés
-    au Z plancher : Δ et H ne font monter ou descendre que la sphère.
+    `anchor` : 'sol' pose la pastille au sol local de la cible (plancher + Δ) ;
+    'vue' la place au point de vue (plancher + Δ + H), le pied du mât, l'ombre
+    et l'empreinte restant ancrés au Z plancher : Δ et H ne font monter ou
+    descendre que la sphère.
 
     Retourne (pastilles du plus loin au plus près, nombre de pastilles masquées).
     """
@@ -2511,15 +2465,8 @@ SPHERE_LIFT = 0.86       # centre de la sphere au-dessus du sol (fraction de rs)
 HALO_RADIUS = 1.75       # rayon du halo de survol (fraction de rs)
 HALO_COLOR = (255, 255, 235)
 
-# Repère XYZ du mode édition (centré sur la position d'origine du CSV)
-AXIS_COLORS = {'x': '#ff5c5c', 'y': '#4cd964', 'z': '#4da3ff'}
-AXIS_NAMES = {'x': 'X Est', 'y': 'Y Nord', 'z': 'Z'}
-AXIS_PX = 90.0                 # longueur visée d'un demi-axe à l'écran (px)
-AXIS_LEN_LIMITS = (0.3, 5.0)   # bornes de cette longueur en mètres
-AXIS_AUTO_PX = 6               # déplacement souris qui choisit l'axe (mode auto)
-AXIS_HIT_PX = 6                # tolérance de saisie d'un axe
-AXIS_Z_PX_M = 0.002            # m par pixel pour Z sur la bulle active (verticale vue de dessus)
-DRAG_AXIS_MODES = ('auto', 'x', 'y', 'z')
+# Axes du déplacement en plan (verrou X / Y)
+AXIS_NAMES = {'x': 'X Est', 'y': 'Y Nord'}
 
 
 def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2,
@@ -2687,160 +2634,105 @@ class Tooltip:
 
 # Aide générale (F1 ou ?) : tous les raccourcis
 HELP_TEXT = """\
+PRINCIPE
+  Le CSV d'entrée donne pour chaque station : X, Y, Z plancher, Delta (Δ),
+  Hauteur instrument (H). Le Z final (point de vue) = plancher + Δ + H.
+  Seule la STATION ACTIVE (celle de la vue A) se corrige, et seulement en :
+  position XY, Δ, H — plus l'orientation de son image. Tout est borné :
+  XY à 5 m au plus du CSV, H entre 0,10 et 3 m, |Δ| ≤ 3 m.
+
+CORRIGER LA STATION ACTIVE  (le curseur peut être dans A ou dans B)
+  Alt + molette .............. Δ ± un pas (5 cm, ou 1 cm dans Réglages)
+  Maj + molette .............. H ± un pas
+  Ctrl + molette ............. orientation de l'image ± 1° (0,1° dans Réglages) ;
+                               appliquée à l'image, jamais au CSV
+  Espace + glisser (vue B) ... position XY : saisir la pastille de la station
+                               active (sphère, mât ou ombre) ; elle suit le
+                               curseur, son point de départ reste en transparence
+  X / Y ...................... verrouiller un axe pour Espace + glisser (2e appui :
+                               libre)
+  Ctrl+Z ..................... annuler (une rafale de molette = une étape)
+  Corriger une voisine ....... Ctrl+clic dessus (elle s'ouvre en B), puis I :
+                               A et B s'échangent, elle devient active
+  Fiche (en bas à gauche) .... Z plancher, Δ, H, Z final, ΔX / ΔY, orientation ;
+                               à jour à chaque cran, valeur changée surlignée
+
+LIRE LA 3D DANS LA BULLE
+  Sphère ..................... le point de vue (Z final), à sa taille réelle :
+                               plus elle est petite, plus elle est loin ; les
+                               stations lointaines sont estompées
+  Mât, ombre, empreinte ...... ancrés au Z plancher ; tronçon Δ rose jusqu'au sol
+                               local, puis mire H graduée (10 cm) jusqu'à la sphère
+  Réseau au sol .............. les liens entre stations, tracés sur le plancher :
+                               ils fuient vers l'horizon et donnent la profondeur
+  Trait pointillé vertical ... centre de l'image (« nord image ») ; il tourne avec
+                               l'image quand on corrige l'orientation, le « N »
+                               rouge reste le nord terrain
+
 NAVIGATION  (vue A ou B)
   Clic sur une pastille ...... y aller (sens de navigation conservé)
   Ctrl+clic ou clic droit .... SONDER : la bulle s'ouvre dans l'autre vue et
-                               les deux se font face (chacune voit l'autre)
-  Glisser .................... tourner la vue
-  Double-clic ................ recentrer la vue sur ce point
-  Molette, + / - ............. champ de vision, 30° à 200° (grand angle > 110°),
-                               cran à 120° ; bouton « 120° » : les deux vues
-  Flèches (Maj = pas large) .. tourner
-  Origine (Home) ............. redresser la vue
+                               les deux se font face
+  Glisser .................... tourner la vue ; double-clic : recentrer
+  Molette, + / - ............. champ de vision, 30° à 200°, cran à 120°
+  Flèches (Maj = pas large) .. tourner ; Origine (Home) : redresser
   Entrée, ou Espace bref ..... avancer vers la pastille la plus centrale
-  Espace + glisser (vue B) ... DÉPLACER EN PLAN la station active (voir plus bas)
   Retour arrière ............. revenir à la bulle précédente
-  En-tête de chaque vue ...... Retour, Origine, H et Δ lus de la bulle de la vue ;
-                               celui de B lie les deux vues (face à face,
-                               inverser, A → B, B → A)
-  O .......................... regarder d'où l'on vient
-  G .......................... face à face : A regarde B, B regarde A
-  I .......................... inverser A et B (bulles et regards)
-  Ctrl+Z ..................... annuler la dernière opération (navigation,
-                               correction, bulle ouverte en B)
-
-CORRIGER SANS LE MODE ÉDITION — seule la STATION ACTIVE (vue A) est modifiée
-  Alt + molette .............. Δ (delta plancher) de la station active
-  Maj + molette .............. H (hauteur station) de la station active
-  Espace + glisser dans B .... position en plan : saisir la pastille de la
-                               station active (sphère, mât ou ombre) ; elle suit
-                               le curseur, en direct, dans toutes les directions ;
-                               son point de départ reste en transparence. La vue A
-                               reste figée pendant le geste et se recale au lâcher
-  Espace dans A .............. refusé : vue prise depuis la station active, tout
-                               s'y décalerait (on croirait les voisines modifiées)
-  Fiche (en bas à gauche) .... station active : sol plancher, Δ, H appareil,
-                               Z final = sol + Δ + H, ΔX / ΔY ; à jour à chaque
-                               cran de molette, valeur changée surlignée
-  X / Y (pendant Espace) ..... verrouiller un axe (2e appui : libre)
-  Corriger une voisine ....... Ctrl+clic dessus (elle s'ouvre en B), puis I
-                               pour l'échanger avec A : elle devient active
-  Pas de la molette .......... 5 cm (1 cm possible, dans Réglages)
-  Mire ....................... ancrée au Z plancher (empreinte 50 cm, ombre,
-                               pied du mât : fixes), tronçon Δ rose jusqu'au sol
-                               local, puis mire H graduée jusqu'à la sphère
-                               (Z final = plancher + Δ + H) ; Δ et H ne font
-                               bouger que la sphère
+  O / G / I .................. d'où l'on vient / face à face / inverser A et B
 
 AFFICHAGE
-  Liste « Voir » ............. pastilles montrées : Local, Locaux voisins,
-                               De proche en proche (défaut : les locaux
-                               voisins, plus les stations atteintes de station
-                               en station jusqu'à 15 m de cheminement — loin
-                               dans les couloirs et par les portes), Distance,
-                               Plancher entier
-  L / T ...................... Voir : Local / Plancher entier (2e appui : retour)
-  M .......................... module (fichiers, état)
-  F .......................... activer / couper les filtres
-  Filtres › Local ............ choisir un local dans la liste
-  Menu « Affichage » ......... étiquettes (nom, distance, H / Δ / Z), couleur
-                               par local ou par lien, pastille au sol ou au
-                               point de vue, regarder d'où l'on vient,
-                               infobulle au survol (courte ; masquée pendant
-                               une modification), fiche de la station active,
-                               trait du centre de l'image
-  Trait pointillé vertical ... centre de l'image (« nord image ») : accroché à
-                               l'image, il tourne avec elle quand on corrige
-                               l'orientation ; le « N » rouge reste le nord terrain
-  F11 / Échap ................ plein écran
-  V .......................... afficher le visualiseur
+  Liste « Voir » ............. Local, Locaux voisins, De proche en proche (défaut),
+                               Distance, Plancher entier ; L / T : raccourcis
+  Menu « Affichage » ......... étiquettes, couleurs, fiche, réseau au sol, trait du
+                               centre, infobulle, mire
+  C .......................... ouvrir / fermer la vue B (comparaison)
+  F / M / V .................. filtres / module / visualiseur ; F11 plein écran
   F1 ou ? .................... cette aide
 
-COMPARAISON  (touche C)
-  C .......................... ouvrir / fermer la vue B
-  « Vue liée » ............... A et B regardent la même direction terrain
-  « Suivi de A » ............. B suit A : même local à un autre plancher, ou
-                               la bulle la plus proche
-  « A → B » / « B → A » ...... recopier une vue dans l'autre (bulle et regard)
-  Ctrl+clic dans B ........... la bulle s'ouvre dans A, face à face
-
 PLAN
-  Clic gauche ................ aller sur la bulle la plus proche
-  Clic droit ................. ouvrir la bulle dans la vue B
-  Clic droit glissé .......... déplacer le plan
-  Molette .................... zoom
-  Survol ..................... nom de la bulle
-  Liste « Plancher » ......... changer de niveau
-
-ÉDITION  (touche E) — rien n'est écrit sur le disque en direct
-  Clic sur une pastille ...... la prendre pour cible
-  Glisser une pastille ....... la déplacer le long d'un axe (auto X ou Y)
-  Glisser un axe du repère ... suivre cet axe
-  X / Y / Z .................. verrouiller l'axe (2e appui : auto)
-  Ctrl + glisser ............. déplacer la bulle active (sur un axe)
-  Ctrl + clic (sans glisser) . sonder, comme hors édition
-  Maj + glisser .............. tourner l'image (Δ nord)
-  Page haut / bas ............ hauteur station ± pas
-  Maj + Page haut / bas ...... delta plancher ± pas
-  Glisser un point du plan ... le déplacer en X ou en Y
-  Ctrl+Z ..................... annuler
+  Clic : aller sur la station ; clic droit : l'ouvrir en B ; clic droit glissé :
+  déplacer le plan ; molette : zoom. Le plan ne modifie rien.
 
 FICHIERS
-  Ctrl+S ..................... « Appliquer / enregistrer » : CSV corrigé (toutes
-                               les corrections, Δ nord compris), CSV recalculé au
-                               format d'import (mêmes colonnes, sans orientation),
-                               images orientées dans un autre dossier
+  Ctrl+S ..................... « Appliquer / enregistrer » : CSV de sortie = le
+                               même CSV qu'à l'entrée, seules les lignes corrigées
+                               changent (X, Y, Delta, Hauteur, Z final) ; en option,
+                               orientation appliquée aux images (copies)
   Les corrections s'enregistrent en continu dans leur propre fichier ;
-  le CSV chargé et les images d'origine ne sont jamais modifiés.
+  le CSV d'entrée et les images d'origine ne sont jamais modifiés.
 """
 
 
 # Aide des boutons, par libellé (un bouton peut aussi recevoir la sienne à la création)
 BUTTON_TIPS: Dict[str, str] = {
-    "Relevé CSV…": "Choisir le relevé CSV (positions, orientation, plancher).",
+    "Relevé CSV…": "Choisir le CSV d'entrée (X, Y, Z plancher, Delta, Hauteur instrument).",
     "Dossier images…": "Choisir le dossier des images bulles (JPEG équirectangulaires).",
-    "Corrections…": "Choisir le fichier de corrections (séparé du relevé, jamais écrasé).",
+    "Corrections…": "Choisir le fichier de corrections (séparé du CSV, jamais écrasé).",
     "Ouvrir le visualiseur  (V)": "Afficher la fenêtre des vues bulle, du plan et des outils.",
-    "Réglages…": "Calibration du nord, hauteur instrument, taille des pastilles, "
-                 "réseau (portée, nombre, séparation), mémoire.",
-    "Appliquer / enregistrer…": "Bilan des corrections : enregistrer, tourner les images "
-                                "par lot, écrire un relevé complet corrigé.",
-    "Appliquer / enregistrer…  (Ctrl+S)": "Bilan des corrections : enregistrer, tourner les "
-                                          "images par lot, écrire un relevé complet corrigé.",
+    "Réglages…": "Pas de la molette (Δ / H, orientation), hauteur instrument par défaut, "
+                 "taille des pastilles, portées, mémoire.",
+    "Appliquer / enregistrer…": "Écrire le CSV de sortie (même format que l'entrée) et, en "
+                                "option, appliquer l'orientation aux images.",
+    "Appliquer / enregistrer…  (Ctrl+S)": "Écrire le CSV de sortie (même format que l'entrée) "
+                                          "et, en option, appliquer l'orientation aux images.",
     "Aide": "Raccourcis clavier et gestes (F1).",
     "?": "Aide : tous les raccourcis clavier et gestes (F1).",
     "Quitter": "Fermer le programme (les corrections sont enregistrées).",
     "Module": "Revenir au module principal (fichiers, état, réglages).",
-    "Comparer  (C)": "Ouvrir / fermer la seconde vue bulle (B), sous la première.",
-    "Édition  (E)": "Mode édition : orientation, position XY, hauteur station, delta "
-                    "plancher. Rien n'est écrit dans les images.",
+    "Comparer  (C)": "Ouvrir / fermer la seconde vue bulle (B). Dans B, Espace + glisser la "
+                     "pastille de la station active corrige sa position XY.",
     "✕": "Masquer le visualiseur (touche V pour le rouvrir).",
     "⛶": "Plein écran (F11), Échap pour en sortir.",
     "Recadrer": "Recadrer le plan sur tout le plancher affiché.",
     "◀ Retour": "Revenir à la bulle précédente (Retour arrière, ou Ctrl+Z).",
     "▸": "Déplier / replier les réglages de filtre.",
     "Réinitialiser les filtres": "Remettre tous les filtres à zéro.",
-    "Bulle active": "Prendre la bulle affichée comme cible d'édition.",
-    "−": "Diminuer d'un pas (liste « pas ») la valeur de cette ligne.",
-    "+": "Augmenter d'un pas (liste « pas ») la valeur de cette ligne.",
-    "Appliquer les valeurs saisies": "Appliquer X, Y, hauteur station et delta saisis "
-                                     "(Entrée dans un champ fait de même).",
-    "−0,5°": "Tourner l'image de −0,5° (correction Δ nord).",
-    "−0,05°": "Tourner l'image de −0,05° (correction Δ nord).",
-    "+0,05°": "Tourner l'image de +0,05° (correction Δ nord).",
-    "+0,5°": "Tourner l'image de +0,5° (correction Δ nord).",
-    "ce plancher": "Appliquer le Δ nord de cette bulle à tout son plancher.",
-    "tout le relevé": "Appliquer le Δ nord de cette bulle à tout le relevé.",
-    "Fichier…": "Choisir un autre fichier de corrections.",
-    "Annuler (Ctrl+Z)": "Annuler la dernière opération : correction ou déplacement "
-                        "d'une bulle à l'autre.",
-    "Réinit. cible": "Rendre à la cible ses valeurs du relevé (annulable).",
-    "Réinit. tout": "Annuler toutes les corrections (confirmation demandée).",
     "⇄ Échanger": "Échanger les bulles des vues A et B.",
     "A → B": "Afficher dans B la bulle de la vue A.",
-    "Parcourir…": "Choisir le dossier de sortie.",
-    "Enregistrer les corrections maintenant": "Écrire tout de suite le fichier de "
-                                              "corrections (sinon automatique).",
+    "Parcourir…": "Choisir le fichier ou le dossier de sortie.",
+    "Tout réinitialiser": "Revenir aux valeurs du CSV pour toutes les stations "
+                          "(confirmation demandée, annulable).",
+    "↺ CSV": "Station active : revenir à ses valeurs du CSV (annulable par Ctrl+Z).",
 }
 
 
@@ -2921,21 +2813,15 @@ class BubbleNavApp(_TkBase):
         self.by_key: Dict[str, Station] = {}
         self.csv_mapping: Optional[Dict[str, str]] = None   # correspondance imposee
         self.incoherences: Dict[int, str] = {}     # étage déduit contredit par Z
-        self.selected: Optional[int] = None      # bulle en cours de modification
-        self._hs_drag = None                     # geste d'édition en cours
-        self._axis_hits: List[Tuple[str, float, float, float, float]] = []
-        self._axis_labels: List[Tuple[float, float, str, str]] = []
-        self._axis_origin_px: Optional[Tuple[float, float]] = None
+        self._hs_drag = None                     # Espace + glisser en cours (vue B)
+        self._axis_lock: Optional[str] = None    # X / Y verrouillé pour ce geste
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
         self._cone_sig = None                    # état du camembert du plan
         self._sprites: "OrderedDict[tuple, tuple]" = OrderedDict()   # sphères
         self._cmp_sig = None                     # état de synchro de la vue B
         self._last_current = -1
-        self._plan_hit = None                    # deplacement sur le plan
         self._plan_hover: Optional[int] = None   # station survolée sur le plan
-        self._plan_axis: Optional[str] = None    # axe du glisser sur le plan
-        self._plan_start = (0.0, 0.0)
         self._autosave_job = None
         self._graph_job = None
         self._pump_job = None
@@ -3267,23 +3153,9 @@ class BubbleNavApp(_TkBase):
             ('f_missing', "Masquer les pastilles dont l'image est absente du dossier."),
             ('f_same_local', "Seulement les pastilles du local de la bulle courante ; le "
                              "filtre suit la bulle quand on navigue (touche L)."),
-            ('step_var', "Pas des boutons + / − (m)."),
-            ('drag_axis_var', "Axe suivi par le glisser : auto (X ou Y selon le geste), "
-                              "X Est, Y Nord ou Z. Touches X / Y / Z."),
-            ('drag_z_var', "L'axe Z corrige le delta plancher (sol et caméra bougent) "
-                           "ou la hauteur station (caméra seule)."),
-            ('yaw_var', "Δ nord de la bulle active (°) : l'image tourne sous les "
-                        "pastilles, rien n'est écrit dans l'image."),
         )
         for attr, text in pairs:
             var = getattr(self, attr, None)
-            if var is not None:
-                by_var[str(var)] = text
-        for axis, text in (('x', "X (Est) de la cible, en m."), ('y', "Y (Nord) de la cible, en m."),
-                           ('dh', "Hauteur station : la caméra bouge, le sol reste."),
-                           ('ddelta', "Delta plancher : caméra et sol bougent "
-                                      "(marche, faux plancher).")):
-            var = getattr(self, 'pos_vars', {}).get(axis)
             if var is not None:
                 by_var[str(var)] = text
         n = 0
@@ -3315,8 +3187,9 @@ class BubbleNavApp(_TkBase):
     def build_view_header(self, bar, which: str) -> None:
         """En-tête d'une vue (A ou B) : les mêmes commandes, pour la bulle de cette vue.
 
-        Retour et Origine, puis la hauteur H et le delta Δ de la bulle affichée,
-        avec − / +. L'en-tête de B porte en plus les commandes qui lient A et B.
+        Retour et Origine, puis la hauteur H et le delta Δ de la bulle affichée
+        (lus ; ils se corrigent à la molette, sur la station active). L'en-tête
+        de A porte « ↺ CSV », celui de B les commandes qui lient A et B.
         """
         mk = self._mk_button
         if which == 'A':
@@ -3345,9 +3218,15 @@ class BubbleNavApp(_TkBase):
             val = tk.Label(bar, text=f"{lib} —", font=F_MONO, bg=COLORS['bg_medium'],
                            fg=COLORS['text'], width=9)
             val.pack(side='left')
-            Tooltip(val, "Hauteur station (caméra seule) : Maj + molette." if comp == 'dh'
-                    else "Delta plancher (caméra et sol) : Alt + molette.")
+            Tooltip(val, (f"Hauteur instrument H de la bulle {which}. Maj + molette : H de la "
+                          "station ACTIVE (vue A), où que soit le curseur.") if comp == 'dh'
+                    else (f"Delta Δ de la bulle {which}. Alt + molette : Δ de la station "
+                          "ACTIVE (vue A), où que soit le curseur."))
             self.ctrl_vals[(which, comp)] = val
+        if which == 'A':
+            mk(bar, "↺ CSV", self._revert_active,
+               tip="Station active : revenir à ses valeurs du CSV (annulable par Ctrl+Z)."
+               ).pack(side='left', padx=(8, 2), pady=3)
         self._refresh_ctrlbar()
 
     def _refresh_ctrlbar(self) -> None:
@@ -3515,38 +3394,39 @@ class BubbleNavApp(_TkBase):
         for j, lk in rev:
             upd(self.stations[j], lk)
 
-    def adjust_alt(self, which, comp: str, sign: int) -> None:
-        """Hauteur (dh) ou delta (ddelta) d'une bulle, ± un pas.
+    def adjust_active(self, comp: str, sign: int) -> None:
+        """Station ACTIVE seulement : Δ ('ddelta'), H ('dh') ou orientation
+        ('yaw_fix'), d'un pas dans le sens `sign`.
 
-        `which` : 'A', 'B' ou l'indice d'une bulle. Une rafale (molette,
-        clics rapprochés) sur la même bulle et la même composante ne compte
-        que pour une étape d'annulation.
+        Bornes et arrondis : voir Corrections.apply (la borne atteinte est
+        affichée). Une rafale de molette ne compte que pour une annulation.
         """
-        if which == 'A':
-            st = self.station()
-        elif which == 'B':
-            st = self.compare.station() if self.compare is not None else None
-        else:
-            st = self.stations[which] if 0 <= which < len(self.stations) else None
+        st = self.station()
         if st is None:
             return
-        step = self.wheel_step()
+        step = self.yaw_step() if comp == 'yaw_fix' else self.wheel_step()
         now = time.monotonic()
         last = getattr(self, '_last_adj', None)
         burst = last is not None and last[0] == st.idx and last[1] == comp and now - last[2] < 1.2
         self._last_adj = (st.idx, comp, now)
-        self.corrections.apply(st, **{comp: round(getattr(st, comp) + sign * step, 6)},
-                               record=not burst)
-        self._refresh_links_of(st.idx)
+        borne = self.corrections.apply(st, **{comp: getattr(st, comp) + sign * step},
+                                       record=not burst)
         if self._card_job:
             self.after_cancel(self._card_job)
         self._card_job = self.after(1600, self._card_expire)   # fin du surlignage
-        self._after_edit(moved=True)
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        self._set_status(f"Station active {self._nom(st.idx)} : " + (
-            f"hauteur station {st.height(eye):.3f} (caméra seule)" if comp == 'dh'
-            else f"delta plancher {st.delta(eye):+.3f} (caméra et sol)")
-            + f" · Z {st.z:.3f}", COLORS['edit'])
+        if comp == 'yaw_fix':
+            self._after_edit(turned=True)
+            msg = (f"orientation de l'image {st.yaw_fix:+.2f}° (appliquée à l'image, "
+                   "pas au CSV)")
+        else:
+            self._refresh_links_of(st.idx)
+            self._after_edit(moved=True)
+            msg = (f"H {st.height(eye):.3f}" if comp == 'dh' else f"Δ {st.delta(eye):+.3f}") \
+                + f" → Z final {st.z:.3f}"
+        self._set_status(f"Station active {self._nom(st.idx)} : {msg}"
+                         + (f"   ⚠ {borne}" if borne else ''),
+                         COLORS['warning'] if borne else COLORS['edit'])
 
     # ── déplacement en plan de la station active (Espace + glisser) ────
     def _ground_rel(self, view: View, cam: Station, x: float, y: float,
@@ -3630,7 +3510,9 @@ class BubbleNavApp(_TkBase):
         elif axis == 'y':
             dx = 0.0
         x0, y0 = info['start']
-        self.corrections.apply(st, x=round(x0 + dx, 3), y=round(y0 + dy, 3), record=False)
+        # déplacement depuis le CSV arrondi au mm ; la coordonnée d'origine reste exacte
+        self.corrections.apply(st, x=st.ox + round(x0 + dx - st.ox, 3),
+                               y=st.oy + round(y0 + dy - st.oy, 3), record=False)
         self._refresh_links_of(st.idx)               # sphère, mât, ombre : en direct
         self._redraw_card_a()                        # A figée pendant le geste
         self._redraw_compare()
@@ -3798,7 +3680,7 @@ class BubbleNavApp(_TkBase):
             return
         self.canvas.delete('fiche')
         self.draw_active_card(self.canvas, view,
-                              view.height - (48 if self.edit_mode else 12), extra='fiche')
+                              view.height - 12, extra='fiche')
 
     def draw_active_card(self, canvas, view: View, bottom: float, extra: str = '') -> None:
         """Fiche de la station active, en bas à gauche de la vue : sol (plancher),
@@ -3817,15 +3699,18 @@ class BubbleNavApp(_TkBase):
         def num(v: float, sg: bool = True) -> str:
             v = round(v, 3) + 0.0                     # jamais « -0,000 »
             return (f"{v:+.3f}" if sg else f"{v:.3f}").replace('.', ',')
-        rows = [("Sol plancher", num(sol, False), '', None, False),
-                ("Δ delta", num(st.delta(eye)), f"CSV {num(st.delta(eye) - st.ddelta)}",
+        rows = [("Z plancher", num(sol, False), '', None, False),
+                ("Δ   Alt+molette", num(st.delta(eye)), f"CSV {num(st.delta0)}",
                  'ddelta', st.shifted()),
-                ("H appareil", num(st.height(eye), False), f"CSV {num(h0, False)}",
+                ("H   Maj+molette", num(st.height(eye), False), f"CSV {num(h0, False)}",
                  'dh', st.raised()),
-                ("Z final", num(st.z, False), "sol + Δ + H", None, st.z_changed())]
+                ("Z final", num(st.z, False), "plancher + Δ + H", None, st.z_changed())]
         if st.moved() or (self._hs_drag and self._hs_drag[0] == 'plan'):
             rows.append(("ΔX / ΔY", f"{num(st.x - st.ox)} / {num(st.y - st.oy)}",
                          "depuis le CSV", 'xy', st.moved()))
+        if st.turned() or flash == 'yaw_fix':
+            rows.append(("Orient. Ctrl+mol.", f"{st.yaw_fix:+.2f}°".replace('.', ','),
+                         "image seule", 'yaw_fix', st.turned()))
         scan = st.key if st.key_explicit and st.key and st.key != st.locator else ''
         head = (f"{scan} · " if scan else '') + f"{st.locator} — station active"
         pad, lh = 12, 24
@@ -3873,23 +3758,70 @@ class BubbleNavApp(_TkBase):
         v = parse_float(str(self.cfg.get('wheel_step', 0.05)))
         return v if v and v > 0 else 0.05
 
-    def wheel_alt(self, event, hotspots, station_idx: int, direction: int) -> bool:
-        """Alt+molette : Δ, Maj+molette : H — toujours de la STATION ACTIVE (vue A).
+    def yaw_step(self) -> float:
+        """Pas de Ctrl + molette pour l'orientation (Réglages : 1° ou 0,1°)."""
+        v = parse_float(str(self.cfg.get('yaw_step', 1.0)))
+        return v if v and v > 0 else 1.0
 
-        Une seule station est modifiable à la fois, la bulle active : pas de
-        correction accidentelle d'une voisine survolée. Depuis la vue B, on
-        voit la pastille de la station active monter ou descendre.
+    def wheel_alt(self, event, hotspots, station_idx: int, direction: int) -> bool:
+        """Molette avec modificateur, TOUJOURS sur la STATION ACTIVE (vue A) :
+        Alt → Δ, Maj → H, Ctrl → orientation de l'image.
+
+        Une seule station est modifiable à la fois : pas de correction
+        accidentelle d'une voisine survolée. Depuis la vue B, on voit la
+        pastille de la station active monter ou descendre.
         Retourne True si la molette a servi à cela.
         """
         alt = alt_down(event.state)
         shift = bool(event.state & 0x0001)
-        if not (alt or shift):
+        ctrl = bool(event.state & 0x0004)
+        if not (alt or shift or ctrl):
             return False
         if self.current >= 0:
             if station_idx != self.current:
                 self._card_b_until = time.monotonic() + 2.5
-            self.adjust_alt(self.current, 'ddelta' if alt else 'dh', direction)
+            self.adjust_active('ddelta' if alt else 'dh' if shift else 'yaw_fix', direction)
         return True
+
+    # ── réseau au sol, dans la vue bulle ─────────────────────────────
+    def draw_floor_network(self, canvas, view: View, cam: Station,
+                           hotspots: Sequence["Hotspot"]) -> None:
+        """Le réseau du relevé tracé AU SOL (Z plancher) dans la bulle : les
+        liens du squelette entre les stations affichées, en perspective. Les
+        lignes fuient vers l'horizon et se croisent là où le plan les croise :
+        la profondeur et la place de chaque station se lisent d'un coup d'œil.
+        Les liens lointains sont plus sombres."""
+        if not self.cfg.get('show_floor_net', True) or not self.plan_edges:
+            return
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        shown = {h.link.target for h in hotspots if h.link.kind == 'same'}
+        shown.add(cam.idx)
+        north = cam.north_pct
+        lim = 4 * max(view.width, view.height)
+        for i, j in self.plan_edges:
+            if i not in shown or j not in shown:
+                continue
+            a, b = self.stations[i], self.stations[j]
+            if a.floor != b.floor:
+                continue
+            pa = (a.x - cam.x, a.y - cam.y, a.plancher(eye) - cam.z)
+            pb = (b.x - cam.x, b.y - cam.y, b.plancher(eye) - cam.z)
+            d = math.hypot((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2)
+            col = '#d6e2ee' if d < 10 else '#a9b6c4' if d < 20 else '#7d8894'
+            seg: List[float] = []
+            n = 14
+            for k in range(n + 1):
+                t = k / n
+                pr = project_point(view, self.calib, north, pa[0] + (pb[0] - pa[0]) * t,
+                                   pa[1] + (pb[1] - pa[1]) * t, pa[2] + (pb[2] - pa[2]) * t)
+                if pr is None or pr[2] < 0.05 or abs(pr[0]) > lim or abs(pr[1]) > lim:
+                    if len(seg) >= 4:
+                        canvas.create_line(*seg, fill=col, width=1, tags='hs')
+                    seg = []
+                    continue
+                seg += [pr[0], pr[1]]
+            if len(seg) >= 4:
+                canvas.create_line(*seg, fill=col, width=1, tags='hs')
 
     # ── mire de hauteur ──────────────────────────────────────────────
     def draw_mire(self, canvas, view: View, cam: Station, tgt: Station, color: str,
@@ -3910,7 +3842,7 @@ class BubbleNavApp(_TkBase):
         gd = tgt.ground(eye) - cam.z             # sol local : plancher + Δ
         top = tgt.z - cam.z                      # Z final : plancher + Δ + H
         d_val = tgt.delta(eye)
-        nd = 3 if self.edit_mode else 2          # au millimètre en édition
+        nd = 2
 
         def pt(z):
             pr = project_point(view, self.calib, north, dx, dy, z)
@@ -3991,8 +3923,6 @@ class BubbleNavApp(_TkBase):
             out.append(partner_idx)
         if hover is not None and hover < len(hotspots):
             out.append(hotspots[hover].link.target)
-        if self.edit_mode and self.selected is not None:
-            out.append(self.selected)
         return [i for k, i in enumerate(out) if i not in out[:k] and 0 <= i < len(self.stations)]
 
     def _build_toolbar(self, parent) -> None:
@@ -4115,6 +4045,12 @@ class BubbleNavApp(_TkBase):
                              command=lambda: (self.cfg.__setitem__('show_card',
                                                                    bool(self.card_var.get())),
                                               self._draw_overlay(), self._redraw_compare()))
+        self.net_var = tk.BooleanVar(value=bool(self.cfg.get('show_floor_net', True)))
+        menu.add_checkbutton(label="Réseau au sol dans la bulle (profondeur)",
+                             variable=self.net_var,
+                             command=lambda: (self.cfg.__setitem__('show_floor_net',
+                                                                   bool(self.net_var.get())),
+                                              self._draw_overlay(), self._redraw_compare()))
         self.mire_var = tk.BooleanVar(value=bool(self.cfg.get('show_mire', True)))
         menu.add_checkbutton(label="Mire de hauteur (empreinte au sol, sol → caméra)",
                              variable=self.mire_var,
@@ -4132,9 +4068,6 @@ class BubbleNavApp(_TkBase):
                                                          padx=8, pady=6)
         self.cmp_btn = self._mk_button(bar, "Comparer  (C)", self._toggle_compare)
         self.cmp_btn.pack(side='left', padx=3, pady=4)
-        self.edit_var = tk.BooleanVar(value=False)
-        self.edit_btn = self._mk_button(bar, "Édition  (E)", self._toggle_edit)
-        self.edit_btn.pack(side='left', padx=3, pady=4)
         self.edit_lbl = tk.Label(bar, text="", bg=COLORS['bg_medium'],
                                  fg=COLORS['edit'], font=F_UI_B)
         self.edit_lbl.pack(side='left', padx=6)
@@ -4195,8 +4128,6 @@ class BubbleNavApp(_TkBase):
                              wraplength=330)
         self.info.pack(fill='x', padx=10)
 
-        self._build_edit_panel(side)
-
         self.nb_title = tk.Label(side, text="Voisins (double-clic pour y aller)",
                                  font=F_UI_B, bg=COLORS['bg_medium'], fg=COLORS['text'])
         self.nb_title.pack(anchor='w', padx=10, pady=(10, 2))
@@ -4254,7 +4185,6 @@ class BubbleNavApp(_TkBase):
             '<F11>': self._toggle_fullscreen,
             '<c>': self._toggle_compare, '<C>': self._toggle_compare,
             '<f>': self._toggle_filters, '<F>': self._toggle_filters,
-            '<e>': self._toggle_edit, '<E>': self._toggle_edit,
             '<v>': self._show_viewer, '<V>': self._show_viewer,
             '<t>': lambda: self._toggle_scope('plancher'),
             '<T>': lambda: self._toggle_scope('plancher'),
@@ -4267,12 +4197,8 @@ class BubbleNavApp(_TkBase):
             '<F1>': self._dlg_help, '<question>': self._dlg_help,
             '<x>': lambda: self._lock_axis('x'), '<X>': lambda: self._lock_axis('x'),
             '<y>': lambda: self._lock_axis('y'), '<Y>': lambda: self._lock_axis('y'),
-            '<z>': lambda: self._lock_axis('z'), '<Z>': lambda: self._lock_axis('z'),
             '<Control-z>': self.undo, '<Control-Z>': self.undo,
             '<Control-s>': self._dlg_apply,
-            '<Prior>': lambda: self._bump('dh', +1), '<Next>': lambda: self._bump('dh', -1),
-            '<Shift-Prior>': lambda: self._bump('ddelta', +1),
-            '<Shift-Next>': lambda: self._bump('ddelta', -1),
         }
         for seq, fn in raccourcis.items():
             self.bind_all(seq, key(fn))
@@ -4412,13 +4338,14 @@ class BubbleNavApp(_TkBase):
         self.f_local_cb.config(values=sorted({s.parts().local for s in stations
                                               if s.parts().local}))
         self.by_photo = {s.photo: s for s in stations}
-        # altitude du point de vue : plancher + delta + hauteur (avant corrections)
-        apply_altimetry(stations, float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
+        # Z = plancher + Δ + H ; les Z lus incohérents sont signalés
+        alti = apply_altimetry(stations, float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
+        if alti:
+            warns.extend(alti)
         self.by_key = {s.key.lower(): s for s in stations}
         custom = self.cfg.get('corr_paths', {}).get(path, '')
         self.corrections = Corrections(path, custom if isinstance(custom, str) else '',
                                        eye=float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
-        self.selected = None
         corr_msg = ''
         if os.path.isfile(self.corrections.path):
             try:
@@ -4435,8 +4362,10 @@ class BubbleNavApp(_TkBase):
         self.rebuild_graph()
 
         msg = f"{len(stations)} bulles · {len(self.floors)} planchers · {os.path.basename(path)}"
-        if warns:
-            msg += f" · {len(warns)} ligne(s) ignorée(s)"
+        if len(warns) > len(alti):
+            msg += f" · {len(warns) - len(alti)} ligne(s) ignorée(s)"
+        if alti:
+            msg += f" · ⚠ {len(alti)} Z à vérifier (Réglages › avertissements)"
         self.incoherences = check_floor_coherence(stations)
         deduits = sum(1 for st in stations if st.parts().etage_deduit)
         if deduits:
@@ -4538,7 +4467,6 @@ class BubbleNavApp(_TkBase):
                 aim_at(self.view, self.calib, self.stations[idx], prev,
                        float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)), self.anchor())
         self.current = idx
-        self.selected = None
         self.focus_idx = None
         st = self.stations[idx]
         if self.floor_var.get() != st.floor:
@@ -4860,7 +4788,7 @@ class BubbleNavApp(_TkBase):
         apply_altimetry(self.stations, float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
         self.rebuild_graph()          # les liens entre planchers dépendent des Z
         self._redraw_compare()
-        self._refresh_edit_panel()
+        self._refresh_counts()
 
     def anchor(self) -> str:
         """Hauteur des pastilles : 'sol' (plancher + delta) ou 'vue' (+ hauteur)."""
@@ -5027,6 +4955,12 @@ class BubbleNavApp(_TkBase):
             return hs.col, hs.row + rs, rs
         return hs.col + vx / n * rs, hs.row + vy / n * rs, rs
 
+    @staticmethod
+    def fade(dist: float) -> float:
+        """Opacité selon la distance : nette de près, estompée au loin (0,1 près)."""
+        t = clamp((dist - FADE_NEAR_M) / (FADE_FAR_M - FADE_NEAR_M), 0.0, 1.0)
+        return round(1.0 - t * (1.0 - FADE_MIN), 1)
+
     def draw_hotspot(self, canvas, hs: "Hotspot", color: str, hovered: bool,
                      selected: bool = False, mast: bool = True) -> None:
         """Dessine une pastille (relief ou plate) sur un canevas."""
@@ -5048,7 +4982,8 @@ class BubbleNavApp(_TkBase):
                 canvas.create_line(fx, fy, px, py, fill='#000000', width=4, tags='hs')
                 canvas.create_line(fx, fy, px, py, fill=color, width=2, tags='hs')
         if self.relief():
-            photo, ax, ay = self._sprite(color, r, hovered, floating=floating)
+            photo, ax, ay = self._sprite(color, r, hovered, floating=floating,
+                                         alpha=1.0 if hovered else self.fade(hs.link.dist))
             canvas.create_image(hs.col - ax, hs.row - ay, anchor='nw', image=photo,
                                 tags='hs')
             if selected:
@@ -5085,14 +5020,13 @@ class BubbleNavApp(_TkBase):
         étiquette qui mordrait sur une autre est omise, la sphère restant
         affichée (le survol montre tout).
         """
-        lo = self.disc_bounds()[0] + 0.5
         n_lines = (int(bool(self.labels_var.get())) * 13
                    + int(bool(self.heights_var.get())) * 33)
         taken: List[Tuple[float, float, float, float]] = []
         ok = set()
         for i in sorted(range(len(hotspots)), key=lambda k: -hotspots[k].radius):
             hs = hotspots[i]
-            if hs.radius <= lo:
+            if hs.link.dist > LABEL_NEAR_M:
                 continue
             tgt = self.stations[hs.link.target]
             w = max(56.0, 6.2 * (len(tgt.locator) + 8)) / 2.0
@@ -5115,8 +5049,8 @@ class BubbleNavApp(_TkBase):
         lignes discrètes — hauteur de l'appareil, delta plancher et altitude
         finale du point de vue (Z caméra). Une valeur corrigée passe en
         orange. Les lignes d'altitude sont réservées aux pastilles proches
-        (non réduites à leur taille minimale), à la pastille survolée et à
-        la cible d'édition, pour ne pas encombrer le lointain.
+        (à moins de LABEL_NEAR_M) et à la pastille survolée, pour ne pas
+        encombrer le lointain.
         """
         lk = hs.link
         top = self.glyph_y(hs, hovered)
@@ -5136,9 +5070,9 @@ class BubbleNavApp(_TkBase):
                            if self.relief() and hs.foot is None else 0)
             canvas.create_oval(hs.col - rs, cy - rs, hs.col + rs, cy + rs,
                                outline='white', width=2, dash=(4, 3), tags='hs')
-        # Pastilles lointaines (à leur taille minimale) : la sphère seule, pour
+        # Pastilles lointaines (au-delà de LABEL_NEAR_M) : la sphère seule, pour
         # que tout le plancher reste lisible ; le survol donne tout.
-        near = labels and hs.radius > self.disc_bounds()[0] + 0.5
+        near = labels and hs.link.dist <= LABEL_NEAR_M
         # Mode num scan : le n° de scan (nom de l'image) au-dessus de la pastille ;
         # le survol ajoute le locator.
         scan = tgt.key_explicit and tgt.key and tgt.key != tgt.locator
@@ -5160,7 +5094,7 @@ class BubbleNavApp(_TkBase):
             y += 13
         if self.heights_var.get() and (near or hovered or selected) and not mire:
             eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-            nd = 3 if self.edit_mode else 2
+            nd = 2
             for label, val, fix, signed in (
                     ("H", tgt.height(eye), tgt.raised(), False),
                     ("Δ", tgt.delta(eye), tgt.shifted(), True),
@@ -5201,13 +5135,7 @@ class BubbleNavApp(_TkBase):
             return
         self.hotspots = self._compute_hotspots(view)
         self.draw_image_center(self.canvas, view, self.station())
-        espace = bool(self._hs_drag and self._hs_drag[0] == 'plan')
-        if self.edit_mode:
-            self._draw_edit_refs(view)
-            self._draw_axes(view)
-        else:
-            self._axis_hits = []
-            self._axis_labels = []
+        self.draw_floor_network(self.canvas, view, self.station(), self.hotspots)
         libres = self.declutter(self.hotspots)
         mires = set(self.mire_targets(self.current,
                                       self.compare.idx if self.compare is not None else None,
@@ -5218,18 +5146,11 @@ class BubbleNavApp(_TkBase):
             missing = not self.store.has(tgt.photo)
             color = self.hotspot_color(lk, tgt)
             hovered = (i == self._hover)
-            selected = self.edit_mode and self.selected == tgt.idx
-            self.draw_hotspot(self.canvas, hs, color, hovered, selected=selected,
-                              mast=tgt.idx not in mires)
+            self.draw_hotspot(self.canvas, hs, color, hovered, mast=tgt.idx not in mires)
             tag = ("↩ origine" if tgt.idx == self.came_from else
                    "B" if self.compare is not None and tgt.idx == self.compare.idx else '')
-            self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing, tag,
+            self.draw_marks(self.canvas, hs, tgt, color, hovered, False, missing, tag,
                             labels=i in libres, mire=tgt.idx in mires)
-        if self.edit_mode or espace:
-            for x, y, txt, col in self._axis_labels:
-                self.canvas.create_text(x + 1, y + 1, text=txt, fill='#000000',
-                                        font=F_UI_B, tags='hs')
-                self.canvas.create_text(x, y, text=txt, fill=col, font=F_UI_B, tags='hs')
         cur = self.station()
         par_bulle = {h.link.target: (k, h) for k, h in enumerate(self.hotspots)}
         for idx in self.mire_targets(self.current,
@@ -5273,15 +5194,7 @@ class BubbleNavApp(_TkBase):
                 text=f"FILTRES : {self.filters.resume()}\n"
                      f"{len(self.hotspots)} pastille(s) affichée(s), "
                      f"{self.hidden_count} masquée(s)", justify='right')
-        if self.edit_mode:
-            self.canvas.create_text(
-                view.width / 2, view.height - 10, anchor='s', tags='hs',
-                fill=COLORS['edit'], font=('Segoe UI', 10, 'bold'),
-                text="ÉDITION — glisser pastille ou axe : déplacement sur un axe "
-                     "(X/Y/Z verrouille) · Ctrl : bulle active · Maj : tourner l'image")
-            self._axis_readout(view)
-        self.draw_active_card(self.canvas, view,
-                              view.height - (48 if self.edit_mode else 12), extra='fiche')
+        self.draw_active_card(self.canvas, view, view.height - 12, extra='fiche')
         # rose des vents : direction du nord dans la vue
         pr = project(view, self.calib.pano_yaw(0.0, st.north_pct), 0.0)
         if pr is not None:
@@ -5290,43 +5203,6 @@ class BubbleNavApp(_TkBase):
                 self.canvas.create_text(col, 34, text="N", fill='#ff6b6b',
                                         font=('Segoe UI', 12, 'bold'), tags='hs')
                 self.canvas.create_line(col, 44, col, 56, fill='#ff6b6b', width=2, tags='hs')
-
-    def _draw_edit_refs(self, view: View) -> None:
-        """Repères d'alignement : toutes les bulles proches, même non liées.
-
-        Elles servent à juger la cohérence de l'orientation de l'image avec
-        l'ensemble du réseau, et pas seulement avec les 8 pastilles retenues.
-        """
-        st = self.station()
-        if st is None:
-            return
-        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        linked = {lk.target for lk in self.links[self.current]} if self.current < len(self.links) else set()
-        radius = self.params.radius
-        for other in self.stations:
-            if other.idx == st.idx or other.idx in linked or other.floor != st.floor:
-                continue
-            dx, dy = other.x - st.x, other.y - st.y
-            if abs(dx) > radius or abs(dy) > radius:
-                continue
-            dh = math.hypot(dx, dy)
-            if dh > radius or dh < 1e-6:
-                continue
-            dz = other.plancher(eye) - st.z
-            az = math.degrees(math.atan2(dx, dy))
-            elev = math.degrees(math.atan2(dz, dh))
-            pr = project(view, self.calib.pano_yaw(az, st.north_pct), elev)
-            if pr is None:
-                continue
-            col, row, _ = pr
-            if not (0 <= col <= view.width and 0 <= row <= view.height):
-                continue
-            self.canvas.create_line(col - 6, row, col + 6, row,
-                                    fill=COLORS['sel'], tags='hs')
-            self.canvas.create_line(col, row - 4, col, row + 4,
-                                    fill=COLORS['sel'], tags='hs')
-            self.canvas.create_text(col + 8, row - 7, anchor='w', text=other.locator,
-                                    fill=COLORS['sel'], font=F_UI, tags='hs')
 
     def tooltip_lines(self, hs: "Hotspot", origin: Optional[Station]) -> Tuple[List[str], bool]:
         """Infobulle courte : nom, distance, altitude ; le détail est dans le panneau."""
@@ -5419,37 +5295,9 @@ class BubbleNavApp(_TkBase):
                                     " — Ctrl+clic sur une voisine pour ouvrir B"),
                 COLORS['warning'])
             return
-        if self.edit_mode and self.current >= 0:
-            st = self.station()
-            ctrl = bool(event.state & 0x0004)
-            shift = bool(event.state & 0x0001)
-            if shift:                                    # tourner l'image
-                self.corrections.apply(st)               # état avant le geste
-                self._hs_drag = ('yaw', self.current, st.yaw_fix, event.x)
-                return
-            axis = self._axis_at(event.x, event.y)
-            if axis is not None:                         # saisie d'un axe du repère
-                if self._start_axis_drag(self._edit_target(), event, axis, on_origin=True):
-                    return
-            if ctrl:                                     # deplacer la bulle active
-                probe = self._hotspot_at(event.x, event.y)
-                self._set_target(None)
-                if self._start_axis_drag(st, event, self._locked_axis()):
-                    if probe is not None:          # simple clic : ce sera une sonde
-                        self._hs_drag[1]['probe'] = self.hotspots[probe].link.target
-                    return
-            hit = self._hotspot_at(event.x, event.y)
-            if hit is not None:
-                tgt = self.stations[self.hotspots[hit].link.target]
-                self._set_target(tgt.idx)
-                self._start_axis_drag(tgt, event, self._locked_axis())
-                return
         self._drag = (event.x, event.y, self.view.yaw, self.view.pitch)
 
     def _on_drag(self, event) -> None:
-        if self._hs_drag is not None:
-            self._drag_edit(event)
-            return
         if self._drag is None:
             return
         x0, y0, yaw0, pitch0 = self._drag
@@ -5464,11 +5312,8 @@ class BubbleNavApp(_TkBase):
         moved = 0
         if getattr(self, '_press_xy', None):
             moved = abs(event.x - self._press_xy[0]) + abs(event.y - self._press_xy[1])
-        if self._hs_drag is not None:
-            self._end_edit_drag()
-            return
         self._drag = None
-        if moved <= 4 and not self.edit_mode:
+        if moved <= 4:
             hit = self._hotspot_at(event.x, event.y)
             if hit is not None:
                 if event.state & 0x0004:            # Ctrl+clic : sonder
@@ -5485,7 +5330,7 @@ class BubbleNavApp(_TkBase):
         if hit != self._hover:
             self._hover = hit
             self.canvas.config(cursor='hand2' if hit is not None else 'fleur')
-            if hit is not None and not self.edit_mode:
+            if hit is not None:
                 self.focus_idx = self.hotspots[hit].link.target
                 self._refresh_side()
             self._draw_overlay()
@@ -5501,8 +5346,6 @@ class BubbleNavApp(_TkBase):
         """Double-clic : rejoint la pastille visée, sinon recentre la vue."""
         hit = self._hotspot_at(event.x, event.y)
         if hit is not None:
-            if self.edit_mode:
-                self.goto(self.hotspots[hit].link.target)
             return
         view = self._frame_view or self.view
         wx, wy, wz = _pano_ray(view, event.x, event.y)
@@ -5674,13 +5517,12 @@ class BubbleNavApp(_TkBase):
         if self.filter_body.winfo_ismapped():
             self.filter_body.pack_forget()
             self.filter_toggle.config(text="▸")
-            if not self.edit_mode:
-                self.plan.config(height=PLAN_H)
+            self.plan.config(height=PLAN_H)
         else:
             self.filter_body.pack(fill='x', padx=10, pady=(2, 4),
                                   before=self.info_title)
             self.filter_toggle.config(text="▾")
-            self.plan.config(height=PLAN_H_EDIT)
+            self.plan.config(height=PLAN_H_SMALL)
 
     def _toggle_compare(self) -> None:
         """Ouvre ou ferme la seconde vue bulle."""
@@ -5820,9 +5662,7 @@ class BubbleNavApp(_TkBase):
         if st is None or self.current >= len(self.links):
             return
         focus = st
-        if self.edit_mode:
-            focus = self._edit_target() or st
-        elif self.focus_idx is not None and 0 <= self.focus_idx < len(self.stations):
+        if self.focus_idx is not None and 0 <= self.focus_idx < len(self.stations):
             focus = self.stations[self.focus_idx]
         self.info_title.config(
             text="Bulle courante" if focus is st else f"Cible : {focus.locator}")
@@ -5847,7 +5687,7 @@ class BubbleNavApp(_TkBase):
             text=f"{self.filters.resume()} · {len(links)}/{len(self.links[self.current])} "
                  f"pastille(s)",
             fg=COLORS['sel'] if self.filters.active else COLORS['text_muted'])
-        self._refresh_edit_panel()
+        self._refresh_counts()
 
     def _describe(self, st: Station, origin: Optional[Station] = None) -> str:
         """Fiche d'une bulle : nom analysé, position, état, distance à l'origine."""
@@ -5889,300 +5729,62 @@ class BubbleNavApp(_TkBase):
         if st.has_yaw():
             lignes.append(f"Δ nord   {st.yaw_fix:+.3f}°  (à appliquer à l'image)")
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        plancher = (f"plancher {st.floor_alt:+.2f} + " if st.floor_alt is not None
-                    else '')
-        lignes.append(f"sol      {plancher}Δ {st.delta(eye):+.2f} = {st.ground(eye):.2f}")
-        lignes.append(f"caméra   sol + H {st.height(eye):.2f} = {st.z:.2f} (point de vue)")
+        lignes.append(f"Z final  plancher {st.plancher(eye):.3f} + Δ {st.delta(eye):+.3f} "
+                      f"+ H {st.height(eye):.3f} = {st.z:.3f}")
+        if st.plancher_src == 'Z CSV':
+            lignes.append("         (plancher déduit du Z du CSV : ni colonne ni libellé)")
         if st.moved():
-            lignes.append(f"DÉPLACÉE en plan de {math.hypot(st.x - st.ox, st.y - st.oy):.2f} m")
+            lignes.append(f"XY corrigé : ΔX {st.x - st.ox:+.3f}  ΔY {st.y - st.oy:+.3f}")
         if st.raised():
-            lignes.append(f"HAUTEUR STATION corrigée de {st.dh:+.3f} m")
+            lignes.append(f"H corrigée de {st.dh:+.3f} m")
         if st.shifted():
-            lignes.append(f"DELTA PLANCHER corrigé de {st.ddelta:+.3f} m")
+            lignes.append(f"Δ corrigé de {st.ddelta:+.3f} m")
         applied = self.corrections.applied.get(st.key) if self.corrections else None
         if applied:
             lignes.append(f"image tournée le {applied}")
         return '\n'.join(lignes)
 
     # ═════════════════════════════════════════════════════════════════
-    # EDITION : POSITION XYZ (CSV) ET ORIENTATION (IMAGE)
+    # CORRECTIONS DE LA STATION ACTIVE
     # ═════════════════════════════════════════════════════════════════
-    def _build_edit_panel(self, side) -> None:
-        # Hôte défilant : le panneau reste utilisable sur un écran peu haut.
-        self.edit_host = tk.Frame(side, bg=COLORS['card'])
-        vsb = tk.Scrollbar(self.edit_host, orient='vertical')
-        vsb.pack(side='right', fill='y')
-        holder = tk.Canvas(self.edit_host, bg=COLORS['card'], highlightthickness=0,
-                           yscrollcommand=vsb.set)
-        holder.pack(side='left', fill='both', expand=True)
-        vsb.config(command=holder.yview)
-        self.edit_frame = tk.Frame(holder, bg=COLORS['card'], padx=8, pady=6)
-        win = holder.create_window((0, 0), window=self.edit_frame, anchor='nw')
-        self.edit_frame.bind('<Configure>',
-                             lambda e: holder.config(scrollregion=holder.bbox('all')))
-        holder.bind('<Configure>', lambda e: holder.itemconfigure(win, width=e.width))
+    def _refresh_counts(self) -> None:
+        """Barre d'outils : nombre de stations corrigées, par nature."""
+        if hasattr(self, 'edit_lbl'):
+            bilan = Corrections.counts(self.stations)
+            self.edit_lbl.config(text=f"✎ {bilan.texte()}" if bilan.any() else '')
 
-        def wheel(event, direction=0):
-            step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
-            holder.yview_scroll(-step, 'units')
-        for widget in (holder, self.edit_frame):
-            widget.bind('<MouseWheel>', wheel)
-            widget.bind('<Button-4>', lambda e: wheel(e, +1))
-            widget.bind('<Button-5>', lambda e: wheel(e, -1))
-
-        def label(parent, text, **kw):
-            return tk.Label(parent, text=text, font=F_UI, bg=COLORS['card'],
-                            fg=COLORS['text'], **kw)
-
-        # Cible d'edition
-        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        row.pack(fill='x')
-        label(row, "Cible :").pack(side='left')
-        self._mk_button(row, "Bulle active", lambda: self._set_target(None),
-                        bg=COLORS['bg_light']).pack(side='left', padx=4)
-        self.target_lbl = tk.Label(row, text="—", font=F_UI_B, bg=COLORS['card'],
-                                   fg=COLORS['sel'])
-        self.target_lbl.pack(side='left', padx=4)
-        label(self.edit_frame,
-              "clic sur une pastille = la prendre pour cible"
-              ).pack(anchor='w', pady=(0, 4))
-
-        # Position XYZ
-        tk.Label(self.edit_frame, text="Position (CSV corrigé)", font=F_UI_B,
-                 bg=COLORS['card'], fg=COLORS['accent']).pack(anchor='w')
-        grid = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        grid.pack(fill='x', pady=2)
-        self.pos_vars = {}
-        for i, axis in enumerate(('x', 'y')):
-            tk.Label(grid, text=axis.upper(), font=F_MONO, width=2, bg=COLORS['card'],
-                     fg=COLORS['text']).grid(row=i, column=0)
-            var = tk.StringVar(value='—')
-            self.pos_vars[axis] = var
-            ent = tk.Entry(grid, textvariable=var, width=11, font=F_MONO,
-                           bg=COLORS['bg_light'], fg=COLORS['text'], relief='flat',
-                           insertbackground=COLORS['text'])
-            ent.grid(row=i, column=1, padx=3, pady=1)
-            ent.bind('<Return>', lambda e: self._apply_position_fields())
-            self._mk_button(grid, "−", lambda a=axis: self._bump(a, -1)).grid(row=i, column=2)
-            self._mk_button(grid, "+", lambda a=axis: self._bump(a, +1)).grid(row=i, column=3, padx=2)
-        tk.Label(grid, text="pas", font=F_UI, bg=COLORS['card'],
-                 fg=COLORS['text_muted']).grid(row=0, column=4, padx=(8, 2))
-        self.step_var = tk.StringVar(value='0.05')
-        ttk.Combobox(grid, textvariable=self.step_var, width=5, state='readonly',
-                     style='BN.TCombobox', values=('0.01', '0.05', '0.10', '0.50')
-                     ).grid(row=1, column=4, padx=(8, 2))
-
-        # Glisser contraint : toujours le long d'un axe
-        tk.Label(self.edit_frame, text="Glisser selon l'axe", font=F_UI_B,
-                 bg=COLORS['card'], fg=COLORS['accent']).pack(anchor='w', pady=(6, 0))
-        ax = self.cfg.get('drag_axis', 'auto')
-        self.drag_axis_var = tk.StringVar(value=ax if ax in DRAG_AXIS_MODES else 'auto')
-        zk = self.cfg.get('drag_z', 'ddelta')
-        self.drag_z_var = tk.StringVar(value=zk if zk in ('dh', 'ddelta') else 'ddelta')
-        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        row.pack(fill='x', pady=2)
-        for val, txt in (('auto', "Auto X/Y"), ('x', "X Est"), ('y', "Y Nord"), ('z', "Z")):
-            tk.Radiobutton(row, text=txt, value=val, variable=self.drag_axis_var,
-                           indicatoron=False, command=self._on_axis_mode, font=F_UI_B,
-                           bg=COLORS['bg_light'], fg=AXIS_COLORS.get(val, COLORS['text']),
-                           selectcolor=COLORS['bg_dark'], activebackground=COLORS['bg_light'],
-                           activeforeground=COLORS['text'], relief='flat', bd=0,
-                           padx=8, pady=2).pack(side='left', padx=2)
-        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        row.pack(fill='x', pady=(0, 2))
-        label(row, "Z agit sur :").pack(side='left')
-        for val, txt in (('ddelta', "Δ plancher"), ('dh', "H station")):
-            tk.Radiobutton(row, text=txt, value=val, variable=self.drag_z_var,
-                           command=self._on_axis_mode, font=F_UI, bg=COLORS['card'],
-                           fg=COLORS['text'], selectcolor=COLORS['bg_dark'],
-                           activebackground=COLORS['card'],
-                           activeforeground=COLORS['text']).pack(side='left', padx=2)
-        label(self.edit_frame,
-              "Repère gradué, centré sur la position du CSV.\n"
-              "Auto : X ou Y selon le début du geste.\n"
-              "Touches X / Y / Z : verrouiller (2e appui : auto).\n"
-              "Saisir un axe du repère : le geste le suit.",
-              justify='left').pack(anchor='w', pady=(0, 2))
-
-        # Altitude : deux composantes de nature physique differente
-        tk.Label(self.edit_frame, text="Altitude (deux composantes)", font=F_UI_B,
-                 bg=COLORS['card'], fg=COLORS['accent']).pack(anchor='w', pady=(6, 0))
-        zg = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        zg.pack(fill='x', pady=2)
-        for i, (axis, lib) in enumerate((('dh', "Hauteur station"),
-                                         ('ddelta', "Delta plancher"))):
-            tk.Label(zg, text=lib, font=F_UI, width=15, anchor='w', bg=COLORS['card'],
-                     fg=COLORS['text']).grid(row=i, column=0)
-            var = tk.StringVar(value='0.000')
-            self.pos_vars[axis] = var
-            ent = tk.Entry(zg, textvariable=var, width=8, font=F_MONO,
-                           bg=COLORS['bg_light'], fg=COLORS['text'], relief='flat',
-                           insertbackground=COLORS['text'])
-            ent.grid(row=i, column=1, padx=3, pady=1)
-            ent.bind('<Return>', lambda e: self._apply_position_fields())
-            self._mk_button(zg, "−", lambda a=axis: self._bump(a, -1)).grid(row=i, column=2)
-            self._mk_button(zg, "+", lambda a=axis: self._bump(a, +1)).grid(row=i, column=3, padx=2)
-        self.z_lbl = tk.Label(self.edit_frame, text="", font=F_MONO, bg=COLORS['card'],
-                              fg=COLORS['text_muted'], anchor='w', justify='left')
-        self.z_lbl.pack(fill='x')
-        label(self.edit_frame,
-              "hauteur station : la caméra bouge, le sol reste (PgUp/PgDn)\n"
-              "delta plancher : caméra et sol bougent — marche, faux\n"
-              "plancher (Maj+PgUp/PgDn)").pack(anchor='w', pady=(0, 2))
-        self._mk_button(self.edit_frame, "Appliquer les valeurs saisies",
-                        self._apply_position_fields, bg=COLORS['bg_light']
-                        ).pack(anchor='w', pady=(2, 0))
-
-        # Orientation image
-        tk.Label(self.edit_frame, text="Orientation — Δ nord (enregistré au CSV)",
-                 font=F_UI_B, bg=COLORS['card'], fg=COLORS['accent']
-                 ).pack(anchor='w', pady=(8, 0))
-        self.yaw_var = tk.DoubleVar(value=0.0)
-        self.yaw_scale = tk.Scale(self.edit_frame, from_=-30, to=30, resolution=0.05,
-                                  orient='horizontal', variable=self.yaw_var,
-                                  command=self._on_yaw_slider, length=300,
-                                  showvalue=False, bg=COLORS['text_muted'],
-                                  fg=COLORS['text'], troughcolor=COLORS['bg_dark'],
-                                  highlightthickness=0, bd=0, sliderrelief='flat',
-                                  activebackground=COLORS['edit'])
-        self.yaw_scale.pack(fill='x')
-        # une manipulation du curseur = une seule étape annulable
-        self.yaw_scale.bind('<ButtonPress-1>',
-                            lambda e: self.station() and self.corrections.apply(self.station()))
-        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        row.pack(fill='x', pady=2)
-        for txt, d in (("−0,5°", -0.5), ("−0,05°", -0.05), ("+0,05°", 0.05), ("+0,5°", 0.5)):
-            self._mk_button(row, txt, lambda dd=d: self._nudge_yaw(dd)).pack(side='left', padx=2)
-        self.yaw_lbl = tk.Label(row, text="0,00°", font=F_MONO, bg=COLORS['card'],
-                                fg=COLORS['edit'])
-        self.yaw_lbl.pack(side='right')
-        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        row.pack(fill='x', pady=(0, 2))
-        label(row, "appliquer à :").pack(side='left')
-        self._mk_button(row, "ce plancher",
-                        lambda: self._spread_yaw('plancher')).pack(side='left', padx=3)
-        self._mk_button(row, "tout le relevé",
-                        lambda: self._spread_yaw('tout')).pack(side='left', padx=3)
-        label(self.edit_frame,
-              "Maj + glisser dans la vue = tourner l'image ;\n"
-              "glisser une pastille = la déplacer le long d'un axe ;\n"
-              "Ctrl + glisser = déplacer la bulle active (sur un axe).\n"
-              "Rien n'est écrit dans les images : l'angle vit dans le CSV et\n"
-              "s'applique à l'affichage. Les images ne sont tournées qu'au\n"
-              "moment choisi, par « Appliquer / enregistrer… »."
-              ).pack(anchor='w', pady=(2, 6))
-
-        # Fichier de corrections
-        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        row.pack(fill='x', pady=(4, 0))
-        label(row, "Corrections :").pack(side='left')
-        self.corr_lbl = tk.Label(row, text="—", font=F_UI, bg=COLORS['card'],
-                                 fg=COLORS['ok'], anchor='w')
-        self.corr_lbl.pack(side='left', padx=4, fill='x', expand=True)
-        self._mk_button(row, "Fichier…", self._choose_corrections_file).pack(side='right')
-
-        # Annulation et sorties
-        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        row.pack(fill='x', pady=2)
-        self._mk_button(row, "Annuler (Ctrl+Z)", self._undo_edit).pack(side='left')
-        self._mk_button(row, "Réinit. cible", self._revert_target).pack(side='left', padx=4)
-        self._mk_button(row, "Réinit. tout", self._revert_all).pack(side='left')
-        row = tk.Frame(self.edit_frame, bg=COLORS['card'])
-        row.pack(fill='x', pady=4)
-        self._mk_button(row, "Appliquer / enregistrer…  (Ctrl+S)", self._dlg_apply,
-                        bg=COLORS['accent']).pack(side='left')
-        self.edit_count = tk.Label(self.edit_frame, text="aucune modification",
-                                   font=F_UI, bg=COLORS['card'], fg=COLORS['text_muted'])
-        self.edit_count.pack(anchor='w')
-
-    # ── bascule ──────────────────────────────────────────────────────
-    @property
-    def edit_mode(self) -> bool:
-        return bool(getattr(self, 'edit_var', None) and self.edit_var.get())
-
-    def _toggle_edit(self, force: Optional[bool] = None) -> None:
-        state = (not self.edit_mode) if force is None else bool(force)
-        self.edit_var.set(state)
-        if state:
-            # Le panneau d'édition a besoin de place : plan réduit et filtres
-            # repliés (l'état des filtres est conservé et restitué en sortie).
-            self._filters_were_open = self.filter_body.winfo_ismapped()
-            if self._filters_were_open:
-                self._toggle_filter_panel()
-            self.plan.config(height=PLAN_H_EDIT)
-            self.nb_title.pack_forget()
-            self.nb_wrap.pack_forget()
-            self.edit_host.pack(fill='both', expand=True, padx=10, pady=(8, 10))
-            self.edit_btn.config(bg=COLORS['edit'], fg='#101010')
-            self._set_target(None)
-        else:
-            self.edit_host.pack_forget()
-            self.plan.config(height=PLAN_H)
-            if getattr(self, '_filters_were_open', False) \
-                    and not self.filter_body.winfo_ismapped():
-                self._toggle_filter_panel()
-            self.nb_title.pack(anchor='w', padx=10, pady=(10, 2))
-            self.nb_wrap.pack(fill='both', expand=True, padx=10, pady=(0, 10))
-            self.edit_btn.config(bg=COLORS['bg_light'], fg=COLORS['text'])
-            self.selected = None
-        self._refresh_edit_panel()
-        self._draw_overlay()
-        self._draw_plan()
-
-    # ── cible ────────────────────────────────────────────────────────
-    def _edit_target(self) -> Optional[Station]:
-        if self.selected is not None and 0 <= self.selected < len(self.stations):
-            return self.stations[self.selected]
-        return self.station()
-
-    def _set_target(self, idx: Optional[int]) -> None:
-        self.selected = idx
-        self._refresh_edit_panel()
-        self._draw_overlay()
-        self._draw_plan()
-
-    def _refresh_edit_panel(self) -> None:
-        if not hasattr(self, 'target_lbl'):
+    # ── réinitialisation, verrou d'axe (Espace + glisser) ─────────────
+    def _revert_active(self) -> None:
+        """Station active : retour aux valeurs du CSV (annulable par Ctrl+Z)."""
+        st = self.station()
+        if st is None or not st.modified():
             return
-        st = self._edit_target()
-        if st is None:
-            return
-        who = "bulle active" if self.selected is None else "pastille"
-        self.target_lbl.config(text=f"{st.locator}  ({who})")
-        for axis in ('x', 'y'):
-            self.pos_vars[axis].set(f"{getattr(st, axis):.3f}")
-        self.pos_vars['dh'].set(f"{st.dh:+.3f}")
-        self.pos_vars['ddelta'].set(f"{st.ddelta:+.3f}")
-        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        base = f"plancher {st.floor_alt:.3f} + " if st.floor_alt is not None else ''
-        self.z_lbl.config(text=(f"{base}Δ {st.delta(eye):+.3f} + H {st.height(eye):.3f} "
-                                f"= Z {st.z:.3f}  ·  sol {st.ground(eye):.3f}"))
-        self._sync_ui = True
-        try:
-            self.yaw_var.set(round(self.stations[self.current].yaw_fix, 2)
-                             if self.current >= 0 else 0.0)
-        finally:
-            self._sync_ui = False
-        self.yaw_lbl.config(text=f"{self.yaw_var.get():+.2f}°".replace('.', ','))
-        bilan = Corrections.counts(self.stations)
-        pending = len(Corrections.pending_images(self.stations))
-        etat = "modifications non enregistrées" if self.corrections.dirty else "enregistré"
-        self.corr_lbl.config(
-            text=f"{os.path.basename(self.corrections.path) or '—'} ({etat})",
-            fg=COLORS['edit'] if self.corrections.dirty else COLORS['ok'])
-        self._refresh_module()
-        if bilan.any():
-            self.edit_count.config(
-                text=(f"corrections : {bilan.texte()}\n"
-                      f"images à tourner : {pending}"), fg=COLORS['edit'])
-            self.edit_lbl.config(text=f"✎ {bilan.texte()}")
-        else:
-            self.edit_count.config(
-                text=("aucune correction" if not pending else
-                      f"{pending} image(s) à tourner"), fg=COLORS['text_muted'])
-            self.edit_lbl.config(text="")
+        self.corrections.revert(st)
+        self._refresh_links_of(st.idx)
+        self._after_edit(moved=True, turned=True)
+        self._set_status(f"Station active {self._nom(st.idx)} : valeurs du CSV rétablies",
+                         COLORS['edit'])
 
-    # ── modifications ────────────────────────────────────────────────
+    def _revert_all(self) -> None:
+        n = sum(1 for s in self.stations if s.modified())
+        if not n or not messagebox.askyesno(
+                "Tout réinitialiser", f"Revenir aux valeurs du CSV pour {n} station(s) ?"):
+            return
+        self.corrections.revert_all(self.stations)
+        self._after_edit(moved=True, turned=True)
+        self._set_status(f"{n} station(s) réinitialisée(s)", COLORS['edit'])
+
+    def _locked_axis(self) -> Optional[str]:
+        """Axe verrouillé pour Espace + glisser (X ou Y), sinon None : libre."""
+        return getattr(self, '_axis_lock', None)
+
+    def _lock_axis(self, axis: str) -> None:
+        """Touches X / Y : verrouille l'axe du déplacement en plan (2e appui : libre)."""
+        self._axis_lock = None if self._locked_axis() == axis else axis
+        self._set_status("Espace + glisser : " + (
+            f"axe {AXIS_NAMES[self._axis_lock]} verrouillé" if self._axis_lock
+            else "libre dans toutes les directions"))
+
     def _after_edit(self, moved: bool = False, turned: bool = False) -> None:
         """Suites d'une correction : rendu, réseau, panneau, sauvegarde."""
         if turned:
@@ -6220,456 +5822,11 @@ class BubbleNavApp(_TkBase):
         else:
             self._set_status("Enregistrement des corrections impossible : "
                              f"{self.corrections.path}", COLORS['error'])
-        self._refresh_edit_panel()
-
-    def _apply_position_fields(self) -> None:
-        st = self._edit_target()
-        if st is None:
-            return
-        vals = {}
-        for axis in ('x', 'y', 'dh', 'ddelta'):
-            v = parse_float(self.pos_vars[axis].get())
-            if v is None:
-                messagebox.showwarning("Position", f"Valeur « {axis} » illisible.")
-                self._refresh_edit_panel()
-                return
-            vals[axis] = v
-        self.corrections.apply(st, **vals)
-        self._after_edit(moved=True)
-
-    def _bump(self, axis: str, sign: int) -> None:
-        st = self._edit_target()
-        if st is None:
-            return
-        step = parse_float(self.step_var.get()) or 0.05
-        self.corrections.apply(st, **{axis: getattr(st, axis) + sign * step})
-        self._after_edit(moved=True)
-
-    def _nudge_yaw(self, delta: float) -> None:
-        st = self.station()
-        if st is None:
-            return
-        self.corrections.apply(st, yaw_fix=st.yaw_fix + delta)
-        self.yaw_var.set(round(st.yaw_fix, 2))
-        self._after_edit(turned=True)
-
-    def _on_yaw_slider(self, _val=None) -> None:
-        st = self.station()
-        if st is None or getattr(self, '_sync_ui', False):
-            return
-        value = round(float(self.yaw_var.get()), 2)
-        if abs(value - st.yaw_fix) < 5e-3:
-            return
-        self.corrections.apply(st, yaw_fix=value, record=False)
-        self.yaw_lbl.config(text=f"{value:+.2f}°".replace('.', ','))
-        self._request_render(interactive=True)
-        self._refresh_edit_panel()
-        if self._autosave_job:
-            self.after_cancel(self._autosave_job)
-        self._autosave_job = self.after(1200, self._autosave)
-
-    def _spread_yaw(self, scope: str) -> None:
-        st = self.station()
-        if st is None:
-            return
-        value = st.yaw_fix
-        targets = [s for s in self.stations
-                   if scope == 'tout' or s.floor == st.floor]
-        if not messagebox.askyesno(
-                "Appliquer la correction d'orientation",
-                f"Appliquer Δ nord = {value:+.2f}° à {len(targets)} bulle(s) "
-                f"({'tout le relevé' if scope == 'tout' else st.floor}) ?\n\n"
-                "Les corrections déjà saisies sur ces bulles seront remplacées."):
-            return
-        for s in targets:
-            self.corrections.apply(s, yaw_fix=value)
-        self._after_edit(turned=True)
-        self._set_status(f"Δ nord {value:+.2f}° appliqué à {len(targets)} bulle(s)",
-                         COLORS['edit'])
-
-    def _undo_edit(self) -> None:
-        self.undo()
-
-    def _revert_target(self) -> None:
-        st = self._edit_target()
-        if st is None or not st.modified():
-            return
-        self.corrections.revert(st)
-        self._after_edit(moved=True, turned=True)
-
-    def _revert_all(self) -> None:
-        moved, turned = Corrections.counts(self.stations)
-        if not (moved or turned):
-            return
-        if not messagebox.askyesno("Tout réinitialiser",
-                                   f"Annuler les {moved + turned} correction(s) ?"):
-            return
-        n = self.corrections.revert_all(self.stations)
-        self._after_edit(moved=True, turned=True)
-        self._set_status(f"{n} bulle(s) réinitialisée(s)", COLORS['edit'])
-
-    # ── deplacements a la souris : toujours le long d'un axe ─────────
-    def _locked_axis(self) -> Optional[str]:
-        """Axe imposé par l'utilisateur, ou None en mode automatique."""
-        v = self.drag_axis_var.get() if hasattr(self, 'drag_axis_var') else 'auto'
-        return v if v in AXES else None
-
-    def _lock_axis(self, axis: str) -> None:
-        """Touches X / Y / Z : verrouille l'axe (seconde pression : auto)."""
-        if not hasattr(self, 'drag_axis_var'):
-            return
-        self.drag_axis_var.set('auto' if self.drag_axis_var.get() == axis else axis)
-        self._on_axis_mode()
-
-    def _on_axis_mode(self) -> None:
-        self.cfg['drag_axis'] = self.drag_axis_var.get()
-        self.cfg['drag_z'] = self.drag_z_var.get()
-        save_config(self.cfg)
-        v = self.drag_axis_var.get()
-        self._set_status("Glisser : " + (f"axe {AXIS_NAMES[v]} verrouillé" if v in AXES
-                                         else "axe choisi par le geste (X ou Y)"))
-        self._draw_overlay()
-        self._draw_plan()
-
-    def _axis_frame(self, tgt: Station) -> Optional[Dict[str, object]]:
-        """Géométrie du repère de `tgt`, relative à la caméra courante (E, N, H).
-
-        origin : position d'origine du CSV (sol local) — centre du repère ;
-        point  : position actuelle (sol local, trait Δ de la mire) ;
-        eye    : caméra de la cible (hauteur station).
-        """
-        cam = self.station()
-        if cam is None:
-            return None
-        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        h0 = tgt.h0 if tgt.h0 is not None else eye
-        sol0 = tgt.oz - h0
-        origin = (tgt.ox - cam.x, tgt.oy - cam.y, sol0 - cam.z)
-        point = (tgt.x - cam.x, tgt.y - cam.y, tgt.ground(eye) - cam.z)
-        eye_pt = (tgt.x - cam.x, tgt.y - cam.y, tgt.z - cam.z)
-        return {'origin': origin, 'point': point, 'eye': eye_pt,
-                'active': tgt.idx == cam.idx, 'north': cam.north_pct}
-
-    def _axis_at(self, x: float, y: float) -> Optional[str]:
-        """Axe du repère sous le curseur (hors du voisinage de son centre)."""
-        o = self._axis_origin_px
-        best, best_d = None, float(AXIS_HIT_PX)
-        for axis, x1, y1, x2, y2 in self._axis_hits:
-            if o is not None and math.hypot(x - o[0], y - o[1]) < 12:
-                return None                     # le centre appartient à la pastille
-            dx, dy = x2 - x1, y2 - y1
-            l2 = dx * dx + dy * dy
-            if l2 < 1:
-                continue
-            u = clamp(((x - x1) * dx + (y - y1) * dy) / l2, 0.0, 1.0)
-            d = math.hypot(x - (x1 + u * dx), y - (y1 + u * dy))
-            if d < best_d:
-                best, best_d = axis, d
-        return best
-
-    def _start_axis_drag(self, tgt: Station, event, axis: Optional[str],
-                         on_origin: bool = False) -> bool:
-        """Début d'un déplacement contraint : l'état avant le geste est mémorisé."""
-        fr = self._axis_frame(tgt)
-        if fr is None:
-            return False
-        self.corrections.apply(tgt)                  # état avant le geste (annulable)
-        zkey = self.drag_z_var.get() if hasattr(self, 'drag_z_var') else 'ddelta'
-        self._hs_drag = ('axe', {
-            'idx': tgt.idx, 'active': fr['active'], 'axis': None, 'want': axis,
-            'line': (fr['origin'] if on_origin else
-                     fr['eye'] if self.anchor() == 'vue' and not fr['active']
-                     else fr['point']),
-            'press': (event.x, event.y), 't0': None, 'north': fr['north'],
-            'start': (tgt.x, tgt.y, tgt.dh, tgt.ddelta),
-            'zkey': zkey if zkey in ('dh', 'ddelta') else 'ddelta', 'd': 0.0})
-        if axis is not None:
-            self._fix_axis(self._hs_drag[1], axis)
-        self._draw_overlay()
-        return True
-
-    def _fix_axis(self, info: Dict[str, object], axis: str) -> None:
-        info['axis'] = axis
-        view = self._frame_view or self.view
-        ray = screen_ray(view, *info['press'], self.calib, info['north'])
-        info['t0'] = axis_param(ray, info['line'], AXES[axis])
-
-    def _auto_axis(self, info: Dict[str, object], x: float, y: float) -> Optional[str]:
-        """Mode auto : l'axe horizontal le plus aligné avec le début du geste."""
-        px, py = info['press']
-        mx, my = x - px, y - py
-        if math.hypot(mx, my) < AXIS_AUTO_PX:
-            return None
-        view = self._frame_view or self.view
-        p = info['line']
-        base = project_point(view, self.calib, info['north'], *p)
-        best, best_c = 'x', -1.0
-        for axis in ('x', 'y'):
-            a = AXES[axis]
-            tip = project_point(view, self.calib, info['north'],
-                                p[0] + 0.5 * a[0], p[1] + 0.5 * a[1], p[2] + 0.5 * a[2])
-            if base is None or tip is None:
-                continue
-            vx, vy = tip[0] - base[0], tip[1] - base[1]
-            n = math.hypot(vx, vy)
-            if n < 1e-6:
-                continue
-            c = abs(mx * vx + my * vy) / (n * math.hypot(mx, my))
-            if c > best_c:
-                best, best_c = axis, c
-        return best
-
-    def _drag_edit(self, event) -> None:
-        kind = self._hs_drag[0]
-        if kind == 'plan':
-            self._drag_plan(event)
-            return
-        if kind == 'yaw':
-            _, idx, start, x0 = self._hs_drag
-            st = self.stations[idx]
-            deg_per_px = self.view.fov / max(1, self.view.width)
-            self.corrections.apply(st, yaw_fix=start + (event.x - x0) * deg_per_px,
-                                   record=False)
-            self.yaw_var.set(round(st.yaw_fix, 2))
-            self.yaw_lbl.config(text=f"{st.yaw_fix:+.2f}°".replace('.', ','))
-            self._request_render(interactive=True)
-            return
-        if kind != 'axe':
-            return
-        info = self._hs_drag[1]
-        if info['axis'] is None:
-            axis = self._auto_axis(info, event.x, event.y)
-            if axis is None:
-                return
-            self._fix_axis(info, axis)
-        axis = info['axis']
-        st = self.stations[info['idx']]
-        if info['active'] and axis == 'z' and info['t0'] is None:
-            # verticale de la bulle active vue d'aplomb : glisser haut/bas
-            d = (info['press'][1] - event.y) * AXIS_Z_PX_M
-        else:
-            if info['t0'] is None:
-                self._set_status(f"Axe {AXIS_NAMES[axis]} vu dans l'axe du regard : "
-                                 "changer de point de vue ou d'axe", COLORS['error'])
-                return
-            view = self._frame_view or self.view
-            t = axis_param(screen_ray(view, event.x, event.y, self.calib, info['north']),
-                           info['line'], AXES[axis])
-            if t is None:
-                return
-            d = t - info['t0']
-        d = round(d, 3)                                 # pas du millimètre
-        info['d'] = d
-        # Bulle active : on tire le terrain, la station part en sens inverse.
-        s_ = -d if info['active'] else d
-        x0, y0, dh0, dd0 = info['start']
-        if axis == 'x':
-            self.corrections.apply(st, x=x0 + s_, y=y0, record=False)
-        elif axis == 'y':
-            self.corrections.apply(st, x=x0, y=y0 + s_, record=False)
-        elif info['zkey'] == 'dh':
-            self.corrections.apply(st, dh=dh0 + s_, record=False)
-        else:
-            self.corrections.apply(st, ddelta=dd0 + s_, record=False)
-        self._refresh_edit_panel()
-        self._draw_overlay()
-        self._draw_plan()
-        self._redraw_compare()
-
-    def _end_edit_drag(self) -> None:
-        kind = self._hs_drag[0] if self._hs_drag else None
-        if kind == 'plan':
-            self._end_plan_drag()
-            return
-        if kind == 'axe' and self._hs_drag[1].get('space') and not self.edit_mode:
-            self.after_idle(lambda: setattr(self, 'selected', None))
-        moved = kind == 'axe' and self._hs_drag[1]['axis'] is not None
-        probe = self._hs_drag[1].get('probe') if kind == 'axe' and not moved else None
-        idx = (self._hs_drag[1]['idx'] if kind == 'axe' else
-               self._hs_drag[1] if kind == 'yaw' else None)
-        self._hs_drag = None
-        if kind is None:
-            return
-        if idx is not None and 0 <= idx < len(self.stations) \
-                and self.corrections.drop_if_unchanged(self.stations[idx]):
-            if self.journal and self.journal[-1] == ('edit',):
-                self.journal.pop()          # clic sans effet : aucune étape à annuler
-            if probe is not None:
-                self.sonde(probe)
-                return
-            self._draw_overlay()
-            return
-        if kind == 'axe' and not moved:
-            self._draw_overlay()
-            return
-        self._after_edit(moved=moved, turned=kind == 'yaw')
-
-    # ── repère XYZ ───────────────────────────────────────────────────
-    def _draw_axes(self, view: View) -> None:
-        """Repère X (Est), Y (Nord), Z centré sur la position d'origine du CSV.
-
-        Les axes sont gradués (pas adapté à la distance) ; un trait relie
-        l'origine à la position actuelle et, pendant un geste, le rail de
-        l'axe suivi est prolongé.
-        """
-        self._axis_hits = []
-        self._axis_labels = []
-        self._axis_origin_px = None
-        tgt = self._edit_target()
-        if tgt is None:
-            return
-        fr = self._axis_frame(tgt)
-        if fr is None:
-            return
-        north = fr['north']
-        o = fr['origin']
-        dist = max(0.3, math.sqrt(sum(c * c for c in o)))
-        length = clamp(AXIS_PX * dist / max(1.0, view.focal()), *AXIS_LEN_LIMITS)
-        drag = self._hs_drag[1] if self._hs_drag and self._hs_drag[0] == 'axe' else None
-        hot = (drag['axis'] or drag['want']) if drag else self._locked_axis()
-        c = self.canvas
-
-        def seg(p, q):
-            return project_segment(view, self.calib, north, p, q)
-
-        def at(p, a, t):
-            return (p[0] + a[0] * t, p[1] + a[1] * t, p[2] + a[2] * t)
-
-        # graduation : le plus petit pas lisible (>= 7 px entre traits)
-        px_m = view.focal() / dist
-        grad = next((g for g in (0.05, 0.1, 0.25, 0.5, 1.0) if g * px_m >= 7), 1.0)
-        for axis in ('x', 'y', 'z'):
-            a = AXES[axis]
-            lo = -length
-            hi = length
-            if axis == 'z' and not fr['active']:
-                hi = max(length, fr['eye'][2] - o[2] + 0.15)   # jusqu'à la caméra
-            sg = seg(at(o, a, lo), at(o, a, hi))
-            if sg is None:
-                continue
-            col = AXIS_COLORS[axis]
-            width = 3 if axis == hot else 1.5
-            c.create_line(*sg, fill=col, width=width, tags='hs')
-            self._axis_hits.append((axis, *sg))
-            n = int(length / grad)
-            for k in range(-n, n + 1):
-                if k == 0:
-                    continue
-                pr = project_point(view, self.calib, north, *at(o, a, k * grad))
-                if pr is not None and pr[2] > 0.05:
-                    r = 2.2 if abs(k * grad - round(k * grad)) < 1e-9 else 1.3
-                    c.create_oval(pr[0] - r, pr[1] - r, pr[0] + r, pr[1] + r,
-                                  fill=col, outline='', tags='hs')
-            tip = project_point(view, self.calib, north, *at(o, a, hi))
-            if tip is not None and tip[2] > 0.05:
-                c.create_text(tip[0] + 1, tip[1] - 9, text=axis.upper(), fill='#000000',
-                              font=F_UI_B, tags='hs')
-                c.create_text(tip[0], tip[1] - 10, text=axis.upper(), fill=col,
-                              font=F_UI_B, tags='hs')
-        base = project_point(view, self.calib, north, *o)
-        if base is not None and base[2] > 0.05:
-            self._axis_origin_px = (base[0], base[1])
-            c.create_oval(base[0] - 5, base[1] - 5, base[0] + 5, base[1] + 5,
-                          outline='white', width=1.5, tags='hs')
-        # déplacement depuis l'origine CSV, décomposé : ΔX puis ΔY puis ΔZ
-        p = fr['point']
-        if any(abs(p[i] - o[i]) > 1e-4 for i in range(3)):
-            self._draw_ghost(view, tgt, fr, o)
-            sg = seg(o, p)
-            if sg is not None:                 # résultante, fine
-                c.create_line(*sg, fill=COLORS['edit'], width=1, dash=(4, 3), tags='hs')
-            d = (p[0] - o[0], p[1] - o[1], p[2] - o[2])
-            k1 = (o[0] + d[0], o[1], o[2])
-            k2 = (o[0] + d[0], o[1] + d[1], o[2])
-            for axis, q0, q1, val in (('x', o, k1, d[0]), ('y', k1, k2, d[1]),
-                                      ('z', k2, p, d[2])):
-                if abs(val) < 1e-4:
-                    continue
-                sg = seg(q0, q1)
-                if sg is None:
-                    continue
-                col = AXIS_COLORS[axis]
-                c.create_line(*sg, fill='#000000', width=5, tags='hs')
-                c.create_line(*sg, fill=col, width=3, tags='hs')
-                mx, my = (sg[0] + sg[2]) / 2.0, (sg[1] + sg[3]) / 2.0
-                # valeurs écrites après les pastilles, pour rester lisibles
-                self._axis_labels.append((mx, my - 10, f"Δ{axis.upper()} {val:+.3f}"
-                                          .replace('.', ','), col))
-        if not fr['active'] and tgt.raised():
-            e0 = (o[0], o[1], o[2] + (tgt.h0 if tgt.h0 is not None else
-                                      float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))))
-            for q, col in ((e0, 'white'), (fr['eye'], COLORS['edit'])):
-                pr = project_point(view, self.calib, north, *q)
-                if pr is not None and pr[2] > 0.05:
-                    c.create_line(pr[0] - 7, pr[1], pr[0] + 7, pr[1], fill=col,
-                                  width=2, tags='hs')
-        # rail de l'axe suivi pendant le geste
-        if drag and drag['axis'] and not (drag['active'] and drag['axis'] == 'z'):
-            a = AXES[drag['axis']]
-            rail = (fr['point'] if drag['axis'] != 'z' or drag['zkey'] == 'ddelta'
-                    else fr['eye'])
-            if drag['active']:
-                rail = o
-            sg = seg(at(rail, a, -3 * length), at(rail, a, 3 * length))
-            if sg is not None:
-                c.create_line(*sg, fill=AXIS_COLORS[drag['axis']], width=1,
-                              dash=(6, 4), tags='hs')
-
-    def _draw_ghost(self, view: View, tgt: Station, fr: Dict[str, object],
-                    o: Sequence[float]) -> None:
-        """Pastille fantôme, semi-transparente, à la position d'origine du CSV."""
-        if fr['active']:
-            return                  # la bulle active n'a pas de pastille dans sa vue
-        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        h0 = tgt.h0 if tgt.h0 is not None else eye
-        q = (o[0], o[1], o[2] + h0) if self.anchor() == 'vue' else tuple(o)
-        pr = project_point(view, self.calib, fr['north'], *q)
-        if pr is None or pr[2] < 0.05:
-            return
-        dist = max(0.35, math.sqrt(sum(v * v for v in q)))
-        r_min, r_max = self.disc_bounds()
-        r = clamp(view.focal() * float(self.cfg.get('disc_radius', DISC_RADIUS_M)) / dist,
-                  r_min, r_max)
-        if self.relief():
-            photo, ax, ay = self._sprite(COLORS['hot'], r, False, alpha=0.38,
-                                         floating=self.anchor() == 'vue')
-            self.canvas.create_image(pr[0] - ax, pr[1] - ay, anchor='nw', image=photo,
-                                     tags='hs')
-        else:
-            self.canvas.create_oval(pr[0] - r, pr[1] - r * 0.55, pr[0] + r, pr[1] + r * 0.55,
-                                    outline=COLORS['hot'], dash=(2, 2), tags='hs')
-        self.canvas.create_text(pr[0], pr[1] + r * 0.6 + 9, text="origine CSV",
-                                fill=MARK_TEXT, font=F_TINY, tags='hs')
-
-    def _axis_readout(self, view: View) -> None:
-        """Déplacement de la cible depuis le CSV, axe par axe."""
-        tgt = self._edit_target()
-        if tgt is None:
-            return
-        drag = self._hs_drag[1] if self._hs_drag and self._hs_drag[0] == 'axe' else None
-        hot = (drag['axis'] or drag['want']) if drag else self._locked_axis()
-        items = (('x', f"ΔX {tgt.x - tgt.ox:+.3f}"), ('y', f"ΔY {tgt.y - tgt.oy:+.3f}"),
-                 ('z', f"ΔH {tgt.dh:+.3f}  ΔΔ {tgt.ddelta:+.3f}"))
-        x = 14
-        y = view.height - 34
-        head = f"{tgt.locator} / CSV (m)"
-        t = self.canvas.create_text(x, y, text=head, anchor='sw', fill=COLORS['sel'],
-                                    font=F_UI_B, tags='hs')
-        x = self.canvas.bbox(t)[2] + 10
-        for axis, txt in items:
-            t = self.canvas.create_text(x, y, text=txt.replace('.', ','), anchor='sw',
-                                        fill=AXIS_COLORS[axis],
-                                        font=F_UI_B if axis == hot else F_UI, tags='hs')
-            x = self.canvas.bbox(t)[2] + 14
-        mode = f"axe {AXIS_NAMES[hot]}" if hot else "axe auto"
-        if drag and drag['axis']:
-            mode += f" {drag['d']:+.3f}".replace('.', ',')
-        self.canvas.create_text(x, y, text=f"[{mode}]", anchor='sw',
-                                fill=COLORS['text'], font=F_UI, tags='hs')
+        self._refresh_counts()
 
     # ── application par lot ──────────────────────────────────────────
     def _dlg_apply(self) -> None:
-        """Bilan des corrections, puis traitements par lot en une passe."""
+        """Bilan des corrections, CSV de sortie, orientation des images."""
         if not self.stations:
             return
         self._autosave()
@@ -6687,26 +5844,21 @@ class BubbleNavApp(_TkBase):
         tk.Label(win, justify='left', anchor='w', font=F_MONO, bg=COLORS['card'],
                  fg=COLORS['text'], padx=10, pady=8, text=(
                      f"positions XY corrigées   {bilan.xy:4d}\n"
-                     f"hauteurs de station      {bilan.h:4d}\n"
-                     f"deltas plancher          {bilan.delta:4d}\n"
-                     f"orientations corrigées   {bilan.nord:4d}\n"
-                     f"images à tourner         {len(pending):4d}\n\n"
-                     f"relevé chargé (intact)   {os.path.basename(self.csv_path)}\n"
+                     f"hauteurs instrument      {bilan.h:4d}\n"
+                     f"deltas                   {bilan.delta:4d}\n"
+                     f"orientations (images)    {bilan.nord:4d}\n\n"
+                     f"CSV d'entrée (intact)    {os.path.basename(self.csv_path)}\n"
                      f"fichier de corrections   {os.path.basename(self.corrections.path)}")
                  ).pack(fill='x', padx=14)
 
-        img_var = tk.StringVar(value=os.path.join(self.images_dir, '_oriente')
-                               if self.images_dir else '')
         base, ext = os.path.splitext(os.path.basename(self.csv_path))
-        merged_var = tk.StringVar(value=os.path.join(
+        csv_var = tk.StringVar(value=os.path.join(
             os.path.dirname(self.csv_path),
             f"{base}_corrige_{datetime.now():%Y%m%d_%Hh%M}{ext or '.csv'}"))
-        do_img = tk.BooleanVar(value=bool(pending))
-        do_merged = tk.BooleanVar(value=True)
-        recalc_var = tk.StringVar(value=os.path.join(
-            os.path.dirname(self.csv_path),
-            f"{base}_recalcule_{datetime.now():%Y%m%d_%Hh%M}{ext or '.csv'}"))
-        do_recalc = tk.BooleanVar(value=True)
+        img_var = tk.StringVar(value=os.path.join(self.images_dir, '_oriente')
+                               if self.images_dir else '')
+        do_csv = tk.BooleanVar(value=True)
+        do_img = tk.BooleanVar(value=False)
 
         def path_row(var, browse):
             row = tk.Frame(win, bg=COLORS['bg_dark'])
@@ -6716,20 +5868,20 @@ class BubbleNavApp(_TkBase):
                      insertbackground=COLORS['text']).pack(side='left', fill='x', expand=True)
             self._mk_button(row, "Parcourir…", browse).pack(side='left', padx=4)
 
+        def pick_csv():
+            path = filedialog.asksaveasfilename(
+                title="CSV de sortie", defaultextension=ext or '.csv',
+                initialdir=os.path.dirname(csv_var.get()),
+                initialfile=os.path.basename(csv_var.get()),
+                filetypes=[("Fichiers CSV", "*.csv *.txt"), ("Tous les fichiers", "*.*")])
+            if path:
+                csv_var.set(path)
+
         def pick_dir():
             path = filedialog.askdirectory(title="Dossier des images orientées",
                                            initialdir=self.images_dir or None)
             if path:
                 img_var.set(path)
-
-        def pick_merged():
-            path = filedialog.asksaveasfilename(
-                title="Relevé complet corrigé", defaultextension=ext or '.csv',
-                initialdir=os.path.dirname(merged_var.get()),
-                initialfile=os.path.basename(merged_var.get()),
-                filetypes=[("Fichiers CSV", "*.csv *.txt"), ("Tous les fichiers", "*.*")])
-            if path:
-                merged_var.set(path)
 
         def check(text, var):
             return tk.Checkbutton(win, text=text, variable=var, font=F_UI_B, anchor='w',
@@ -6738,96 +5890,60 @@ class BubbleNavApp(_TkBase):
                                   activebackground=COLORS['bg_dark'],
                                   activeforeground=COLORS['text'])
 
+        check("Écrire le CSV de sortie", do_csv).pack(fill='x', padx=14, pady=(12, 2))
+        tk.Label(win, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
+                 anchor='w', justify='left', text=(
+                     "Le même CSV qu'à l'entrée (mêmes colonnes, même format). Seules "
+                     "les lignes corrigées changent :\nX, Y, Delta, Hauteur et Z final "
+                     "= plancher + Δ + H. L'orientation n'y figure pas.")
+                 ).pack(fill='x', padx=30, pady=(0, 4))
+        path_row(csv_var, pick_csv)
+
         workers = max(1, int(self.cfg.get('export_workers', 2)))
         check("Appliquer l'orientation aux images  (copie dans un autre dossier)",
-              do_img).pack(fill='x', padx=14, pady=(12, 2))
+              do_img).pack(fill='x', padx=14, pady=(10, 2))
         tk.Label(win, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
                  anchor='w', justify='left', text=(
-                     f"{len(pending)} image(s) à écrire, originaux intacts. Panoramas "
-                     f"16000×8000 : ~{len(pending) * 7 / workers / 60:.0f} min, "
-                     f"~{workers * 0.8:.1f} Go.\n"
-                     "Rotation au pixel entier, tables JPEG de la source réutilisées.\n"
-                     "Une fois appliqué, le Δ nord repasse à 0 dans le fichier de "
-                     "corrections (date d'application conservée).")
+                     f"{len(pending)} image(s) à tourner, originaux intacts. Panoramas "
+                     f"16000×8000 : ~{len(pending) * 7 / workers / 60:.0f} min.\n"
+                     "Rotation au pixel entier, tables JPEG de la source réutilisées.")
                  ).pack(fill='x', padx=30, pady=(0, 4))
         path_row(img_var, pick_dir)
-
-        check("Écrire le CSV corrigé",
-              do_merged).pack(fill='x', padx=14, pady=(8, 2))
-        tk.Label(win, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
-                 anchor='w', justify='left', text=(
-                     "Même format que le CSV chargé, avec les bonnes valeurs : X, Y, "
-                     "Z = plancher + Δ + H,\n"
-                     "delta, hauteur instrument et Δ nord. Le CSV chargé n'est pas "
-                     "modifié.")
-                 ).pack(fill='x', padx=30, pady=(0, 4))
-        path_row(merged_var, pick_merged)
-
-        def pick_recalc():
-            path = filedialog.asksaveasfilename(
-                title="CSV recalculé (format d'import)", defaultextension=ext or '.csv',
-                initialdir=os.path.dirname(recalc_var.get()),
-                initialfile=os.path.basename(recalc_var.get()),
-                filetypes=[("Fichiers CSV", "*.csv *.txt"), ("Tous les fichiers", "*.*")])
-            if path:
-                recalc_var.set(path)
-
-        check("Écrire aussi le CSV recalculé, au format d'import",
-              do_recalc).pack(fill='x', padx=14, pady=(8, 2))
-        tk.Label(win, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
-                 anchor='w', justify='left', text=(
-                     "Identique au CSV chargé (mêmes colonnes, même ordre, même format), "
-                     "valeurs recalculées :\nX, Y, Z = plancher + Δ + H, delta et "
-                     "hauteur. Aucun élément d'orientation (% NORD d'origine, pas de "
-                     "Δ nord).")
-                 ).pack(fill='x', padx=30, pady=(0, 4))
-        path_row(recalc_var, pick_recalc)
 
         foot = tk.Frame(win, bg=COLORS['bg_dark'])
         foot.pack(fill='x', padx=14, pady=12)
 
         def run():
-            out_dir = img_var.get().strip()
-            merged = merged_var.get().strip()
+            out_csv = csv_var.get().strip() if do_csv.get() else ''
+            out_dir = img_var.get().strip() if do_img.get() else ''
+            if do_csv.get():
+                if not out_csv:
+                    messagebox.showwarning("Appliquer", "Indiquez le CSV à écrire.")
+                    return
+                for reserved in (self.csv_path, self.corrections.path):
+                    if reserved and os.path.abspath(out_csv) == os.path.abspath(reserved):
+                        messagebox.showerror("Appliquer", "Choisissez un autre nom : ce "
+                                                          "fichier ne doit pas être écrasé.")
+                        return
             if do_img.get():
                 if not out_dir:
                     messagebox.showwarning("Appliquer", "Indiquez le dossier de destination.")
                     return
-                if self.images_dir and os.path.abspath(out_dir) == os.path.abspath(self.images_dir):
-                    messagebox.showerror("Appliquer",
-                                         "Ce dossier contient les images source : "
-                                         "elles seraient écrasées.")
+                if self.images_dir and os.path.abspath(out_dir) == os.path.abspath(
+                        self.images_dir):
+                    messagebox.showerror("Appliquer", "Ce dossier contient les images "
+                                                      "source : elles seraient écrasées.")
                     return
-            recalc = recalc_var.get().strip()
-            outs = ([merged] if do_merged.get() else []) + ([recalc] if do_recalc.get()
-                                                           else [])
-            for path in outs:
-                if not path:
-                    messagebox.showwarning("Appliquer", "Indiquez le CSV à écrire.")
-                    return
-                for reserved in (self.csv_path, self.corrections.path):
-                    if reserved and os.path.abspath(path) == os.path.abspath(reserved):
-                        messagebox.showerror("Appliquer",
-                                             "Choisissez un autre nom : ce fichier ne "
-                                             "doit pas être écrasé.")
-                        return
-            if len(outs) == 2 and os.path.abspath(merged) == os.path.abspath(recalc):
-                messagebox.showerror("Appliquer", "Les deux CSV doivent avoir des noms "
-                                                  "différents.")
-                return
             win.destroy()
-            merged = merged if do_merged.get() else ''
-            recalc = recalc if do_recalc.get() else ''
-            if do_img.get():
-                self._run_export(out_dir, merged, recalc)
-            elif merged or recalc:
-                self._export_merged(merged, recalc)
+            if out_dir:
+                self._run_export(out_dir, out_csv)
+            elif out_csv:
+                self._export_csv(out_csv)
 
         self._mk_button(foot, "Appliquer", run, bg=COLORS['accent']).pack(side='right')
         self._mk_button(foot, "Fermer", win.destroy).pack(side='right', padx=6)
-        self._mk_button(foot, "Enregistrer les corrections maintenant",
-                        lambda: (self.corrections.__setattr__('dirty', True),
-                                 self._autosave())).pack(side='left')
+        self._mk_button(foot, "Tout réinitialiser", lambda: (win.destroy(), self._revert_all())
+                        ).pack(side='left')
         win.bind('<Escape>', lambda e: win.destroy())
 
     def _choose_corrections_file(self) -> None:
@@ -6868,40 +5984,28 @@ class BubbleNavApp(_TkBase):
         else:
             self.corrections.dirty = True
             self._autosave()
-        self._refresh_edit_panel()
+        self._refresh_counts()
         self._refresh_module()
 
-    def _export_merged(self, path: str, recalc: str = '') -> bool:
-        """Écrit le relevé complet corrigé (`path`) et / ou le CSV recalculé au
-        format d'import (`recalc`), sans rien changer aux fichiers de travail."""
-        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        lignes = []
+    def _export_csv(self, path: str) -> bool:
+        """Écrit le CSV de sortie (même format que l'entrée, corrections comprises)."""
         try:
-            if path:
-                n_mod, n_keep, added = write_corrected_csv(
-                    self.csv_path, path, self.stations, eye=eye, mapping=self.csv_mapping)
-                lignes.append(
-                    f"CSV corrigé : {n_mod} ligne(s) corrigée(s), {n_keep} inchangée(s).\n"
-                    f"{path}"
-                    + ("\nColonne(s) ajoutée(s) en fin de ligne (Δ nord, delta, hauteur "
-                       "instrument)." if added else ""))
-            if recalc:
-                n_mod, n_keep, _ = write_corrected_csv(
-                    self.csv_path, recalc, self.stations, eye=eye, mapping=self.csv_mapping,
-                    import_format=True)
-                lignes.append(
-                    f"CSV recalculé (format d'import, sans orientation) : {n_mod} ligne(s) "
-                    f"recalculée(s), {n_keep} inchangée(s).\n{recalc}")
+            n_mod, n_keep = write_survey_csv(
+                self.csv_path, path, self.stations,
+                eye=float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
+                mapping=self.csv_mapping)
         except Exception as exc:
-            messagebox.showerror("Relevé corrigé", f"Écriture impossible :\n{exc}")
+            messagebox.showerror("CSV de sortie", f"Écriture impossible :\n{exc}")
             return False
-        self._set_status("CSV écrit : " + " · ".join(os.path.basename(p) for p in (path, recalc)
-                                                      if p), COLORS['ok'])
-        messagebox.showinfo("CSV écrits", "\n\n".join(lignes)
-                            + "\n\nLe CSV chargé n'est pas modifié.")
+        self._set_status(f"CSV écrit : {n_mod} ligne(s) corrigée(s), {n_keep} identique(s) "
+                         f"→ {os.path.basename(path)}", COLORS['ok'])
+        messagebox.showinfo("CSV de sortie", (
+            f"{n_mod} ligne(s) corrigée(s), {n_keep} recopiée(s) à l'identique.\n\n{path}\n\n"
+            "Même format que le CSV d'entrée ; l'orientation n'y figure pas.\n"
+            "Le CSV d'entrée n'est pas modifié."))
         return True
 
-    def _run_export(self, out_dir: str, merged_after: str = '', recalc_after: str = '') -> None:
+    def _run_export(self, out_dir: str, csv_after: str = '') -> None:
         """Applique les Δ nord aux images (copies), puis met à jour les fichiers."""
         todo = [s for s in self.stations if s.has_yaw() and self.store.has(s.photo)]
         absent = len(Corrections.pending_images(self.stations)) - len(todo)
@@ -6937,12 +6041,12 @@ class BubbleNavApp(_TkBase):
             applied = ({s.key for s in todo if s.photo not in failed}
                        if not cancel.is_set() else set())
             self._post(self._export_done, win, out_dir, ok, skipped + absent,
-                       errors, applied, merged_after, recalc_after)
+                       errors, applied, csv_after)
 
         threading.Thread(target=work, name='bubblenav-export', daemon=True).start()
 
     def _export_done(self, win, out_dir: str, ok: int, skipped: int, errors: List[str],
-                     applied: set, merged_after: str, recalc_after: str = '') -> None:
+                     applied: set, csv_after: str = '') -> None:
         try:
             win.destroy()
         except Exception:
@@ -6963,11 +6067,9 @@ class BubbleNavApp(_TkBase):
             self._autosave()
             msg += ("\n\nΔ nord remis à 0 et date d'application inscrite dans "
                     f"{os.path.basename(self.corrections.path)}.")
-        if merged_after or recalc_after:
-            if self._export_merged(merged_after, recalc_after):
-                msg += "\nCSV écrit(s)."
-        else:
-            messagebox.showinfo("Orientation appliquée", msg)
+        if csv_after:
+            self._export_csv(csv_after)
+        messagebox.showinfo("Orientation appliquée", msg)
         self._refresh_side()
         self._draw_overlay()
         if applied and messagebox.askyesno(
@@ -7089,39 +6191,6 @@ class BubbleNavApp(_TkBase):
                 if st.modified() and st.moved():
                     ox, oy = to_screen(st.ox, st.oy)
                     self.plan.create_line(ox, oy, x, y, fill=COLORS['edit'], width=1)
-                if self.edit_mode and self.selected == st.idx:
-                    self.plan.create_oval(x - 7, y - 7, x + 7, y + 7,
-                                          outline=COLORS['sel'], width=2)
-        if self.edit_mode:
-            tgt = self._edit_target()
-            if tgt is not None and tgt.floor == floor:
-                ox, oy = to_screen(tgt.ox, tgt.oy)
-                if tgt.moved():                  # fantôme + composantes ΔX / ΔY
-                    tx, ty = to_screen(tgt.x, tgt.y)
-                    self.plan.create_oval(ox - 5, oy - 5, ox + 5, oy + 5,
-                                          outline=COLORS['hot'], dash=(2, 2))
-                    for axis, (x1, y1, x2, y2), val in (
-                            ('x', (ox, oy, tx, oy), tgt.x - tgt.ox),
-                            ('y', (tx, oy, tx, ty), tgt.y - tgt.oy)):
-                        if abs(val) < 1e-4:
-                            continue
-                        self.plan.create_line(x1, y1, x2, y2, fill=AXIS_COLORS[axis],
-                                              width=2)
-                        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                        dx_, dy_ = (0, -9) if axis == 'x' else (6, 0)
-                        self.plan.create_text(mx + dx_, my + dy_, font=F_TINY_B,
-                                              anchor='s' if axis == 'x' else 'w',
-                                              fill=AXIS_COLORS[axis],
-                                              text=f"Δ{axis.upper()} {val:+.3f}"
-                                              .replace('.', ','))
-                hot = self._locked_axis() or getattr(self, '_plan_axis', None)
-                for axis, (dx, dy) in (('x', (1, 0)), ('y', (0, -1))):
-                    self.plan.create_line(ox - 18 * dx, oy - 18 * dy, ox + 18 * dx,
-                                          oy + 18 * dy, fill=AXIS_COLORS[axis],
-                                          width=2.5 if axis == hot else 1)
-                    self.plan.create_text(ox + 25 * dx, oy + 25 * dy, text=axis.upper(),
-                                          fill=AXIS_COLORS[axis], font=F_UI_B)
-
         cur = self.station()
         if cur is not None:
             # voisins mis en evidence (filtres compris)
@@ -7302,55 +6371,13 @@ class BubbleNavApp(_TkBase):
 
     def _on_plan_press_left(self, event) -> None:
         self._plan_press = (event.x, event.y)
-        self._plan_hit = None
-        if not self.edit_mode:
-            return
-        idx = self._plan_nearest(event, 12.0)
-        if idx is not None:
-            self._set_target(idx)
-            st = self.stations[idx]
-            self.corrections.apply(st)                   # état avant le geste
-            self._plan_hit = idx
-            self._plan_start = (st.x, st.y)
-            self._plan_axis = self._locked_axis()
-            if self._plan_axis == 'z':
-                self._set_status("Axe Z verrouillé : le plan ne règle que X et Y — "
-                                 "glisser dans la vue", COLORS['edit'])
 
     def _on_plan_drag_left(self, event) -> None:
-        """Vue de dessus : déplacement de la cible le long de X ou de Y."""
-        if self._plan_hit is None or self._plan_axis == 'z':
-            return
-        mx, my = event.x - self._plan_press[0], event.y - self._plan_press[1]
-        if self._plan_axis is None:
-            if math.hypot(mx, my) < AXIS_AUTO_PX:
-                return
-            self._plan_axis = 'x' if abs(mx) >= abs(my) else 'y'
-        scale = max(1e-9, float(self._plan_view.get('scale', 1.0)))
-        x0, y0 = self._plan_start
-        if self._plan_axis == 'x':
-            x, y = x0 + round(mx / scale, 3), y0
-        else:
-            x, y = x0, y0 - round(my / scale, 3)
-        self.corrections.apply(self.stations[self._plan_hit], x=x, y=y, record=False)
-        self._refresh_edit_panel()
-        self._draw_plan()
-        self._draw_overlay()
+        """Le plan ne modifie rien : il sert à naviguer."""
 
     def _on_plan_release_left(self, event) -> None:
-        if self._plan_hit is not None:
-            st = self.stations[self._plan_hit]
-            self._plan_hit = None
-            self._plan_axis = None
-            if self.corrections.drop_if_unchanged(st):      # simple clic : pas d'étape
-                if self.journal and self.journal[-1] == ('edit',):
-                    self.journal.pop()
-                return
-            self._after_edit(moved=True)
-            return
         press = getattr(self, '_plan_press', None)
-        if press and abs(event.x - press[0]) + abs(event.y - press[1]) <= 3 \
-                and not self.edit_mode:
+        if press and abs(event.x - press[0]) + abs(event.y - press[1]) <= 3:
             idx = self._plan_nearest(event, 22.0)
             if idx is not None:
                 self.goto(idx)
@@ -7669,6 +6696,19 @@ class BubbleNavApp(_TkBase):
             tk.Radiobutton(row, text=txt, variable=step_v, value=val, font=F_UI,
                            command=lambda: self.cfg.__setitem__('wheel_step',
                                                                 float(step_v.get())),
+                           bg=COLORS['bg_dark'], fg=COLORS['text'],
+                           selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_dark'],
+                           activeforeground=COLORS['text'], bd=0, highlightthickness=0
+                           ).pack(side='left', padx=4)
+        row = tk.Frame(vue, bg=COLORS['bg_dark'])
+        row.pack(fill='x', pady=(4, 0))
+        tk.Label(row, text="Pas de Ctrl + molette (orient.)", width=22, anchor='w',
+                 font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text']).pack(side='left')
+        yaw_v = tk.DoubleVar(value=self.yaw_step())
+        for txt, val in (("1°", 1.0), ("0,1°", 0.1)):
+            tk.Radiobutton(row, text=txt, variable=yaw_v, value=val, font=F_UI,
+                           command=lambda: self.cfg.__setitem__('yaw_step',
+                                                                float(yaw_v.get())),
                            bg=COLORS['bg_dark'], fg=COLORS['text'],
                            selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_dark'],
                            activeforeground=COLORS['text'], bd=0, highlightthickness=0
@@ -8108,6 +7148,7 @@ class CompareView(tk.Frame if _TK_OK else object):
             anchor=app.anchor())
         if self.station() is not None:
             app.draw_image_center(self.canvas, view, self.station())
+            app.draw_floor_network(self.canvas, view, self.station(), self.hotspots)
         libres = app.declutter(self.hotspots)
         mires = set(app.mire_targets(self.idx, app.current, self.hotspots, self._hover))
         for i, hs in enumerate(self.hotspots):
@@ -8520,163 +7561,104 @@ def selftest(csv_path: str = '') -> int:
     flat = ground_from_screen(View(0, 0, 90, 640, 400), 320, 200, cal, 50.0, -1.65)
     check("regard horizontal : pas de point au sol", flat is None)
 
-    # 7. Corrections : application, annulation, CSV corrige
-    print("\n7) Fichier de corrections et relevé complet")
+    # 7. Modèle Z = plancher + Δ + H, corrections bornées, CSV de sortie
+    print("\n7) Modèle altimétrique, corrections bornées, CSV de sortie")
     import shutil
     import tempfile
     tmp = tempfile.mkdtemp(prefix='bubblenav_')
     try:
-        if csv_path and os.path.isfile(csv_path):
-            work_csv = os.path.join(tmp, os.path.basename(csv_path))
-            shutil.copy2(csv_path, work_csv)
-            sts, _ = read_survey_csv(work_csv)
-            by_photo = {s.photo: s for s in sts}
-            corr = Corrections(work_csv)
+        def mk(i: int, **kw) -> Station:
+            st = Station(idx=i, photo=f"p{i}", locator=f"L{i}", x=10.0 * i, y=0.0, z=0.0,
+                         north_pct=50.0, floor='P', h0=1.65, plancher_z=-3.5,
+                         plancher_src='colonne', **kw)
+            st.ox, st.oy = st.x, st.y
+            return st
+        sts = [mk(0), mk(1, delta0=0.25), mk(2)]
+        notes = apply_altimetry(sts, 1.65)
+        check("Z = plancher + Δ + H", not notes and abs(sts[1].z - (-3.5 + 0.25 + 1.65)) < 1e-12
+              and sts[1].oz == sts[1].z, f"{sts[1].z:.3f}")
+        corr = Corrections('', eye=1.65)
+        s0 = sts[0]
+        corr.apply(s0, dh=0.05)
+        check("H : la caméra monte, plancher et sol local restent",
+              abs(s0.z + 1.80) < 1e-9 and s0.plancher() == -3.5 and s0.ground() == -3.5)
+        corr.apply(s0, ddelta=-0.2)
+        check("Δ : sol local et caméra bougent, le plancher reste",
+              abs(s0.ground() + 3.7) < 1e-9 and abs(s0.z + 2.0) < 1e-9 and s0.plancher() == -3.5,
+              f"sol {s0.ground():.3f} Z {s0.z:.3f}")
+        b1 = corr.apply(s0, dh=10.0)
+        b2 = corr.apply(s0, dh=-10.0)
+        check("H bornée", abs(s0.height() - H_MIN_M) < 1e-9 and 'hauteur' in b1 and 'hauteur' in b2,
+              b1)
+        b3 = corr.apply(s0, ddelta=-9.0)
+        check("Δ borné", abs(s0.delta() + DELTA_MAX_M) < 1e-9 and 'Δ' in b3, b3)
+        b4 = corr.apply(s0, x=s0.ox + 30.0, y=s0.oy + 40.0)
+        check("déplacement XY borné autour de la position du CSV",
+              abs(math.hypot(s0.x - s0.ox, s0.y - s0.oy) - BOUND_XY_M) < 1e-3 and b4, b4)
+        corr.apply(s0, x=s0.ox + 0.12345678, y=s0.oy)
+        check("déplacement arrondi au micromètre, origine exacte",
+              s0.x == 0.123457 and s0.y == s0.oy, f"{s0.x!r}")
+        corr.apply(s0, yaw_fix=190.0)
+        check("orientation ramenée dans ]-180°, 180°]", abs(s0.yaw_fix + 170.0) < 1e-9)
+        while corr.can_undo():
+            corr.undo({x.photo: x for x in sts})
+        check("annulation complète : retour exact au CSV",
+              not s0.modified() and s0.z == s0.oz and s0.x == s0.ox, f"Z {s0.z!r}")
+        for _ in range(25):
+            corr.apply(sts[2], dh=sts[2].dh + 0.05, record=False)
+        for _ in range(25):
+            corr.apply(sts[2], dh=sts[2].dh - 0.05, record=False)
+        check("25 crans de 5 cm aller-retour : aucun bruit numérique",
+              sts[2].dh == 0.0 and sts[2].z == sts[2].oz, f"dh {sts[2].dh!r}")
 
-            corr.apply(sts[0], x=sts[0].x + 0.123, dh=-0.05)
-            corr.apply(sts[5], y=sts[5].y - 1.5)
-            corr.apply(sts[9], yaw_fix=1.25)
-            check("état modifié détecté", sts[0].moved() and sts[0].raised()
-                  and sts[9].turned() and not sts[9].moved())
-            check("comptage des corrections",
-                  Corrections.counts(sts) == Bilan(xy=2, h=1, delta=0, nord=1),
-                  Corrections.counts(sts).texte())
-
-            # Les deux composantes en Z : hauteur station vs delta plancher
-            s0 = sts[0]
-            sol_avant = s0.ground(1.65)
-            corr.apply(s0, dh=-0.05, record=False)
-            check("hauteur station : la caméra bouge, le sol reste",
-                  abs(s0.z - (s0.oz - 0.05)) < 1e-9 and abs(s0.ground(1.65) - sol_avant) < 1e-9,
-                  f"z {s0.oz:.3f} -> {s0.z:.3f}, sol {s0.ground(1.65):.3f}")
-            corr.apply(s0, dh=0.0, ddelta=0.12, record=False)
-            check("delta plancher : caméra ET sol bougent",
-                  abs(s0.z - (s0.oz + 0.12)) < 1e-9
-                  and abs(s0.ground(1.65) - (sol_avant + 0.12)) < 1e-9,
-                  f"z {s0.z:.3f}, sol {s0.ground(1.65):.3f}")
-            check("Z = altitude d'origine + dH + dDelta", abs(s0.z - (s0.oz + s0.dh + s0.ddelta)) < 1e-12)
-            corr.apply(s0, dh=-0.05, ddelta=0.0, record=False)
-            check("images en attente de rotation",
-                  [s.idx for s in Corrections.pending_images(sts)] == [9])
-
-            corr.undo(by_photo)
-            check("annulation (Ctrl+Z)", not sts[9].turned())
-            corr.apply(sts[9], yaw_fix=1.25)
-
-            before = open(work_csv, 'rb').read()
-            side = corr.save(sts)
-            check("fichier de corrections écrit",
-                  bool(side) and side.endswith(Corrections.SUFFIX)
-                  and os.path.isfile(side), os.path.basename(side or ''))
-            corr_lines = _read_text(side).splitlines()
-            check("une ligne par bulle corrigée seulement", len(corr_lines) == 4,
-                  f"{len(corr_lines) - 1} ligne(s)")
-            check("en-tête du fichier de corrections (patch QGIS)",
-                  corr_lines[0].split(';') == list(Corrections.HEADER),
-                  corr_lines[0][:80])
-            champs = dict(zip(corr_lines[0].split(';'), corr_lines[1].split(';')))
-            check("deltas séparés par nature dans le fichier",
-                  abs(float(champs['dH station']) + 0.05) < 1e-6
-                  and abs(float(champs['dDelta plancher'])) < 1e-6
-                  and abs(float(champs['dZ']) + 0.05) < 1e-6
-                  and abs(float(champs['dX']) - 0.123) < 1e-6,
-                  f"dH {champs['dH station']} dDelta {champs['dDelta plancher']} dZ {champs['dZ']}")
-            check("le relevé chargé n'est pas touché",
-                  open(work_csv, 'rb').read() == before)
-
-            sts2, _ = read_survey_csv(work_csv)
-            by2 = {s.photo: s for s in sts2}
-            n_ok, n_miss = Corrections(work_csv).load(by2)
-            check("corrections relues et appliquées",
-                  n_ok == 3 and n_miss == 0
-                  and abs(by2[sts[0].photo].x - sts[0].x) < 5e-4
-                  and abs(by2[sts[0].photo].dh + 0.05) < 5e-4
-                  and abs(by2[sts[9].photo].yaw_fix - 1.25) < 5e-5,
-                  f"{n_ok} appliquées, {n_miss} sans correspondance")
-            check("corrections relues = état modifié",
-                  by2[sts[0].photo].moved() and by2[sts[9].photo].turned()
-                  and Corrections.counts(sts2) == Bilan(xy=2, h=1, delta=0, nord=1))
-
-            # ancien format (Z absolu seul) : range en hauteur de station
-            legacy = os.path.join(tmp, 'ancien_corrections.csv')
-            with open(legacy, 'w', encoding='utf-8-sig', newline='') as fh:
-                fh.write("Fichier photo;X;Y;Z;Delta Nord (deg)\r\n"
-                         f"{sts[3].photo};{sts[3].ox:.3f};{sts[3].oy:.3f};{sts[3].oz + 0.2:.3f};0\r\n")
-            sts_l, _ = read_survey_csv(work_csv)
-            Corrections(work_csv, path=legacy).load({s.photo: s for s in sts_l})
-            check("ancien fichier (Z seul) relu comme hauteur de station",
-                  abs(sts_l[3].dh - 0.2) < 1e-6 and sts_l[3].raised() and not sts_l[3].shifted())
-
-            with open(side, 'a', encoding='utf-8') as fh:
-                fh.write("PHOTO_INCONNUE;X;1.0;2.0;3.0;0.0;;;;;\r\n")
-            n_ok2, n_miss2 = Corrections(work_csv).load({s.photo: s for s in
-                                                         read_survey_csv(work_csv)[0]})
-            check("ligne sans correspondance signalée, pas fatale",
-                  n_ok2 == 3 and n_miss2 == 1, f"{n_ok2}/{n_miss2}")
-
-            corr.mark_applied([sts[9].photo])
-            corr.apply(sts[9], yaw_fix=0.0, record=False)
-            corr.save(sts)
-            reread = Corrections(work_csv)
-            reread.load({s.photo: s for s in read_survey_csv(work_csv)[0]})
-            check("date d'application conservée",
-                  sts[9].photo in reread.applied, str(reread.applied)[:60])
-            corr.apply(sts[9], yaw_fix=1.25, record=False)
-
-            out_csv = os.path.join(tmp, 'corrige.csv')
-            n_mod, n_keep, added = write_corrected_csv(work_csv, out_csv, sts)
-            check("lignes réécrites", n_mod == 3 and n_keep == len(sts) - 3,
-                  f"{n_mod} modifiées, {n_keep} recopiées")
-            check("colonne Δ nord ajoutée", added)
-
-            src_lines = _read_text(work_csv).splitlines()
-            dst_lines = _read_text(out_csv).splitlines()
-            a_h = 'hcam' in auto_columns([norm_key(c) for c in src_lines[0].split(';')])
-            check("colonnes ajoutées en fin d'en-tête (Δ nord, hauteur corrigée)",
-                  dst_lines[0] == src_lines[0] + ';' + YAW_COLUMN
-                  + ('' if a_h else ';Hauteur instrument'), dst_lines[0][-50:])
-            n_src = len(src_lines[0].split(';'))
-            check("les autres colonnes ne bougent pas",
-                  all(';'.join(b.split(';')[:n_src]) == a for a, b in
-                      zip(src_lines[1:], dst_lines[1:])
-                      if not b.startswith(tuple(x.photo for x in sts if x.modified()))))
-            if not a_h:
-                h_col = [ln.split(';')[-1] for ln in dst_lines[1:4]]
-                check("hauteur instrument écrite pour chaque bulle",
-                      all(parse_float(v) is not None for v in h_col), str(h_col))
-
-            sts3, _ = read_survey_csv(out_csv)
-            check("valeurs X/Y/Z relues",
-                  abs(sts3[0].x - sts[0].x) < 5e-4 and abs(sts3[0].z - sts[0].z) < 5e-4
-                  and abs(sts3[5].y - sts[5].y) < 5e-4)
-            check("orientation relue depuis le CSV",
-                  abs(sts3[9].yaw_fix - 1.25) < 1e-6 and not sts3[9].turned()
-                  and sts3[9].has_yaw(), f"{sts3[9].yaw_fix:+.4f}°")
-            check("colonne % NORD intacte",
-                  all(abs(a.north_pct - b.north_pct) < 1e-9 for a, b in zip(sts, sts3)))
-            check("décimales d'origine conservées",
-                  dst_lines[1].split(';')[2].count('.') == 1
-                  and len(dst_lines[1].split(';')[2].split('.')[1]) ==
-                  len(src_lines[1].split(';')[2].split('.')[1]),
-                  dst_lines[1].split(';')[2])
-
-            # deuxième passe : la colonne existe, seules les lignes changées bougent
-            for st in sts3:
-                st.ox, st.oy, st.oz, st.oyaw = st.x, st.y, st.z, st.yaw_fix
-            Corrections(out_csv).apply(sts3[9], yaw_fix=2.5)
-            out2 = os.path.join(tmp, 'corrige2.csv')
-            n2, k2, added2 = write_corrected_csv(out_csv, out2, sts3)
-            l2 = _read_text(out2).splitlines()
-            diff2 = [i for i, (a, b) in enumerate(zip(dst_lines, l2)) if a != b]
-            check("colonne existante réutilisée", not added2 and n2 == 1
-                  and diff2 == [10], f"{n2} ligne(s), différences {diff2}")
-            check("Δ nord mis à jour en place",
-                  abs(read_survey_csv(out2)[0][9].yaw_fix - 2.5) < 1e-6)
-
-            corr.revert_all(sts)
-            check("réinitialisation complète", not Corrections.counts(sts).any())
-            check("retour aux valeurs du fichier",
-                  all(not s.modified() and abs(s.z - s.oz) < 1e-12 for s in sts))
+        # CSV de sortie : le même que l'entrée, lignes corrigées seules
+        c = os.path.join(tmp, 'terrain.csv')
+        src_txt = ("\ufeffNum scan;Locator;X;Y;Z;Delta;Hauteur/cm;Zcorrige;% NORD;PlancherMS\r\n"
+                   "1001;R110b_01;15.217;6.563;-3.500;;165.000;-1.850;50;PLANCHER 01 (-03.50m)\r\n"
+                   "2108;R348_01;3.667;7.057;4.000;-0.400;165.000;5.250;50;PLANCHER 03 (+04.00m)\r\n"
+                   "1052;R732_01;-8.440;-8.710;-8.500;;120.000;-7.300;50;\r\n")
+        with open(c, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(src_txt)
+        t, _ = read_survey_csv(c)
+        check("lecture : Z = plancher, Delta, Hauteur/cm, Zcorrige = Z final",
+              t[1].plancher_z == 4.0 and t[1].plancher_src == 'colonne' and t[1].z_csv == 5.25
+              and abs(t[1].h0 - 1.65) < 1e-9 and t[1].delta0 == -0.4 and t[2].h0 == 1.2,
+              f"plancher {t[1].plancher_z} Δ {t[1].delta0} H {t[1].h0}")
+        notes = apply_altimetry(t, 1.65)
+        check("Z recalculé = Zcorrige du fichier, aucune incohérence",
+              not notes and all(abs(x.z - x.z_csv) < 1e-9 for x in t), '; '.join(notes))
+        out = os.path.join(tmp, 'terrain_sortie.csv')
+        n_mod, n_keep = write_survey_csv(c, out, t)
+        check("sans correction : CSV de sortie identique octet pour octet",
+              (n_mod, n_keep) == (0, 3) and open(out, 'rb').read() == open(c, 'rb').read())
+        k = Corrections(c, eye=1.65)
+        k.apply(t[0], x=t[0].x + 0.1, dh=0.05, ddelta=-0.20)
+        k.apply(t[1], yaw_fix=3.0)                    # orientation seule
+        n_mod, n_keep = write_survey_csv(c, out, t)
+        src_l = _read_text(c).splitlines()
+        out_l = _read_text(out).splitlines()
+        ligne = out_l[1].split(';')
+        check("ligne corrigée : X, Delta, Hauteur (cm), Zcorrige ; Z plancher intact",
+              ligne[2] == '15.317' and ligne[4] == '-3.500' and ligne[5] == '-0.200'
+              and ligne[6] == '170.000' and ligne[7] == '-2.000' and ligne[8] == '50',
+              ';'.join(ligne[2:9]))
+        check("même en-tête, mêmes colonnes ; orientation seule : ligne intacte",
+              (n_mod, n_keep) == (1, 2) and out_l[0] == src_l[0] and out_l[2:] == src_l[2:]
+              and all(len(x.split(';')) == len(y.split(';')) for x, y in zip(src_l, out_l)))
+        r, _ = read_survey_csv(out)
+        apply_altimetry(r, 1.65)
+        check("CSV de sortie relu : mêmes Z, aucune incohérence",
+              all(abs(p_.z - q_.z) < 5e-4 for p_, q_ in zip(t, r))
+              and all(abs(x.z - x.z_csv) < 5e-4 for x in r))
+        # fichier de corrections : aller-retour (orientation comprise)
+        k.save(t)
+        f, _ = read_survey_csv(c)
+        apply_altimetry(f, 1.65)
+        Corrections(c, eye=1.65).load({x.photo: x for x in f}, by_key={x.key.lower(): x for x in f})
+        check("fichier de corrections relu : XY, Δ, H, orientation",
+              abs(f[0].x - 15.317) < 1e-9 and abs(f[0].dh - 0.05) < 1e-9
+              and abs(f[0].ddelta + 0.2) < 1e-9 and abs(f[0].z + 2.0) < 1e-9
+              and abs(f[1].yaw_fix - 3.0) < 1e-9 and not f[2].modified())
 
         # 8. Rotation d'image : semantique et coherence avec le rendu
         print("\n8) Rotation d'image (correction d'orientation)")
@@ -8780,28 +7762,19 @@ def selftest(csv_path: str = '') -> int:
         check("filtre images absentes",
               not [lk for lk in mine if flt6.accepts(cur, sts[lk.target], lk, False)])
 
-    # taille de pastille : décroissance en 1/distance
+    # taille de pastille : À L'ÉCHELLE (f x rayon / distance), sans taille plancher
     view = View(0, -20, 105, 1600, 900)
     f = view.focal()
     r1 = clamp(f * DISC_RADIUS_M / 6.0, DISC_PX_MIN, DISC_PX_MAX)
     r2 = clamp(f * DISC_RADIUS_M / 18.0, DISC_PX_MIN, DISC_PX_MAX)
-    check("pastille 3x plus loin = 3x plus petite (hors bornes)",
-          abs(r1 / r2 - 3.0) < 1e-6, f"{r1:.1f} px à 6 m, {r2:.1f} px à 18 m")
-    tailles = [clamp(f * DISC_RADIUS_M / d, DISC_PX_MIN, DISC_PX_MAX)
-               for d in (0.4, 1.0, 2.0, 5.0, 10.0, 30.0, 200.0)]
-    check("taille bornée à toute distance",
-          all(DISC_PX_MIN <= t <= DISC_PX_MAX for t in tailles),
-          f"{min(tailles):.0f} à {max(tailles):.0f} px de 0,4 m à 200 m")
-    check("bornes utiles : cliquable et non envahissante",
-          DISC_PX_MIN >= 9.0 and DISC_PX_MAX <= 40.0
-          and DISC_PX_MAX >= 3 * DISC_PX_MIN,
-          f"{DISC_PX_MIN:.0f} → {DISC_PX_MAX:.0f} px")
-    check("pastille jamais plus large que 5 % de la vue",
-          DISC_PX_MAX * 2 <= 0.05 * 1600 + 1e-9,
-          f"{DISC_PX_MAX * 2:.0f} px de diamètre sur 1600 px")
-    seuil = f * DISC_RADIUS_M / DISC_PX_MAX
-    check("proportionnalité conservée au-delà de la portée utile", seuil < 6.0,
-          f"plafonnée en deçà de {seuil:.1f} m seulement")
+    check("pastille 3x plus loin = 3x plus petite", abs(r1 / r2 - 3.0) < 1e-6,
+          f"{r1:.1f} px à 6 m, {r2:.1f} px à 18 m")
+    loin = f * DISC_RADIUS_M / DISC_PX_MIN
+    pres = f * DISC_RADIUS_M / DISC_PX_MAX
+    check("échelle vraie de près comme de loin (la distance se lit juste)",
+          pres <= 2.5 and loin >= 35.0, f"proportionnelle de {pres:.1f} m à {loin:.0f} m")
+    check("estompage avec la distance", BubbleNavApp.fade(3.0) == 1.0
+          and BubbleNavApp.fade(20.0) < 1.0 and BubbleNavApp.fade(80.0) == FADE_MIN)
     ratio = View(0, 0, 50, 1600, 900).focal() / View(0, 0, 100, 1600, 900).focal()
     attendu = math.tan(math.radians(50)) / math.tan(math.radians(25))
     check("zoom : la pastille grossit du bon facteur", abs(ratio - attendu) < 1e-9,
@@ -8873,17 +7846,18 @@ def selftest(csv_path: str = '') -> int:
 
         # releve complet corrige : correspondance par cle
         out3 = os.path.join(tmp2, 'complet.csv')
-        n_mod, _, _ = write_corrected_csv(csv_ren, out3, sts_ren)
+        n_mod, _ = write_survey_csv(csv_ren, out3, sts_ren)
         rel3, _ = read_survey_csv(out3)
         check("relevé complet corrigé par clé", n_mod == 1 and abs(rel3[0].x - 10.25) < 5e-4)
 
         # colonnes Hauteur appareil / Delta du releve mises a jour par composante
         csv_hd = os.path.join(tmp2, 'hd.csv')
         with open(csv_hd, 'w', encoding='utf-8-sig', newline='') as fh:
-            fh.write("Num scan;Fichier photo;X;Y;Z;Hauteur appareil;Delta plancher;% NORD;Plancher\r\n"
+            fh.write("Num scan;Fichier photo;X;Y;Zcorrige;Hauteur appareil;Delta plancher;% NORD;Plancher\r\n"
                      "0001;0001;1.000;2.000;3.250;1.600;0.000;50;P0\r\n"
                      "0002;0002;4.000;2.000;3.250;1.600;0.000;50;P0\r\n")
         sts_hd, _ = read_survey_csv(csv_hd)
+        apply_altimetry(sts_hd, 1.65)
         check("hauteur appareil et delta lus dans le relevé",
               sts_hd[0].h0 == 1.6 and sts_hd[0].delta0 == 0.0
               and abs(sts_hd[0].ground() - 1.65) < 1e-9)
@@ -8891,9 +7865,10 @@ def selftest(csv_path: str = '') -> int:
         c_hd.apply(sts_hd[0], dh=0.05)
         c_hd.apply(sts_hd[1], ddelta=-0.15)
         out_hd = os.path.join(tmp2, 'hd_corrige.csv')
-        write_corrected_csv(csv_hd, out_hd, sts_hd)
+        write_survey_csv(csv_hd, out_hd, sts_hd)
         rel_hd, _ = read_survey_csv(out_hd)
-        check("relevé complet : Z, hauteur et delta mis à jour selon la composante",
+        apply_altimetry(rel_hd, 1.65)
+        check("CSV de sortie : Z final, hauteur et delta mis à jour selon la composante",
               abs(rel_hd[0].oz - 3.30) < 5e-4 and abs(rel_hd[0].h0 - 1.65) < 5e-4
               and abs(rel_hd[0].delta0) < 5e-4
               and abs(rel_hd[1].oz - 3.10) < 5e-4 and abs(rel_hd[1].h0 - 1.60) < 5e-4
@@ -8963,7 +7938,8 @@ def selftest(csv_path: str = '') -> int:
         c2 = ecrit('b.csv', "Numéro de scan,Est,Nord,Altitude\n12,10.5,20.25,3.1\n13,11,20,3.1\n")
         s2, _ = read_survey_csv(c2)
         check("intitulés variés, séparateur virgule", len(s2) == 2 and s2[1].key == '13'
-              and abs(s2[0].x - 10.5) < 1e-9 and abs(s2[0].y - 20.25) < 1e-9 and s2[0].z == 3.1)
+              and abs(s2[0].x - 10.5) < 1e-9 and abs(s2[0].y - 20.25) < 1e-9
+              and s2[0].plancher_z == 3.1)
 
         c3 = ecrit('c.csv', "0347;589,15;73,45;1,65\r\n0348;591,00;73,45;1,65\r\n")
         try:
@@ -8978,7 +7954,7 @@ def selftest(csv_path: str = '') -> int:
                   len(s3) == 2 and s3[0].key == '0347' and abs(s3[0].x - 589.15) < 1e-9)
             out3 = os.path.join(tmp3, 'c_corrige.csv')
             s3[0].x += 0.1
-            write_corrected_csv(c3, out3, s3, mapping={k: f"#{v}" for k, v in need.guess.items()})
+            write_survey_csv(c3, out3, s3, mapping={k: f"#{v}" for k, v in need.guess.items()})
             l3 = _read_text(out3).splitlines()
             check("relevé corrigé sans en-tête : aucune ligne ajoutée, valeur corrigée",
                   len(l3) == 2 and l3[0].split(';')[1] == '589,25' and l3[1] == "0348;591,00;73,45;1,65",
@@ -9022,7 +7998,7 @@ def selftest(csv_path: str = '') -> int:
         s5, _ = read_survey_csv(c5)
         s5[0].x = 1.5
         out5 = os.path.join(tmp3, 'e_corrige.csv')
-        n5, _, _ = write_corrected_csv(c5, out5, s5)
+        n5, _ = write_survey_csv(c5, out5, s5)
         check("relevé corrigé d'un CSV num scan sans colonne photo",
               n5 == 1 and _read_text(out5).splitlines()[1] == "0347;1.500;2.000;3.000")
     finally:
@@ -9036,7 +8012,7 @@ def selftest(csv_path: str = '') -> int:
     try:
         c = os.path.join(tmp4, 'etages.csv')
         with open(c, 'w', encoding='utf-8-sig', newline='') as fh:
-            fh.write("Num scan;Nom du Locator;X;Y;Z;% NORD;Plancher\r\n"
+            fh.write("Num scan;Nom du Locator;X;Y;Zcorrige;% NORD;Plancher\r\n"
                      "1;R110b_01;0;0;-1.85;50;PLANCHER 01 (-03.50m)\r\n"
                      "2;R110b_02;1;0;-1.85;50;PLANCHER 01 (-03.50m)\r\n"
                      "3;R712_01;0;0;21.65;50;PLANCHER 07 (+20.00m)\r\n"
@@ -9064,37 +8040,24 @@ def selftest(csv_path: str = '') -> int:
     finally:
         _sh4.rmtree(tmp4, ignore_errors=True)
 
-    # 14. Repère XYZ, glisser sur un axe, squelette du plan
-    print("\n14) Repère XYZ, glisser sur un axe, squelette du plan")
+    # 14. Rayon écran ↔ projection, squelette du plan
+    print("\n14) Rayon écran ↔ projection, squelette du plan")
     import random as _rnd
     rng = _rnd.Random(7)
-    err_px = err_t = 0.0
-    n_ok = 0
+    err_px = 0.0
     for _ in range(2000):
         cal = Calib(rng.choice(('colonne', 'centre')), rng.choice((1, -1)), rng.uniform(-40, 40))
         pct = rng.uniform(0, 100)
-        v = View(rng.uniform(-180, 180), rng.uniform(-60, 10), rng.uniform(60, 110), 1280, 800)
-        p = (rng.uniform(-8, 8), rng.uniform(-8, 8), rng.uniform(-2.5, 0.5))
-        axis = AXES[rng.choice('xyz')]
-        t_true = rng.uniform(-1.5, 1.5)
-        q = tuple(p[i] + axis[i] * t_true for i in range(3))
+        v = View(rng.uniform(-180, 180), rng.uniform(-60, 10), rng.uniform(60, 180), 1280, 800)
+        q = (rng.uniform(-8, 8), rng.uniform(-8, 8), rng.uniform(-2.5, 0.5))
         pr = project_point(v, cal, pct, *q)
         if pr is None or not (0 <= pr[0] <= v.width and 0 <= pr[1] <= v.height):
             continue
         ray = screen_ray(v, pr[0], pr[1], cal, pct)
-        back = project_point(v, cal, pct, *(r * 5.0 for r in ray))
+        back = project_point(v, cal, pct, *(r_ * 5.0 for r_ in ray))
         err_px = max(err_px, math.hypot(back[0] - pr[0], back[1] - pr[1]))
-        t = axis_param(ray, p, axis)
-        if t is None:
-            continue
-        n_ok += 1
-        err_t = max(err_t, abs(t - t_true))
-    check("rayon écran ↔ projection d'un point (aller-retour)", err_px < 1e-6,
-          f"écart max {err_px:.1e} px")
-    check("abscisse sur l'axe retrouvée sous le curseur", n_ok > 100 and err_t < 1e-6,
-          f"{n_ok} cas, écart max {err_t:.1e} m")
-    check("axe vu dans l'axe du regard : geste ignoré",
-          axis_param((0.0, 1.0, 0.0), (0.0, 5.0, -1.6), AXES['y']) is None)
+    check("rayon écran ↔ projection d'un point (aller-retour, grand angle compris)",
+          err_px < 1e-6, f"écart max {err_px:.1e} px")
     grid = [Station(idx=k, photo=f"g{k}", locator=f"G{k}", x=float(k % 6) * 2.0,
                     y=float(k // 6) * 2.0, z=1.65, north_pct=50.0, floor='P')
             for k in range(36)]
@@ -9124,98 +8087,21 @@ def selftest(csv_path: str = '') -> int:
               and 2.0 <= len(full) / max(1, len(sk)) <= 4.5,
               f"{len(full)} → {len(sk)} traits")
 
-    # 15. Altimétrie : Z = Z plancher + delta + hauteur instrument
-    print("\n15) Altimétrie : Z plancher + delta + hauteur instrument")
-    import tempfile as _tf5
-    import shutil as _sh5
-    tmp5 = _tf5.mkdtemp(prefix='bubblenav_alti_')
-    try:
-        c = os.path.join(tmp5, 'alti.csv')
-        with open(c, 'w', encoding='utf-8-sig', newline='') as fh:
-            fh.write("Num scan;Nom du Locator;X;Y;Z;Z plancher;Delta;Hauteur instrument;"
-                     "% NORD;Plancher\r\n"
-                     "1;R110_01;0;0;1.650;0.00;0;1.65;50;PLANCHER 01 (+00.00m)\r\n"
-                     "2;R110_02;3;0;1.900;0.00;+0.25;1.65;50;PLANCHER 01 (+00.00m)\r\n"
-                     "3;R110_03;6;0;2.500;0.00;-0.10;1.50;50;PLANCHER 01 (+00.00m)\r\n"
-                     "4;R210_01;0;5;5.650;4.00;0;;50;PLANCHER 02 (+04.00m)\r\n"
-                     "5;SAP_01;9;9;7.777;;;;50;\r\n")
-        a, _ = read_survey_csv(c)
-        check("colonnes Z plancher / Delta / Hauteur instrument reconnues",
-              a[1].floor_alt == 0.0 and a[1].floor_alt_src == 'colonne'
-              and a[1].delta_col and a[1].delta0 == 0.25 and a[2].h0 == 1.50)
-        apply_altimetry(a, 1.60)
-        check("Z = plancher + Δ + H (Z du CSV ignoré)",
-              abs(a[1].z - 1.90) < 1e-9 and abs(a[2].z - 1.40) < 1e-9
-              and abs(a[3].z - 5.60) < 1e-9,
-              f"{a[1].z:.2f} / {a[2].z:.2f} / {a[3].z:.2f} (H défaut 1.60)")
-        check("sans altitude de plancher : Z du CSV conservé", abs(a[4].z - 7.777) < 1e-9)
-        corr = Corrections(c, eye=1.60)
-        corr.apply(a[2], ddelta=+0.05)
-        corr.apply(a[2], dh=+0.02)
-        check("corrections : Δ et H s'ajoutent au calcul",
-              abs(a[2].z - 1.47) < 1e-9 and abs(a[2].delta(1.60) + 0.05) < 1e-9
-              and abs(a[2].height(1.60) - 1.52) < 1e-9 and abs(a[2].ground(1.60) + 0.05) < 1e-9)
-        out = os.path.join(tmp5, 'alti_corrige.csv')
-        write_corrected_csv(c, out, a, eye=1.60)
-        b, _ = read_survey_csv(out)
-        check("CSV corrigé : Z, Delta et Hauteur de la bulle corrigée",
-              abs(b[2].z_csv - 1.47) < 5e-4 and abs(b[2].delta0 + 0.05) < 5e-4
-              and abs(b[2].h0 - 1.52) < 5e-4, f"Z {b[2].z_csv} Δ {b[2].delta0} H {b[2].h0}")
-        check("CSV corrigé : Z faux remplacé par le calcul, même sans correction",
-              abs(b[3].z_csv - 5.60) < 5e-4 and abs(b[0].z_csv - 1.65) < 5e-4
-              and abs(b[1].z_csv - 1.90) < 5e-4 and abs(b[4].z_csv - 7.777) < 5e-4,
-              f"{b[3].z_csv} / {b[0].z_csv} / {b[4].z_csv}")
-        apply_altimetry(b, 1.60)
-        check("CSV corrigé relu : mêmes altitudes",
-              all(abs(p.z - q.z) < 5e-4 for p, q in zip(a, b)))
-    finally:
-        _sh5.rmtree(tmp5, ignore_errors=True)
-
-    # 16. Format terrain : Z plancher, Delta, Hauteur/cm, Zcorrige, PlancherMS
-    print("\n16) Format terrain (Z plancher, Delta, Hauteur/cm, Zcorrige)")
-    import tempfile as _tf6
-    import shutil as _sh6
-    tmp6 = _tf6.mkdtemp(prefix='bubblenav_terrain_')
-    try:
-        c = os.path.join(tmp6, 'terrain.csv')
-        src_txt = ("\ufeffNum scan;Locator;X;Y;Z;Delta;Hauteur/cm;Zcorrige;% NORD;PlancherMS\r\n"
-                   "1001;R110b_01;15.217;6.563;-3.500;;165.000;-1.850;50;PLANCHER 01 (-03.50m)\r\n"
-                   "2108;R348_01;3.667;7.057;4.000;-0.400;165.000;5.250;50;PLANCHER 03 (+04.00m)\r\n"
-                   "1052;R732_01;-8.440;-8.710;-8.500;;165.000;-6.850;50;\r\n")
-        with open(c, 'w', encoding='utf-8', newline='') as fh:
-            fh.write(src_txt)
-        t, _ = read_survey_csv(c)
-        check("Z = plancher, Zcorrige = point de vue, hauteur en cm, PlancherMS lu",
-              t[1].floor_alt == 4.0 and t[1].z_csv == 5.25 and abs(t[1].h0 - 1.65) < 1e-9
-              and t[1].delta0 == -0.4 and t[0].floor.startswith('PLANCHER 01')
-              and t[2].floor_alt == -8.5,
-              f"plancher {t[1].floor_alt} Δ {t[1].delta0} H {t[1].h0} « {t[0].floor} »")
-        apply_altimetry(t, 1.65)
-        check("Z calculé = Zcorrige du fichier", all(abs(x.z - x.z_csv) < 1e-9 for x in t))
-        out = os.path.join(tmp6, 'terrain_corrige.csv')
-        n_mod, n_keep, _ = write_corrected_csv(c, out, t)
-        check("sans correction : CSV corrigé identique au fichier",
-              n_mod == 0 and open(out, 'rb').read() == open(c, 'rb').read())
-        Corrections(c).apply(t[0], dh=0.05, ddelta=-0.20)
-        write_corrected_csv(c, out, t)
-        ligne = _read_text(out).splitlines()[1].split(';')
-        check("correction réécrite dans les unités du fichier (cm)",
-              ligne[5] == '-0.200' and ligne[6] == '170.000' and ligne[7] == '-2.000',
-              ';'.join(ligne[4:8]))
-        # regarder d'où l'on vient : la pastille visée tombe au centre de l'écran
-        v = View(0.0, 0.0, 90.0, 800, 600)
-        cal = Calib('colonne', 1, 0.0)
-        a1 = Station(idx=0, photo='a', locator='A', x=0, y=0, z=1.65, north_pct=37.0, floor='P')
-        b1 = Station(idx=1, photo='b', locator='B', x=3, y=4, z=1.65, north_pct=62.0, floor='P')
-        aim_at(v, cal, b1, a1, 1.65, 'sol')
-        dx, dy = a1.x - b1.x, a1.y - b1.y
-        pr = project(v, cal.pano_yaw(math.degrees(math.atan2(dx, dy)), b1.north_pct),
-                     math.degrees(math.atan2(a1.ground(1.65) - b1.z, math.hypot(dx, dy))))
-        check("regarder d'où l'on vient : pastille au centre",
-              pr is not None and abs(pr[0] - 400) < 1e-6 and abs(pr[1] - 300) < 1e-6,
-              f"{pr[0]:.3f}, {pr[1]:.3f}" if pr else "hors champ")
-    finally:
-        _sh6.rmtree(tmp6, ignore_errors=True)
+    # 15. Visée : regarder d'où l'on vient
+    print("\n15) Visée")
+    v = View(0.0, 0.0, 90.0, 800, 600)
+    cal = Calib('colonne', 1, 0.0)
+    a1 = Station(idx=0, photo='a', locator='A', x=0, y=0, z=1.65, north_pct=37.0, floor='P',
+                 h0=1.65)
+    b1 = Station(idx=1, photo='b', locator='B', x=3, y=4, z=1.65, north_pct=62.0, floor='P',
+                 h0=1.65)
+    aim_at(v, cal, b1, a1, 1.65, 'sol')
+    dx, dy = a1.x - b1.x, a1.y - b1.y
+    pr = project(v, cal.pano_yaw(math.degrees(math.atan2(dx, dy)), b1.north_pct),
+                 math.degrees(math.atan2(a1.ground(1.65) - b1.z, math.hypot(dx, dy))))
+    check("regarder d'où l'on vient : pastille au centre",
+          pr is not None and abs(pr[0] - 400) < 1e-6 and abs(pr[1] - 300) < 1e-6,
+          f"{pr[0]:.3f}, {pr[1]:.3f}" if pr else "hors champ")
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))
