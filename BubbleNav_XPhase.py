@@ -255,6 +255,7 @@ DEFAULT_CONFIG = {
     'show_mire': True,               # mire de hauteur sur les bulles comparées
     'show_tooltip': True,            # infobulle au survol des pastilles
     'show_card': True,               # fiche de la station active : sol, Δ, H, Z
+    'show_img_center': True,         # trait du centre de l'image (nord image)
     'wheel_step': 0.05,              # pas de la molette pour H / Δ (m) : 0,05 ou 0,01
     'view_scope': SCOPE_DEFAULT,     # pastilles : 'local' | 'voisins' | 'chaine' | 'distance'
                                      # | 'plancher'
@@ -1853,8 +1854,14 @@ def _format_like(sample: str, value: float, default_decimals: int = 3) -> str:
 def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
                         write_yaw: Optional[bool] = None,
                         eye: float = EYE_HEIGHT_DEFAULT,
-                        mapping: Optional[Dict[str, str]] = None) -> Tuple[int, int, bool]:
+                        mapping: Optional[Dict[str, str]] = None,
+                        import_format: bool = False) -> Tuple[int, int, bool]:
     """Écrit le CSV corrigé : chaque bulle avec ses bonnes valeurs.
+
+    `import_format` : CSV recalculé IDENTIQUE à l'import — mêmes colonnes, pas
+    une de plus, valeurs recalculées (X, Y, Z et, s'il en a les colonnes,
+    delta et hauteur) ; aucun élément d'orientation (ni Δ nord, ni % NORD
+    modifié).
 
     X / Y corrigés, Z = plancher + delta + hauteur instrument (corrections
     comprises), delta et hauteur dans leurs colonnes (ajoutées si une
@@ -1921,7 +1928,7 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
     # Colonnes ajoutées au besoin : Δ nord, et les composantes d'altitude
     # corrigées que le relevé ne porte pas encore.
     need_yaw = (any(st.has_yaw() or st.turned() for st in stations)
-                if write_yaw is None else bool(write_yaw))
+                if write_yaw is None else bool(write_yaw)) and not import_format
     extras: List[Tuple[str, str, object]] = []
     if need_yaw and 'dnord' not in col:
         extras.append(('dnord', YAW_COLUMN, lambda st: st.yaw_fix))
@@ -1929,6 +1936,8 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
         extras.append(('delta', 'Delta', lambda st: st.delta(eye)))
     if 'hcam' not in col and any(st.raised() for st in stations):
         extras.append(('hcam', 'Hauteur instrument', lambda st: st.height(eye)))
+    if import_format:
+        extras = []                            # colonnes de l'import, pas une de plus
 
     out: List[str] = ([] if headerless else
                       [head_body + ''.join(delim + h for _, h, _ in extras) + head_eol])
@@ -1957,6 +1966,8 @@ def write_corrected_csv(src_csv: str, dst_csv: str, stations: Sequence[Station],
         if st is not None:
             # chaque cellule reçoit sa bonne valeur, au format d'origine
             for name, value in valeurs(st):
+                if import_format and name == 'dnord':
+                    continue
                 i = col.get(name, -1)
                 if 0 <= i < len(fields):
                     if not fields[i].strip() and (
@@ -2728,7 +2739,11 @@ AFFICHAGE
                                par local ou par lien, pastille au sol ou au
                                point de vue, regarder d'où l'on vient,
                                infobulle au survol (courte ; masquée pendant
-                               une modification), fiche de la station active
+                               une modification), fiche de la station active,
+                               trait du centre de l'image
+  Trait pointillé vertical ... centre de l'image (« nord image ») : accroché à
+                               l'image, il tourne avec elle quand on corrige
+                               l'orientation ; le « N » rouge reste le nord terrain
   F11 / Échap ................ plein écran
   V .......................... afficher le visualiseur
   F1 ou ? .................... cette aide
@@ -2763,8 +2778,10 @@ PLAN
   Ctrl+Z ..................... annuler
 
 FICHIERS
-  Ctrl+S ..................... « Appliquer / enregistrer » : CSV corrigé (bonnes
-                               valeurs), images orientées dans un autre dossier
+  Ctrl+S ..................... « Appliquer / enregistrer » : CSV corrigé (toutes
+                               les corrections, Δ nord compris), CSV recalculé au
+                               format d'import (mêmes colonnes, sans orientation),
+                               images orientées dans un autre dossier
   Les corrections s'enregistrent en continu dans leur propre fichier ;
   le CSV chargé et les images d'origine ne sont jamais modifiés.
 """
@@ -3718,6 +3735,43 @@ class BubbleNavApp(_TkBase):
                                 else "départ · origine CSV", start is None or
                                 math.hypot(start[0] - st.ox, start[1] - st.oy) <= 0.005)
 
+    # ── centre de l'image (nord image) ───────────────────────────────
+    def draw_image_center(self, canvas, view: View, st: Station) -> None:
+        """Trait vertical discret accroché à l'image, sur son centre (le « nord
+        image ») : il tourne avec l'image quand on corrige l'orientation (Δ nord),
+        alors que le « N » du terrain reste en place — le repère d'un changement
+        d'orientation."""
+        if not self.cfg.get('show_img_center', True):
+            return
+        yaw = wrap180(st.yaw_fix)          # l'image est décalée de Δ nord à l'écran
+        lim = 4 * max(view.width, view.height)
+        seg: List[float] = []
+        top = None
+
+        def flush():
+            if len(seg) >= 4:
+                canvas.create_line(*seg, fill='#e8e8e8', width=1, dash=(6, 5), tags='hs')
+
+        for el in range(-88, 89, 4):
+            pr = project(view, yaw, float(el))
+            if pr is None or abs(pr[0]) > lim or abs(pr[1]) > lim:
+                flush()
+                seg = []
+                continue
+            seg += [pr[0], pr[1]]
+            if 0 <= pr[0] <= view.width and 0 <= pr[1] <= view.height:
+                if top is None or pr[1] < top[1]:
+                    top = (pr[0], pr[1])
+        flush()
+        if top is not None:
+            y = max(top[1], 56)
+            txt = "centre image" + (f"  Δnord {st.yaw_fix:+.2f}°".replace('.', ',')
+                                    if st.turned() or st.has_yaw() else '')
+            canvas.create_text(top[0] + 5, y + 1, text=txt, anchor='nw', fill='#000000',
+                               font=F_TINY, tags='hs')
+            canvas.create_text(top[0] + 4, y, text=txt, anchor='nw', fill='#e8e8e8',
+                               font=F_TINY, tags='hs')
+
     # ── fiche de la station active : sol, Δ, H, Z ────────────────────
     def _card_expire(self) -> None:
         self._card_job = None
@@ -4035,6 +4089,12 @@ class BubbleNavApp(_TkBase):
                                                                    bool(self.tip_var.get())),
                                               self.canvas.delete('tip'),
                                               self.compare and self.compare.canvas.delete('tip')))
+        self.center_var = tk.BooleanVar(value=bool(self.cfg.get('show_img_center', True)))
+        menu.add_checkbutton(label="Trait du centre de l'image (nord image)",
+                             variable=self.center_var,
+                             command=lambda: (self.cfg.__setitem__('show_img_center',
+                                                                   bool(self.center_var.get())),
+                                              self._draw_overlay(), self._redraw_compare()))
         self.card_var = tk.BooleanVar(value=bool(self.cfg.get('show_card', True)))
         menu.add_checkbutton(label="Fiche de la station active (sol, Δ, H, Z)",
                              variable=self.card_var,
@@ -5126,6 +5186,7 @@ class BubbleNavApp(_TkBase):
         if view is None or self.current < 0:
             return
         self.hotspots = self._compute_hotspots(view)
+        self.draw_image_center(self.canvas, view, self.station())
         espace = bool(self._hs_drag and self._hs_drag[0] == 'plan')
         if self.edit_mode:
             self._draw_edit_refs(view)
@@ -6635,6 +6696,10 @@ class BubbleNavApp(_TkBase):
             f"{base}_corrige_{datetime.now():%Y%m%d_%Hh%M}{ext or '.csv'}"))
         do_img = tk.BooleanVar(value=bool(pending))
         do_merged = tk.BooleanVar(value=True)
+        recalc_var = tk.StringVar(value=os.path.join(
+            os.path.dirname(self.csv_path),
+            f"{base}_recalcule_{datetime.now():%Y%m%d_%Hh%M}{ext or '.csv'}"))
+        do_recalc = tk.BooleanVar(value=True)
 
         def path_row(var, browse):
             row = tk.Frame(win, bg=COLORS['bg_dark'])
@@ -6691,6 +6756,26 @@ class BubbleNavApp(_TkBase):
                  ).pack(fill='x', padx=30, pady=(0, 4))
         path_row(merged_var, pick_merged)
 
+        def pick_recalc():
+            path = filedialog.asksaveasfilename(
+                title="CSV recalculé (format d'import)", defaultextension=ext or '.csv',
+                initialdir=os.path.dirname(recalc_var.get()),
+                initialfile=os.path.basename(recalc_var.get()),
+                filetypes=[("Fichiers CSV", "*.csv *.txt"), ("Tous les fichiers", "*.*")])
+            if path:
+                recalc_var.set(path)
+
+        check("Écrire aussi le CSV recalculé, au format d'import",
+              do_recalc).pack(fill='x', padx=14, pady=(8, 2))
+        tk.Label(win, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
+                 anchor='w', justify='left', text=(
+                     "Identique au CSV chargé (mêmes colonnes, même ordre, même format), "
+                     "valeurs recalculées :\nX, Y, Z = plancher + Δ + H, delta et "
+                     "hauteur. Aucun élément d'orientation (% NORD d'origine, pas de "
+                     "Δ nord).")
+                 ).pack(fill='x', padx=30, pady=(0, 4))
+        path_row(recalc_var, pick_recalc)
+
         foot = tk.Frame(win, bg=COLORS['bg_dark'])
         foot.pack(fill='x', padx=14, pady=12)
 
@@ -6706,21 +6791,30 @@ class BubbleNavApp(_TkBase):
                                          "Ce dossier contient les images source : "
                                          "elles seraient écrasées.")
                     return
-            if do_merged.get():
-                if not merged:
+            recalc = recalc_var.get().strip()
+            outs = ([merged] if do_merged.get() else []) + ([recalc] if do_recalc.get()
+                                                           else [])
+            for path in outs:
+                if not path:
                     messagebox.showwarning("Appliquer", "Indiquez le CSV à écrire.")
                     return
                 for reserved in (self.csv_path, self.corrections.path):
-                    if reserved and os.path.abspath(merged) == os.path.abspath(reserved):
+                    if reserved and os.path.abspath(path) == os.path.abspath(reserved):
                         messagebox.showerror("Appliquer",
                                              "Choisissez un autre nom : ce fichier ne "
                                              "doit pas être écrasé.")
                         return
+            if len(outs) == 2 and os.path.abspath(merged) == os.path.abspath(recalc):
+                messagebox.showerror("Appliquer", "Les deux CSV doivent avoir des noms "
+                                                  "différents.")
+                return
             win.destroy()
+            merged = merged if do_merged.get() else ''
+            recalc = recalc if do_recalc.get() else ''
             if do_img.get():
-                self._run_export(out_dir, merged if do_merged.get() else '')
-            elif do_merged.get():
-                self._export_merged(merged)
+                self._run_export(out_dir, merged, recalc)
+            elif merged or recalc:
+                self._export_merged(merged, recalc)
 
         self._mk_button(foot, "Appliquer", run, bg=COLORS['accent']).pack(side='right')
         self._mk_button(foot, "Fermer", win.destroy).pack(side='right', padx=6)
@@ -6770,26 +6864,37 @@ class BubbleNavApp(_TkBase):
         self._refresh_edit_panel()
         self._refresh_module()
 
-    def _export_merged(self, path: str) -> bool:
-        """Écrit un relevé complet corrigé, sans rien changer aux fichiers de travail."""
+    def _export_merged(self, path: str, recalc: str = '') -> bool:
+        """Écrit le relevé complet corrigé (`path`) et / ou le CSV recalculé au
+        format d'import (`recalc`), sans rien changer aux fichiers de travail."""
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        lignes = []
         try:
-            n_mod, n_keep, added = write_corrected_csv(
-                self.csv_path, path, self.stations,
-                eye=float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
-                mapping=self.csv_mapping)
+            if path:
+                n_mod, n_keep, added = write_corrected_csv(
+                    self.csv_path, path, self.stations, eye=eye, mapping=self.csv_mapping)
+                lignes.append(
+                    f"CSV corrigé : {n_mod} ligne(s) corrigée(s), {n_keep} inchangée(s).\n"
+                    f"{path}"
+                    + ("\nColonne(s) ajoutée(s) en fin de ligne (Δ nord, delta, hauteur "
+                       "instrument)." if added else ""))
+            if recalc:
+                n_mod, n_keep, _ = write_corrected_csv(
+                    self.csv_path, recalc, self.stations, eye=eye, mapping=self.csv_mapping,
+                    import_format=True)
+                lignes.append(
+                    f"CSV recalculé (format d'import, sans orientation) : {n_mod} ligne(s) "
+                    f"recalculée(s), {n_keep} inchangée(s).\n{recalc}")
         except Exception as exc:
             messagebox.showerror("Relevé corrigé", f"Écriture impossible :\n{exc}")
             return False
-        self._set_status(f"CSV corrigé écrit : {n_mod} ligne(s) corrigée(s), "
-                         f"{n_keep} inchangée(s) → {path}", COLORS['ok'])
-        messagebox.showinfo("CSV corrigé", (
-            f"{n_mod} ligne(s) corrigée(s), {n_keep} inchangée(s).\n\n{path}\n\n"
-            + ("Colonne(s) ajoutée(s) en fin de ligne pour les valeurs corrigées "
-               "(Δ nord, delta, hauteur instrument).\n\n" if added else "")
-            + "Le CSV chargé n'est pas modifié."))
+        self._set_status("CSV écrit : " + " · ".join(os.path.basename(p) for p in (path, recalc)
+                                                      if p), COLORS['ok'])
+        messagebox.showinfo("CSV écrits", "\n\n".join(lignes)
+                            + "\n\nLe CSV chargé n'est pas modifié.")
         return True
 
-    def _run_export(self, out_dir: str, merged_after: str = '') -> None:
+    def _run_export(self, out_dir: str, merged_after: str = '', recalc_after: str = '') -> None:
         """Applique les Δ nord aux images (copies), puis met à jour les fichiers."""
         todo = [s for s in self.stations if s.has_yaw() and self.store.has(s.photo)]
         absent = len(Corrections.pending_images(self.stations)) - len(todo)
@@ -6825,12 +6930,12 @@ class BubbleNavApp(_TkBase):
             applied = ({s.key for s in todo if s.photo not in failed}
                        if not cancel.is_set() else set())
             self._post(self._export_done, win, out_dir, ok, skipped + absent,
-                       errors, applied, merged_after)
+                       errors, applied, merged_after, recalc_after)
 
         threading.Thread(target=work, name='bubblenav-export', daemon=True).start()
 
     def _export_done(self, win, out_dir: str, ok: int, skipped: int, errors: List[str],
-                     applied: set, merged_after: str) -> None:
+                     applied: set, merged_after: str, recalc_after: str = '') -> None:
         try:
             win.destroy()
         except Exception:
@@ -6851,9 +6956,9 @@ class BubbleNavApp(_TkBase):
             self._autosave()
             msg += ("\n\nΔ nord remis à 0 et date d'application inscrite dans "
                     f"{os.path.basename(self.corrections.path)}.")
-        if merged_after:
-            if self._export_merged(merged_after):
-                msg += "\nRelevé complet corrigé écrit."
+        if merged_after or recalc_after:
+            if self._export_merged(merged_after, recalc_after):
+                msg += "\nCSV écrit(s)."
         else:
             messagebox.showinfo("Orientation appliquée", msg)
         self._refresh_side()
@@ -7994,6 +8099,8 @@ class CompareView(tk.Frame if _TK_OK else object):
             app.store.has, float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
             float(app.cfg.get('disc_radius', DISC_RADIUS_M)), *app.disc_bounds(),
             anchor=app.anchor())
+        if self.station() is not None:
+            app.draw_image_center(self.canvas, view, self.station())
         libres = app.declutter(self.hotspots)
         mires = set(app.mire_targets(self.idx, app.current, self.hotspots, self._hover))
         for i, hs in enumerate(self.hotspots):

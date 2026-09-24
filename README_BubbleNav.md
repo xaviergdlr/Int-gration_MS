@@ -126,6 +126,14 @@ format du CSV chargé avec les **bonnes valeurs** sur chaque ligne :
 Si une correction de delta, de hauteur ou d'orientation le demande, la colonne
 correspondante est ajoutée en fin de ligne. Le CSV chargé n'est jamais modifié.
 
+**Le CSV recalculé, au format d'import** (même boîte, coché par défaut, nom
+`…_recalcule_<date>.csv`) est **identique au CSV chargé** : mêmes colonnes, pas
+une de plus, même ordre, même séparateur, mêmes unités et décimales. Seules les
+valeurs sont recalculées : X, Y, Z = plancher + Δ + H, et Delta / Hauteur
+instrument si le relevé a ces colonnes. **Aucun élément d'orientation** : la
+colonne % NORD garde sa valeur d'origine et aucun Δ nord n'est écrit. Si le
+relevé n'a pas de colonnes Delta / Hauteur, seul le Z porte leurs corrections.
+
 Les lignes inexploitables sont ignorées et listées dans « Réglages… → Voir les
 avertissements CSV » — jamais bloquantes.
 
@@ -607,6 +615,11 @@ cible). Le bouton « Bulle active » revient à la première.
 * **Maj + glisser** dans la vue, ou le curseur Δ nord, ou les pas ±0,05° / ±0,5° ;
 * l'**image tourne sous les pastilles** — les pastilles, géoréférencées, sont la
   référence : on aligne le décor sur elles ;
+* un **trait vertical pointillé, discret**, marque le **centre de l'image**
+  (son « nord image ») : il est accroché à l'image et tourne avec elle, alors
+  que le « N » rouge reste le nord terrain. L'écart entre les deux se lit
+  d'un coup d'œil, et l'étiquette donne le Δ nord en cours (Affichage › Trait
+  du centre de l'image pour le masquer) ;
 * les **croix bleues** sont les bulles voisines non retenues comme pastilles :
   elles élargissent le jeu de repères pour juger la cohérence avec le réseau ;
 * « appliquer à ce plancher / tout le relevé » propage la même valeur si le
@@ -684,9 +697,12 @@ tourner, fichiers concernés) et propose deux traitements par lot :
    16000×8000 et par tâche (nombre de tâches réglable). Les angles appliqués
    repassent alors à 0 dans le fichier de corrections, avec la date
    d'application — impossible de les appliquer deux fois.
-2. **Écrire aussi un relevé complet corrigé** (facultatif) — relevé d'origine +
-   corrections fusionnés en un CSV unique, pour une chaîne qui n'accepte qu'un
-   seul fichier. Le relevé chargé et le fichier de corrections ne bougent pas.
+2. **Écrire le CSV corrigé** — relevé d'origine + toutes les corrections
+   (Δ nord compris) fusionnés en un CSV unique, pour une chaîne qui n'accepte
+   qu'un seul fichier. Le relevé chargé et le fichier de corrections ne bougent
+   pas.
+3. **Écrire aussi le CSV recalculé, au format d'import** — mêmes colonnes que
+   le CSV chargé, valeurs recalculées, sans orientation (voir plus haut).
 
 Tant que le lot n'est pas lancé, tout reste réversible.
 
