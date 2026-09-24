@@ -245,6 +245,7 @@ DEFAULT_CONFIG = {
                                      # 'reseau' : réseau élagué (portée, nombre, direction)
     'color_mode': 'local',           # couleur des pastilles : 'local' ou 'lien'
     'show_mire': True,               # mire de hauteur sur les bulles comparées
+    'show_tooltip': True,            # infobulle au survol des pastilles
     'wheel_step': 0.05,              # pas de la molette pour H / Δ (m) : 0,05 ou 0,01
     'view_scope': 'voisins',         # pastilles : 'local' | 'voisins' | 'distance' | 'plancher'
     'scope_dist': 6.0,               # distance de voisinage (m) : local + second plan
@@ -2653,8 +2654,7 @@ NAVIGATION  (vue A ou B)
   Flèches (Maj = pas large) .. tourner
   Origine (Home) ............. redresser la vue
   Entrée, ou Espace bref ..... avancer vers la pastille la plus centrale
-  Espace + glisser ........... DÉPLACER EN PLAN la bulle visée (hors pastille :
-                               la bulle active), le long de X ou de Y
+  Espace + glisser ........... DÉPLACER EN PLAN la station active (voir plus bas)
   Retour arrière ............. revenir à la bulle précédente
   En-tête de chaque vue ...... Retour, Origine, H et Δ lus de la bulle de la vue ;
                                celui de B lie les deux vues (face à face,
@@ -2665,11 +2665,17 @@ NAVIGATION  (vue A ou B)
   Ctrl+Z ..................... annuler la dernière opération (navigation,
                                correction, bulle ouverte en B)
 
-CORRIGER SANS LE MODE ÉDITION
-  Alt + molette .............. Δ (delta plancher) de la pastille survolée,
-                               ou de la bulle de la vue hors pastille
-  Maj + molette .............. H (hauteur station), idem
-  Espace + glisser ........... position en plan (X ou Y)
+CORRIGER SANS LE MODE ÉDITION — seule la STATION ACTIVE (vue A) est modifiée
+  Alt + molette .............. Δ (delta plancher) de la station active
+  Maj + molette .............. H (hauteur station) de la station active
+  Espace + glisser dans A .... position en plan, libre dans toutes les directions :
+                               on « attrape » le sol ; les pastilles d'avant
+                               restent visibles en transparence
+  Espace + glisser dans B .... la pastille de la station active suit le curseur ;
+                               sa position CSV d'origine reste en transparence
+  X / Y (pendant Espace) ..... verrouiller un axe (2e appui : libre)
+  Corriger une voisine ....... Ctrl+clic dessus (elle s'ouvre en B), puis I
+                               pour l'échanger avec A : elle devient active
   Pas de la molette .......... 5 cm (1 cm possible, dans Réglages)
   Mire ....................... empreinte au sol (50 cm) et mire graduée du sol
                                à la caméra, sur la bulle de l'autre vue et la
@@ -2686,7 +2692,9 @@ AFFICHAGE
   Filtres › Local ............ choisir un local dans la liste
   Menu « Affichage » ......... étiquettes (nom, distance, H / Δ / Z), couleur
                                par local ou par lien, pastille au sol ou au
-                               point de vue, regarder d'où l'on vient
+                               point de vue, regarder d'où l'on vient,
+                               infobulle au survol (courte ; masquée pendant
+                               une modification)
   F11 / Échap ................ plein écran
   V .......................... afficher le visualiseur
   F1 ou ? .................... cette aide
@@ -3440,10 +3448,119 @@ class BubbleNavApp(_TkBase):
                                record=not burst)
         self._after_edit(moved=True)
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        self._set_status(f"{self._nom(st.idx)} : " + (
+        self._set_status(f"Station active {self._nom(st.idx)} : " + (
             f"hauteur station {st.height(eye):.3f} (caméra seule)" if comp == 'dh'
             else f"delta plancher {st.delta(eye):+.3f} (caméra et sol)")
             + f" · Z {st.z:.3f}", COLORS['edit'])
+
+    # ── déplacement en plan de la station active (Espace + glisser) ────
+    def _ground_rel(self, view: View, cam: Station, x: float, y: float,
+                    dz: float) -> Optional[Tuple[float, float]]:
+        """Point du plan d'altitude relative `dz` visé à l'écran (Est, Nord) / caméra."""
+        res = ground_from_screen(view, x, y, self.calib, cam.north_pct, dz, max_dist=60.0)
+        if res is None:
+            return None
+        az, dist = res
+        a = math.radians(az)
+        return dist * math.sin(a), dist * math.cos(a)
+
+    def start_plan_drag(self, event, view: View, cam_idx: int, mode: str) -> bool:
+        """Début d'un déplacement en plan de la STATION ACTIVE.
+
+        mode 'monde' (vue A) : on tire le terrain, la station part en sens
+        inverse ; le point du sol saisi reste sous le curseur.
+        mode 'pastille' (vue B) : la pastille de la station active suit le
+        curseur sur son sol.
+        Libre dans toutes les directions ; X / Y verrouillés le contraignent.
+        """
+        st = self.station()
+        if st is None or not (0 <= cam_idx < len(self.stations)):
+            return False
+        cam = self.stations[cam_idx]
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        dz = -st.height(eye) if mode == 'monde' else st.ground(eye) - cam.z
+        v = dc_replace(view)
+        p0 = self._ground_rel(v, cam, event.x, event.y, dz)
+        if p0 is None:
+            self._set_status("Espace + glisser : visez le sol (vers le bas de l'image)",
+                             COLORS['warning'])
+            return False
+        self.corrections.apply(st)                    # état avant le geste
+        self._hs_drag = ('plan', {'idx': st.idx, 'start': (st.x, st.y), 'p0': p0,
+                                  'dz': dz, 'cam': cam_idx, 'view': v, 'mode': mode})
+        # fantômes : où étaient les pastilles avant le geste (vue A)
+        self._ghosts = ([(h.col, h.row, h.radius, self.hotspot_color(h.link,
+                          self.stations[h.link.target]), h.foot is not None)
+                         for h in self.hotspots] if mode == 'monde' else [])
+        self._draw_overlay()
+        return True
+
+    def _drag_plan(self, event) -> None:
+        info = self._hs_drag[1]
+        st = self.stations[info['idx']]
+        cam = self.stations[info['cam']]
+        p = self._ground_rel(info['view'], cam, event.x, event.y, info['dz'])
+        if p is None:
+            return
+        dx, dy = p[0] - info['p0'][0], p[1] - info['p0'][1]
+        if info['mode'] == 'monde':                  # on tire le terrain
+            dx, dy = -dx, -dy
+        axis = self._locked_axis()
+        if axis == 'x':
+            dy = 0.0
+        elif axis == 'y':
+            dx = 0.0
+        x0, y0 = info['start']
+        self.corrections.apply(st, x=round(x0 + dx, 3), y=round(y0 + dy, 3), record=False)
+        self._draw_overlay()
+        self._redraw_compare()
+        self._draw_plan()
+        self._refresh_ctrlbar()
+        self._set_status(f"Station active {self._nom(st.idx)} : ΔX {st.x - st.ox:+.3f}  "
+                         f"ΔY {st.y - st.oy:+.3f} m depuis le CSV", COLORS['edit'])
+
+    def _end_plan_drag(self) -> None:
+        info = self._hs_drag[1]
+        self._hs_drag = None
+        self._ghosts = []
+        st = self.stations[info['idx']]
+        if self.corrections.drop_if_unchanged(st):
+            if self.journal and self.journal[-1] == ('edit',):
+                self.journal.pop()
+            self._draw_overlay()
+            return
+        self._after_edit(moved=True)
+
+    def ghost_of_active(self, canvas, view: View, cam: Station) -> None:
+        """Vue B : position d'origine (CSV) de la station active, en transparence,
+        reliée à sa position corrigée."""
+        st = self.station()
+        if st is None or st.idx == cam.idx or not (st.moved() or st.z_changed()):
+            return
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        h0 = st.h0 if st.h0 is not None else eye
+        vue = self.anchor() == 'vue'
+        z0 = st.oz if vue else st.oz - h0
+        z1 = st.z if vue else st.ground(eye)
+        a = project_point(view, self.calib, cam.north_pct, st.ox - cam.x, st.oy - cam.y,
+                          z0 - cam.z)
+        b = project_point(view, self.calib, cam.north_pct, st.x - cam.x, st.y - cam.y,
+                          z1 - cam.z)
+        if a is None or a[2] < 0.05:
+            return
+        d = max(0.35, math.hypot(st.ox - cam.x, st.oy - cam.y))
+        r_min, r_max = self.disc_bounds()
+        r = clamp(view.focal() * float(self.cfg.get('disc_radius', DISC_RADIUS_M)) / d,
+                  r_min, r_max)
+        if b is not None and b[2] > 0.05:
+            canvas.create_line(a[0], a[1], b[0], b[1], fill=COLORS['edit'], width=2,
+                               dash=(4, 3), tags='hs')
+        if self.relief():
+            photo, ax, ay = self._sprite(local_color(st.parts().local or st.floor), r,
+                                         False, alpha=0.35, floating=vue)
+            canvas.create_image(a[0] - ax, a[1] - ay, anchor='nw', image=photo, tags='hs')
+        canvas.create_text(a[0], a[1] - SPHERE_RADIUS * r - 8, text="origine CSV",
+                           fill=MARK_TEXT, font=F_TINY, tags='hs')
 
     def wheel_step(self) -> float:
         """Pas de la molette pour H et Δ (Réglages : 1 ou 5 cm, 5 par défaut)."""
@@ -3451,17 +3568,19 @@ class BubbleNavApp(_TkBase):
         return v if v and v > 0 else 0.05
 
     def wheel_alt(self, event, hotspots, station_idx: int, direction: int) -> bool:
-        """Alt+molette : Δ, Maj+molette : H — de la pastille survolée, sinon de la bulle
-        de la vue. Retourne True si la molette a servi à cela."""
+        """Alt+molette : Δ, Maj+molette : H — toujours de la STATION ACTIVE (vue A).
+
+        Une seule station est modifiable à la fois, la bulle active : pas de
+        correction accidentelle d'une voisine survolée. Depuis la vue B, on
+        voit la pastille de la station active monter ou descendre.
+        Retourne True si la molette a servi à cela.
+        """
         alt = alt_down(event.state)
         shift = bool(event.state & 0x0001)
         if not (alt or shift):
             return False
-        hit = hotspot_hit(hotspots, event.x, event.y, self.relief())
-        idx = hotspots[hit].link.target if hit is not None else station_idx
-        if idx is None or idx < 0:
-            return True
-        self.adjust_alt(idx, 'ddelta' if alt else 'dh', direction)
+        if self.current >= 0:
+            self.adjust_alt(self.current, 'ddelta' if alt else 'dh', direction)
         return True
 
     # ── mire de hauteur ──────────────────────────────────────────────
@@ -3649,6 +3768,12 @@ class BubbleNavApp(_TkBase):
                              variable=self.focus_var, command=self._set_focus_origin)
         menu.add_command(label="Regarder d'où l'on vient  (O)", command=self.look_back)
         menu.add_separator()
+        self.tip_var = tk.BooleanVar(value=bool(self.cfg.get('show_tooltip', True)))
+        menu.add_checkbutton(label="Infobulle au survol des pastilles", variable=self.tip_var,
+                             command=lambda: (self.cfg.__setitem__('show_tooltip',
+                                                                   bool(self.tip_var.get())),
+                                              self.canvas.delete('tip'),
+                                              self.compare and self.compare.canvas.delete('tip')))
         self.mire_var = tk.BooleanVar(value=bool(self.cfg.get('show_mire', True)))
         menu.add_checkbutton(label="Mire de hauteur (empreinte au sol, sol → caméra)",
                              variable=self.mire_var,
@@ -4687,15 +4812,20 @@ class BubbleNavApp(_TkBase):
         if view is None or self.current < 0:
             return
         self.hotspots = self._compute_hotspots(view)
-        espace = bool(self._hs_drag and self._hs_drag[0] == 'axe'
-                      and self._hs_drag[1].get('space'))
+        espace = bool(self._hs_drag and self._hs_drag[0] == 'plan')
         if self.edit_mode:
             self._draw_edit_refs(view)
             self._draw_axes(view)
-        elif espace:
-            self._draw_axes(view)               # déplacement en plan (Espace)
         else:
             self._axis_hits = []
+            self._axis_labels = []
+        if espace:                               # avant le geste, en transparence
+            for col, row, rad, color, flot in getattr(self, '_ghosts', []):
+                if self.relief():
+                    photo, ax, ay = self._sprite(color, rad, False, alpha=0.30,
+                                                 floating=flot)
+                    self.canvas.create_image(col - ax, row - ay, anchor='nw', image=photo,
+                                             tags='hs')
         libres = self.declutter(self.hotspots)
         mires = set(self.mire_targets(self.current,
                                       self.compare.idx if self.compare is not None else None,
@@ -4768,7 +4898,7 @@ class BubbleNavApp(_TkBase):
                 text="ÉDITION — glisser pastille ou axe : déplacement sur un axe "
                      "(X/Y/Z verrouille) · Ctrl : bulle active · Maj : tourner l'image")
             self._axis_readout(view)
-        elif self._hs_drag and self._hs_drag[0] == 'axe' and self._hs_drag[1].get('space'):
+        elif self._hs_drag and self._hs_drag[0] == 'plan':
             self._axis_readout(view)
         # rose des vents : direction du nord dans la vue
         pr = project(view, self.calib.pano_yaw(0.0, st.north_pct), 0.0)
@@ -4817,42 +4947,38 @@ class BubbleNavApp(_TkBase):
                                     fill=COLORS['sel'], font=F_UI, tags='hs')
 
     def tooltip_lines(self, hs: "Hotspot", origin: Optional[Station]) -> Tuple[List[str], bool]:
-        """Contenu de l'infobulle d'une pastille vue depuis `origin`."""
+        """Infobulle courte : nom, distance, altitude ; le détail est dans le panneau."""
         lk = hs.link
         tgt = self.stations[lk.target]
-        p = tgt.parts()
-        sens = {'same': 'même plancher', 'up': 'niveau au-dessus',
-                'down': 'niveau en dessous'}[lk.kind]
-        lines = [
-            tgt.locator,
-            f"photo        {tgt.photo}"
-            + (f"   (clé {tgt.key})" if tgt.key_explicit or tgt.key != tgt.photo else ''),
-            f"local        {p.local or '—'}   étage {p.etage or '—'}   "
-            f"index {p.index or '—'}",
-            f"prise de vue {p.date_lisible() or '—'}",
-            f"distance 3D  {lk.dist:.2f} m",
-            f"horizontale  {lk.dist_h:.2f} m",
-            f"Δ altitude   {lk.dz:+.2f} m",
-            f"azimut       {lk.azimuth:+.1f}°",
-            f"X / Y / Z    {tgt.x:.2f} / {tgt.y:.2f} / {tgt.z:.2f}",
-            f"plancher     {tgt.floor}  ({sens})",
-            f"image        {'présente' if self.store.has(tgt.photo) else 'ABSENTE'}",
-        ]
-        if origin is not None and origin.idx != tgt.idx:
-            lines.append(f"cap depuis   {self.calib.pano_yaw(lk.azimuth, origin.north_pct):+.1f}°"
-                         " dans l'image")
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        scan = tgt.key_explicit and tgt.key and tgt.key != tgt.locator
+        sens = {'same': '', 'up': '  ▲ niveau au-dessus', 'down': '  ▼ niveau en dessous'}
+        lines = [f"{tgt.key} · {tgt.locator}" if scan else tgt.locator,
+                 f"{lk.dist:.2f} m   Δz {lk.dz:+.2f}{sens[lk.kind]}",
+                 f"H {tgt.height(eye):.2f}   Δ {tgt.delta(eye):+.2f}   Z {tgt.z:.2f}"]
+        if not self.store.has(tgt.photo):
+            lines.append("image absente")
         if tgt.modified():
             marks = []
             if tgt.moved():
-                marks.append(f"XY déplacé de {math.hypot(tgt.x - tgt.ox, tgt.y - tgt.oy):.2f} m")
+                marks.append(f"XY {math.hypot(tgt.x - tgt.ox, tgt.y - tgt.oy):.2f} m")
             if tgt.raised():
-                marks.append(f"hauteur {tgt.dh:+.3f} m")
+                marks.append(f"H {tgt.dh:+.2f}")
             if tgt.shifted():
-                marks.append(f"delta {tgt.ddelta:+.3f} m")
+                marks.append(f"Δ {tgt.ddelta:+.2f}")
             if tgt.turned():
-                marks.append(f"image tournée de {tgt.yaw_fix:+.2f}°")
-            lines.append("modifié      " + ' · '.join(marks))
+                marks.append(f"nord {tgt.yaw_fix:+.1f}°")
+            lines.append("corrigée : " + ' · '.join(marks))
         return lines, tgt.modified()
+
+    def tooltip_allowed(self) -> bool:
+        """Infobulle au survol : affichable ou non, et jamais pendant une correction."""
+        if not self.cfg.get('show_tooltip', True):
+            return False
+        if self._hs_drag is not None:
+            return False
+        last = getattr(self, '_last_adj', None)
+        return last is None or time.monotonic() - last[2] > 1.5
 
     @staticmethod
     def draw_tooltip(canvas, x: int, y: int, lines: List[str], width: int, height: int,
@@ -4883,8 +5009,9 @@ class BubbleNavApp(_TkBase):
         self.canvas.delete('tip')
         if hit is None or hit >= len(self.hotspots):
             return
+        if not self.tooltip_allowed():
+            return
         lines, modified = self.tooltip_lines(self.hotspots[hit], self.station())
-        lines.append("Ctrl+clic    sonder : face à face dans la vue B")
         self.draw_tooltip(self.canvas, x, y, lines, self.view.width, self.view.height,
                           modified)
 
@@ -4899,16 +5026,11 @@ class BubbleNavApp(_TkBase):
         self._press_xy = (event.x, event.y)
         self._hs_drag = None
         if getattr(self, '_space_down', False) and self.current >= 0:
-            # Espace + glisser : la bulle visée (ou la bulle active, hors
-            # pastille) se déplace en plan, sur l'axe X ou Y choisi par le geste
+            # Espace + glisser : la station active se déplace en plan, librement ;
+            # on tire le terrain, les pastilles suivent le curseur
             self._space_used = True
-            hit = self._hotspot_at(event.x, event.y)
-            tgt = self.stations[self.hotspots[hit].link.target] if hit is not None \
-                else self.station()
-            self.selected = tgt.idx if hit is not None else None
-            axis = self._locked_axis()
-            if self._start_axis_drag(tgt, event, axis if axis in ('x', 'y') else None):
-                self._hs_drag[1]['space'] = True
+            if self.start_plan_drag(event, self._frame_view or self.view, self.current,
+                                    'monde'):
                 return
         if self.edit_mode and self.current >= 0:
             st = self.station()
@@ -5912,6 +6034,9 @@ class BubbleNavApp(_TkBase):
 
     def _drag_edit(self, event) -> None:
         kind = self._hs_drag[0]
+        if kind == 'plan':
+            self._drag_plan(event)
+            return
         if kind == 'yaw':
             _, idx, start, x0 = self._hs_drag
             st = self.stations[idx]
@@ -5966,6 +6091,9 @@ class BubbleNavApp(_TkBase):
 
     def _end_edit_drag(self) -> None:
         kind = self._hs_drag[0] if self._hs_drag else None
+        if kind == 'plan':
+            self._end_plan_drag()
+            return
         if kind == 'axe' and self._hs_drag[1].get('space') and not self.edit_mode:
             self.after_idle(lambda: setattr(self, 'selected', None))
         moved = kind == 'axe' and self._hs_drag[1]['axis'] is not None
@@ -7550,6 +7678,7 @@ class CompareView(tk.Frame if _TK_OK else object):
                            labels=i in libres, mire=tgt.idx in mires)
         me = self.station()
         if me is not None:
+            app.ghost_of_active(self.canvas, view, me)
             par_bulle = {h.link.target: (k, h) for k, h in enumerate(self.hotspots)}
             for idx in app.mire_targets(self.idx, app.current, self.hotspots, self._hover):
                 k, h = par_bulle.get(idx, (None, None))
@@ -7599,11 +7728,23 @@ class CompareView(tk.Frame if _TK_OK else object):
 
     # ── interactions ─────────────────────────────────────────────────
     def _on_press(self, event) -> None:
+        self._press_xy = (event.x, event.y)
+        app = self.app
+        if getattr(app, '_space_down', False) and app.current >= 0 and self.idx != app.current:
+            # Espace + glisser dans B : la pastille de la station active suit le curseur
+            app._space_used = True
+            if app.start_plan_drag(event, self._frame_view or self.view, self.idx,
+                                   'pastille'):
+                self._drag = None
+                return
         self._drag = (event.x, event.y, self.view.yaw, self.view.pitch,
                       self.app.view.yaw, self.app.view.pitch)
-        self._press_xy = (event.x, event.y)
 
     def _on_drag(self, event) -> None:
+        hd = self.app._hs_drag
+        if hd is not None and hd[0] == 'plan' and hd[1]['mode'] == 'pastille':
+            self.app._drag_plan(event)
+            return
         if self._drag is None:
             return
         x0, y0, yaw0, pitch0, ayaw0, apitch0 = self._drag
@@ -7621,6 +7762,10 @@ class CompareView(tk.Frame if _TK_OK else object):
             self.request_render(interactive=True)
 
     def _on_release(self, event) -> None:
+        hd = self.app._hs_drag
+        if hd is not None and hd[0] == 'plan' and hd[1]['mode'] == 'pastille':
+            self.app._end_plan_drag()
+            return
         moved = 0
         if getattr(self, '_press_xy', None):
             moved = abs(event.x - self._press_xy[0]) + abs(event.y - self._press_xy[1])
@@ -7649,8 +7794,9 @@ class CompareView(tk.Frame if _TK_OK else object):
         self.canvas.delete('tip')
         if hit is None or hit >= len(self.hotspots):
             return
+        if not self.app.tooltip_allowed():
+            return
         lines, modified = self.app.tooltip_lines(self.hotspots[hit], self.station())
-        lines.append("Ctrl+clic    sonder : face à face dans la vue A")
         self.app.draw_tooltip(self.canvas, x, y, lines, self.view.width, self.view.height,
                               modified)
 

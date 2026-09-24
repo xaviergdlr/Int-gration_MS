@@ -165,7 +165,7 @@ relevé déjà renommé.
 | Glisser | tourner la vue |
 | Molette, `+` / `−` | champ de vision, de 30° à **200°** (105° par défaut), avec un **cran à 120°** ; au-delà de 110°, passage progressif en **grand angle** |
 | Bouton **120°** (à côté du champ) | les **deux vues** à 120° |
-| **Espace + glisser** | **déplacer en plan** la bulle visée, le long de X ou de Y (axe choisi par le geste, ou verrouillé par X / Y). Hors pastille : la bulle active. Sans passer par le mode édition. Un **appui bref** sur Espace avance vers la pastille centrale |
+| **Espace + glisser** | **déplacer en plan la station active**, librement dans toutes les directions (X / Y verrouillent un axe). Sans passer par le mode édition. Un **appui bref** sur Espace avance vers la pastille centrale |
 | Double-clic | recentrer la vue sur ce point |
 | `Entrée` / `Espace` | avancer vers la pastille la plus centrale |
 | `Retour arrière` | revenir à la bulle précédente |
@@ -350,8 +350,11 @@ segments de tête change. Un nom incomplet est signalé (`nom incomplet : date
 absente`) sans jamais bloquer, et le nombre de noms incomplets apparaît dans la
 barre d'état au chargement.
 
-Le survol d'une pastille ajoute une infobulle avec les mêmes attributs plus
-l'azimut et le cap dans l'image.
+Une infobulle **courte** (3 lignes) : n° de scan et locator ; distance et Δz ;
+H, Δ et Z — plus « image absente » ou la correction déjà appliquée. Elle se
+coupe dans **Affichage › Infobulle au survol des pastilles**, et se masque
+d'elle-même pendant une modification (Espace + glisser, et 1,5 s après un coup
+de molette) pour laisser voir le résultat.
 
 ### Filtres des pastilles  (touche F)
 Un panneau repliable, à droite, restreint ce qui est affiché **en direct** — les
@@ -429,11 +432,13 @@ dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
    * la mire monte du sol à la caméra, graduée tous les 10 cm (trait plus long
      tous les 50 cm) ;
    * les valeurs sont affichées : sol, Δ, H, Z.
-3. **Corriger** en continu :
-   * **Alt + molette** sur une pastille : son **Δ** (sol et caméra montent ou
-     descendent ensemble) ;
+3. **Corriger** en continu — **seule la station active (celle de la vue A)
+   est modifiable**, où que soit le curseur, dans A comme dans B :
+   * **Alt + molette** : son **Δ** (sol et caméra montent ou descendent
+     ensemble) ;
    * **Maj + molette** : sa **H** (la caméra seule) ;
-   * hors pastille, la molette agit sur la bulle de la vue elle-même ;
+   * pour corriger la voisine sondée, **I** l'échange avec A : elle devient
+     active ;
    * l'en-tête de chaque vue affiche en permanence H et Δ de sa bulle.
 
    Le pas de la molette est de **5 cm** (1 cm au choix, dans Réglages). Une rafale
@@ -449,12 +454,19 @@ la molette). Celui de B porte en plus
 les commandes qui **lient les deux vues** : ⇆ Face à face · ⇄ Inverser ·
 A → B · B → A · Suivi de A · Vue liée. Les valeurs corrigées passent en orange.
 
-**Déplacer en plan sans le mode édition** : maintenir **Espace** et glisser une
-pastille la déplace le long de X ou de Y. L'axe est choisi par le début du
-geste, ou verrouillé par les touches X / Y. Le repère gradué et la lecture
-ΔX / ΔY s'affichent pendant le geste, et Ctrl+Z l'annule. Hors pastille, c'est
-la bulle active qui se déplace. Avec Alt / Maj + molette pour Δ / H, tout se
-corrige donc sans changer de mode.
+**Déplacer en plan sans le mode édition** — toujours la **station active**,
+en X / Y seulement (le Z se règle à la molette) :
+* **dans A** : maintenir **Espace** et glisser en visant le sol. On « attrape »
+  le sol et le monde suit la main, dans **toutes les directions** ; les
+  pastilles d'avant le geste restent affichées **en transparence**, pour voir
+  le point de vue se décaler par rapport à elles ;
+* **dans B** (après un Ctrl+clic sur une voisine) : Espace + glisser, et la
+  pastille de la station active **suit le curseur** au sol ; sa position CSV
+  d'origine reste visible en transparence (« origine CSV », trait pointillé) ;
+* **X / Y** verrouillent un axe si besoin (2e appui : libre) ;
+* la lecture ΔX / ΔY par rapport au CSV s'affiche pendant le geste ; le geste
+  entier s'annule d'un **Ctrl+Z**.
+Avec Alt / Maj + molette pour Δ / H, tout se corrige donc sans changer de mode.
 
 **Bulle corrigée** : elle garde la couleur de son local ; ce sont son nom et
 sa distance qui passent en **orange** (sur le plan, point cerclé d'orange).
@@ -491,7 +503,6 @@ en propre.
 * sur une pastille de **B**, la bulle s'ouvre dans **A** ;
 * sur un point du **plan** (clic droit sans glisser), la bulle s'ouvre dans **B**.
 
-L'infobulle des pastilles le rappelle (« clic droit : ouvrir dans la vue B / A »).
 Sous macOS, le bouton 2 est aussi accepté.
 
 * **Vue liée** (par défaut) : les deux vues regardent en permanence la **même
@@ -670,9 +681,11 @@ Tant que le lot n'est pas lancé, tout reste réversible.
   est signalée et ignorée, jamais bloquante.
 
 ### Survol d'une pastille
-Une infobulle donne le nom, le fichier photo, la **distance 3D**, la distance
-horizontale, le Δ altitude, l'azimut, les coordonnées, le plancher, la présence
-de l'image et, le cas échéant, la correction déjà appliquée.
+Une infobulle **courte** (3 lignes) : n° de scan et locator ; distance et Δz ;
+H, Δ et Z — plus « image absente » ou la correction déjà appliquée. Elle se
+coupe dans **Affichage › Infobulle au survol des pastilles**, et se masque
+d'elle-même pendant une modification (Espace + glisser, et 1,5 s après un coup
+de molette) pour laisser voir le résultat.
 
 ## 7. Performance
 
