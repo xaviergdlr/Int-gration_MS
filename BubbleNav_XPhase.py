@@ -65,6 +65,8 @@ FOV_MIN, FOV_MAX = 30.0, 200.0
 # les formes et permet de voir bien plus large, jusqu'à 200°.
 WIDE_START, WIDE_FULL = 110.0, 160.0
 FOV_DEFAULT = 105.0            # vue large demandee
+FOV_SNAP = 120.0               # cran aimanté du champ (bouton « 120° »)
+FOV_SNAP_TOL = 3.0
 PITCH_MIN, PITCH_MAX = -89.0, 89.0
 PITCH_DEFAULT = -20.0          # les pastilles au sol sont sous l'horizon
 DRAG_SCALE = 0.5               # sous-echantillonnage pendant la manipulation
@@ -2595,11 +2597,17 @@ NAVIGATION  (vue A ou B)
                                les deux se font face (chacune voit l'autre)
   Glisser .................... tourner la vue
   Double-clic ................ recentrer la vue sur ce point
-  Molette, + / - ............. champ de vision, 30° à 200° (grand angle > 110°)
+  Molette, + / - ............. champ de vision, 30° à 200° (grand angle > 110°),
+                               cran à 120° ; bouton « 120° » : les deux vues
   Flèches (Maj = pas large) .. tourner
   Origine (Home) ............. redresser la vue
-  Entrée ou Espace ........... avancer vers la pastille la plus centrale
+  Entrée, ou Espace bref ..... avancer vers la pastille la plus centrale
+  Espace + glisser ........... DÉPLACER EN PLAN la bulle visée (hors pastille :
+                               la bulle active), le long de X ou de Y
   Retour arrière ............. revenir à la bulle précédente
+  En-tête de chaque vue ...... Retour, Origine, H et Δ de la bulle de la vue ;
+                               celui de B lie les deux vues (face à face,
+                               inverser, A → B, B → A)
   O .......................... regarder d'où l'on vient
   G .......................... face à face : A regarde B, B regarde A
   I .......................... inverser A et B (bulles et regards)
@@ -2958,7 +2966,6 @@ class BubbleNavApp(_TkBase):
         self.viewer.withdraw()
 
         self._build_toolbar(self.viewer)
-        self._build_ctrlbar(self.viewer)
 
         body = tk.Frame(self.viewer, bg=COLORS['bg_dark'])
         body.pack(fill='both', expand=True)
@@ -2974,6 +2981,12 @@ class BubbleNavApp(_TkBase):
         self.views.pack(side='left', fill='both', expand=True)
         self.pane_a = tk.Frame(self.views, bg=COLORS['bg_dark'])
         self.views.add(self.pane_a, minsize=160, stretch='always')
+        head = tk.Frame(self.pane_a, bg=COLORS['bg_medium'])
+        head.pack(fill='x', side='top')
+        tk.Label(head, text="Vue A", font=F_TITLE, bg=COLORS['bg_medium'],
+                 fg=COLORS['hot']).pack(side='left', padx=(10, 8), pady=3)
+        self.ctrl_vals: Dict[Tuple[str, str], tk.Label] = {}
+        self.build_view_header(head, 'A')
         self.canvas = tk.Canvas(self.pane_a, bg='#101010', highlightthickness=0,
                                 cursor='fleur')
         self.canvas.pack(fill='both', expand=True)
@@ -3167,64 +3180,61 @@ class BubbleNavApp(_TkBase):
                 n += 1
         return n
 
-    def _build_ctrlbar(self, parent) -> None:
-        """Barre de contrôle : navigation A / B et réglage fin de H et Δ.
+    def build_view_header(self, bar, which: str) -> None:
+        """En-tête d'une vue (A ou B) : les mêmes commandes, pour la bulle de cette vue.
 
-        Tout ce qu'il faut pour vérifier et corriger les altitudes sans
-        passer par le mode édition : les deux bulles comparées, leur hauteur
-        et leur delta, ajustables au pas choisi.
+        Retour et Origine, puis la hauteur H et le delta Δ de la bulle affichée,
+        avec − / +. L'en-tête de B porte en plus les commandes qui lient A et B.
         """
-        bar = tk.Frame(parent, bg=COLORS['bg_dark'])
-        bar.pack(fill='x', side='top')
         mk = self._mk_button
+        if which == 'A':
+            back, origin = self.go_back, self.look_back
+        else:
+            back = lambda: self.compare and self.compare.go_back()
+            origin = lambda: self.compare and self.compare.look_back()
         for txt, cmd, tip in (
-                ("◀ Retour", self.go_back, "Revenir à la bulle précédente (Retour arrière)."),
-                ("↩ Origine", self.look_back, "Regarder d'où l'on vient (O)."),
-                ("⇆ Face à face", self.face_a_face,
-                 "A regarde B et B regarde A : chaque vue montre la pastille de l'autre (G)."),
-                ("⇄ Inverser", self.swap_ab,
-                 "Échanger A et B, bulles et regards compris (I)."),
-                ("A → B", self.a_to_b, "Mettre dans B la bulle et le regard de A."),
-                ("B → A", self.b_to_a, "Mettre dans A la bulle et le regard de B.")):
-            mk(bar, txt, cmd, tip=tip).pack(side='left', padx=(6 if txt.startswith('◀') else 2, 2),
-                                            pady=3)
+                ("◀ Retour", back, f"Vue {which} : revenir à la bulle précédente."),
+                ("↩ Origine", origin, f"Vue {which} : regarder d'où l'on vient (O dans A).")):
+            mk(bar, txt, cmd, tip=tip).pack(side='left', padx=2, pady=3)
+        if which == 'B':
+            for txt, cmd, tip in (
+                    ("⇆ Face à face", self.face_a_face,
+                     "A regarde B et B regarde A : chaque vue montre la pastille de l'autre (G)."),
+                    ("⇄ Inverser", self.swap_ab, "Échanger A et B, bulles et regards compris (I)."),
+                    ("A → B", self.a_to_b, "Mettre dans B la bulle et le regard de A."),
+                    ("B → A", self.b_to_a, "Mettre dans A la bulle et le regard de B.")):
+                mk(bar, txt, cmd, tip=tip).pack(side='left', padx=2, pady=3)
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y', padx=6, pady=5)
-        self.ctrl_vals: Dict[Tuple[str, str], tk.Label] = {}
-        self.ctrl_btns: List[tk.Button] = []
-        for which, col in (('A', COLORS['hot']), ('B', COLORS['sel'])):
-            name = tk.Label(bar, text=which, font=F_UI_B, bg=COLORS['bg_dark'], fg=col,
-                            width=14, anchor='e')
-            name.pack(side='left', padx=(6, 2))
-            self.ctrl_vals[(which, 'name')] = name
-            for comp, lib, tip in (('dh', 'H', "hauteur station : la caméra bouge"),
-                                   ('ddelta', 'Δ', "delta plancher : caméra et sol bougent")):
-                b = mk(bar, "−", lambda w=which, c=comp: self.adjust_alt(w, c, -1),
-                       tip=f"{which} : {tip}, − un pas")
-                b.config(padx=5)
-                b.pack(side='left')
-                val = tk.Label(bar, text=f"{lib} —", font=F_MONO, bg=COLORS['bg_dark'],
-                               fg=COLORS['text'], width=9)
-                val.pack(side='left')
-                b2 = mk(bar, "+", lambda w=which, c=comp: self.adjust_alt(w, c, +1),
-                        tip=f"{which} : {tip}, + un pas")
-                b2.config(padx=5)
-                b2.pack(side='left', padx=(0, 4))
-                self.ctrl_vals[(which, comp)] = val
-                if which == 'B':
-                    self.ctrl_btns += [b, b2]
-        tk.Label(bar, text="pas", font=F_UI, bg=COLORS['bg_dark'],
-                 fg=COLORS['text_muted']).pack(side='left', padx=(8, 2))
-        fs = str(self.cfg.get('fine_step', '0.01'))
-        self.fine_step_var = tk.StringVar(value=fs)
-        cb = ttk.Combobox(bar, textvariable=self.fine_step_var, width=6, state='readonly',
-                          style='BN.TCombobox', values=('0.001', '0.005', '0.01', '0.05', '0.10'))
-        cb.pack(side='left', pady=3)
-        cb.bind('<<ComboboxSelected>>',
-                lambda e: self.cfg.__setitem__('fine_step', self.fine_step_var.get()))
-        Tooltip(cb, "Pas des réglages rapides de H et Δ (m), boutons et Alt / Maj + molette.")
-        tk.Label(bar, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'],
-                 text="Ctrl+clic sonde · Alt / Maj+molette : Δ / H"
-                 ).pack(side='left', padx=6)
+        name = tk.Label(bar, text=which, font=F_UI_B, bg=COLORS['bg_medium'],
+                        fg=COLORS['hot'] if which == 'A' else COLORS['sel'], anchor='w')
+        name.pack(side='left', padx=(2, 6))
+        self.ctrl_vals[(which, 'name')] = name
+        for comp, lib, tip in (('dh', 'H', "hauteur station : la caméra bouge"),
+                               ('ddelta', 'Δ', "delta plancher : caméra et sol bougent")):
+            b1 = mk(bar, "−", lambda w=which, c=comp: self.adjust_alt(w, c, -1),
+                    tip=f"Vue {which} : {tip}, − un pas")
+            b1.config(padx=5)
+            b1.pack(side='left')
+            val = tk.Label(bar, text=f"{lib} —", font=F_MONO, bg=COLORS['bg_medium'],
+                           fg=COLORS['text'], width=9)
+            val.pack(side='left')
+            b2 = mk(bar, "+", lambda w=which, c=comp: self.adjust_alt(w, c, +1),
+                    tip=f"Vue {which} : {tip}, + un pas")
+            b2.config(padx=5)
+            b2.pack(side='left', padx=(0, 4))
+            self.ctrl_vals[(which, comp)] = val
+        if which == 'A':
+            tk.Label(bar, text="pas", font=F_UI, bg=COLORS['bg_medium'],
+                     fg=COLORS['text_muted']).pack(side='left', padx=(8, 2))
+            self.fine_step_var = tk.StringVar(value=str(self.cfg.get('fine_step', '0.01')))
+            cb = ttk.Combobox(bar, textvariable=self.fine_step_var, width=6, state='readonly',
+                              style='BN.TCombobox',
+                              values=('0.001', '0.005', '0.01', '0.05', '0.10'))
+            cb.pack(side='left', pady=3)
+            cb.bind('<<ComboboxSelected>>',
+                    lambda e: self.cfg.__setitem__('fine_step', self.fine_step_var.get()))
+            Tooltip(cb, "Pas des réglages rapides de H et Δ (m), boutons et Alt / Maj + molette.")
+        self._refresh_ctrlbar()
 
     def _refresh_ctrlbar(self) -> None:
         """Valeurs de la barre de contrôle, relues à chaque changement."""
@@ -3233,6 +3243,12 @@ class BubbleNavApp(_TkBase):
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         b = self.compare.station() if self.compare is not None else None
         for which, st in (('A', self.station()), ('B', b)):
+            lbl = self.ctrl_vals.get((which, 'name'))
+            try:
+                if lbl is None or not lbl.winfo_exists():
+                    continue                    # en-tête de B fermé
+            except Exception:
+                continue
             if st is None:
                 self.ctrl_vals[(which, 'name')].config(text=f"{which} —")
                 self.ctrl_vals[(which, 'dh')].config(text="H —", fg=COLORS['text_muted'])
@@ -3246,9 +3262,6 @@ class BubbleNavApp(_TkBase):
             self.ctrl_vals[(which, 'ddelta')].config(
                 text=f"Δ {st.delta(eye):+.3f}",
                 fg=COLORS['edit'] if st.shifted() else COLORS['text'])
-        state = 'normal' if b is not None else 'disabled'
-        for btn in self.ctrl_btns:
-            btn.config(state=state)
 
     # ── sonder, face à face, inverser ────────────────────────────────
     def _aim_a(self, idx: int) -> None:
@@ -3504,7 +3517,7 @@ class BubbleNavApp(_TkBase):
                  font=F_UI).pack(side='left', padx=(2, 2))
         self.fov_var = tk.DoubleVar(value=self.view.fov)
         self.fov_scale = tk.Scale(bar, from_=FOV_MIN, to=FOV_MAX, resolution=1,
-                                  orient='horizontal', length=150, showvalue=False,
+                                  orient='horizontal', length=110, showvalue=False,
                                   variable=self.fov_var, command=self._on_fov,
                                   bg=COLORS['text_muted'], fg=COLORS['text'],
                                   troughcolor=COLORS['bg_dark'], highlightthickness=0,
@@ -3514,6 +3527,11 @@ class BubbleNavApp(_TkBase):
         self.fov_lbl = tk.Label(bar, text=f"{self.view.fov:.0f}°", width=5,
                                 bg=COLORS['bg_medium'], fg=COLORS['text'], font=F_MONO)
         self.fov_lbl.pack(side='left')
+        b120 = self._mk_button(bar, "120°", self.fov_reset,
+                               tip="Champ de vision à 120° pour les deux vues ; le curseur "
+                                   "et la molette marquent un cran à 120°.")
+        b120.config(padx=6)
+        b120.pack(side='left', padx=(2, 0), pady=4)
 
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
                                                          padx=8, pady=6)
@@ -3700,7 +3718,7 @@ class BubbleNavApp(_TkBase):
             '<Shift-Right>': lambda: self._nudge(yaw=+25),
             '<plus>': lambda: self._zoom(-6), '<KP_Add>': lambda: self._zoom(-6),
             '<minus>': lambda: self._zoom(+6), '<KP_Subtract>': lambda: self._zoom(+6),
-            '<Return>': self._go_forward, '<space>': self._go_forward,
+            '<Return>': self._go_forward,
             '<BackSpace>': self.go_back, '<Home>': self._reset_view,
             '<F11>': self._toggle_fullscreen,
             '<c>': self._toggle_compare, '<C>': self._toggle_compare,
@@ -3725,6 +3743,50 @@ class BubbleNavApp(_TkBase):
         for seq, fn in raccourcis.items():
             self.bind_all(seq, key(fn))
         self.bind_all('<Escape>', key(self._leave_fullscreen))
+        # Espace : tenu, il transforme le glisser en déplacement en plan ;
+        # appui bref sans glisser, il avance comme avant.
+        self._space_down = False
+        self._space_used = False
+        self._space_t = 0.0
+        self._space_job = None
+
+        def sp_press(event):
+            if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Combobox, tk.Spinbox)):
+                return None
+            if self._space_job is not None:        # répétition automatique (X11)
+                self.after_cancel(self._space_job)
+                self._space_job = None
+                return 'break'
+            if not self._space_down:
+                self._space_down, self._space_used = True, False
+                self._space_t = time.monotonic()
+                try:
+                    self.canvas.config(cursor='crosshair')
+                except Exception:
+                    pass
+            return 'break'
+
+        def sp_release(event):
+            if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Combobox, tk.Spinbox)):
+                return None
+            if self._space_job is not None:
+                self.after_cancel(self._space_job)
+            self._space_job = self.after(40, sp_done)
+            return 'break'
+
+        def sp_done():
+            self._space_job = None
+            bref = time.monotonic() - self._space_t < 0.35
+            used = self._space_used
+            self._space_down = False
+            try:
+                self.canvas.config(cursor='fleur')
+            except Exception:
+                pass
+            if bref and not used:
+                self._go_forward()
+        self.bind_all('<KeyPress-space>', sp_press)
+        self.bind_all('<KeyRelease-space>', sp_release)
 
     # ═════════════════════════════════════════════════════════════════
     # DONNEES
@@ -4291,10 +4353,9 @@ class BubbleNavApp(_TkBase):
     def hotspot_color(self, lk: "Link", tgt: Station) -> str:
         """Couleur d'une pastille : par local (défaut) ou par type de lien.
 
-        Image absente et bulle corrigée gardent leur couleur d'alerte.
+        Une bulle corrigée garde sa couleur (c'est son texte qui passe en
+        orange) ; une image absente reste en rouge sombre.
         """
-        if tgt.modified():
-            return COLORS['edit']
         if not self.store.has(tgt.photo):
             return COLORS['plan_missing']
         if self.cfg.get('color_mode', 'local') == 'local':
@@ -4429,6 +4490,7 @@ class BubbleNavApp(_TkBase):
             name += f" · {tgt.locator}"
         if (self.names_var.get() and near) or hovered or tag or selected:
             text(hs.col, top, (tag + '  ' if tag else '') + name,
+                 COLORS['edit'] if tgt.modified() else
                  'white' if hovered or tag else MARK_TEXT,
                  F_TINY_B if hovered or selected or tag else F_TINY)
         y = self.label_y(hs, hovered)
@@ -4436,8 +4498,8 @@ class BubbleNavApp(_TkBase):
             txt = human_dist(lk.dist)
             if hovered and missing:
                 txt += " · image absente"
-            text(hs.col, y, txt, 'white' if hovered else '#e8e8e8',
-                 F_UI_B if hovered else F_UI)
+            text(hs.col, y, txt, COLORS['edit'] if tgt.modified() else
+                 'white' if hovered else '#e8e8e8', F_UI_B if hovered else F_UI)
             y += 13
         if self.heights_var.get() and (near or hovered or selected) and not mire:
             eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
@@ -4481,9 +4543,13 @@ class BubbleNavApp(_TkBase):
         if view is None or self.current < 0:
             return
         self.hotspots = self._compute_hotspots(view)
+        espace = bool(self._hs_drag and self._hs_drag[0] == 'axe'
+                      and self._hs_drag[1].get('space'))
         if self.edit_mode:
             self._draw_edit_refs(view)
             self._draw_axes(view)
+        elif espace:
+            self._draw_axes(view)               # déplacement en plan (Espace)
         else:
             self._axis_hits = []
         libres = self.declutter(self.hotspots)
@@ -4502,7 +4568,7 @@ class BubbleNavApp(_TkBase):
                    "B" if self.compare is not None and tgt.idx == self.compare.idx else '')
             self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing, tag,
                             labels=i in libres, mire=tgt.idx in mires)
-        if self.edit_mode:
+        if self.edit_mode or espace:
             for x, y, txt, col in self._axis_labels:
                 self.canvas.create_text(x + 1, y + 1, text=txt, fill='#000000',
                                         font=F_UI_B, tags='hs')
@@ -4548,6 +4614,8 @@ class BubbleNavApp(_TkBase):
                 fill=COLORS['edit'], font=('Segoe UI', 10, 'bold'),
                 text="ÉDITION — glisser pastille ou axe : déplacement sur un axe "
                      "(X/Y/Z verrouille) · Ctrl : bulle active · Maj : tourner l'image")
+            self._axis_readout(view)
+        elif self._hs_drag and self._hs_drag[0] == 'axe' and self._hs_drag[1].get('space'):
             self._axis_readout(view)
         # rose des vents : direction du nord dans la vue
         pr = project(view, self.calib.pano_yaw(0.0, st.north_pct), 0.0)
@@ -4677,6 +4745,18 @@ class BubbleNavApp(_TkBase):
         self.focus_set()
         self._press_xy = (event.x, event.y)
         self._hs_drag = None
+        if getattr(self, '_space_down', False) and self.current >= 0:
+            # Espace + glisser : la bulle visée (ou la bulle active, hors
+            # pastille) se déplace en plan, sur l'axe X ou Y choisi par le geste
+            self._space_used = True
+            hit = self._hotspot_at(event.x, event.y)
+            tgt = self.stations[self.hotspots[hit].link.target] if hit is not None \
+                else self.station()
+            self.selected = tgt.idx if hit is not None else None
+            axis = self._locked_axis()
+            if self._start_axis_drag(tgt, event, axis if axis in ('x', 'y') else None):
+                self._hs_drag[1]['space'] = True
+                return
         if self.edit_mode and self.current >= 0:
             st = self.station()
             ctrl = bool(event.state & 0x0004)
@@ -4776,15 +4856,34 @@ class BubbleNavApp(_TkBase):
             self.view.pitch = clamp(self.view.pitch + pitch, PITCH_MIN, PITCH_MAX)
         self._request_render(force=True)
 
+    def fov_reset(self) -> None:
+        """Bouton « 120° » : les deux vues au même champ."""
+        self.view.fov = FOV_SNAP
+        self.fov_var.set(FOV_SNAP)
+        self.fov_lbl.config(text=f"{FOV_SNAP:.0f}°")
+        self.cfg['fov'] = FOV_SNAP
+        self._request_render(force=True)
+        if self.compare is not None:
+            self.compare.view.fov = FOV_SNAP
+            self.compare.request_render(force=True)
+
     def _zoom(self, delta: float) -> None:
-        self.view.fov = clamp(self.view.fov + delta, FOV_MIN, FOV_MAX)
+        old = self.view.fov
+        new = clamp(old + delta, FOV_MIN, FOV_MAX)
+        if (old - FOV_SNAP) * (new - FOV_SNAP) < 0:      # cran : on s'arrête à 120°
+            new = FOV_SNAP
+        self.view.fov = new
         self.fov_var.set(self.view.fov)
         self.fov_lbl.config(text=f"{self.view.fov:.0f}°")
         self.cfg['fov'] = self.view.fov
         self._request_render(interactive=True)
 
     def _on_fov(self, _val=None) -> None:
-        self.view.fov = float(self.fov_var.get())
+        v = float(self.fov_var.get())
+        if abs(v - FOV_SNAP) <= FOV_SNAP_TOL and v != FOV_SNAP:   # cran aimanté
+            v = FOV_SNAP
+            self.fov_var.set(v)
+        self.view.fov = v
         self.fov_lbl.config(text=f"{self.view.fov:.0f}°")
         self.cfg['fov'] = self.view.fov
         self._request_render(interactive=True)
@@ -5555,7 +5654,7 @@ class BubbleNavApp(_TkBase):
 
     def _lock_axis(self, axis: str) -> None:
         """Touches X / Y / Z : verrouille l'axe (seconde pression : auto)."""
-        if not self.edit_mode or not hasattr(self, 'drag_axis_var'):
+        if not hasattr(self, 'drag_axis_var'):
             return
         self.drag_axis_var.set('auto' if self.drag_axis_var.get() == axis else axis)
         self._on_axis_mode()
@@ -5714,6 +5813,8 @@ class BubbleNavApp(_TkBase):
 
     def _end_edit_drag(self) -> None:
         kind = self._hs_drag[0] if self._hs_drag else None
+        if kind == 'axe' and self._hs_drag[1].get('space') and not self.edit_mode:
+            self.after_idle(lambda: setattr(self, 'selected', None))
         moved = kind == 'axe' and self._hs_drag[1]['axis'] is not None
         probe = self._hs_drag[1].get('probe') if kind == 'axe' and not moved else None
         idx = (self._hs_drag[1]['idx'] if kind == 'axe' else
@@ -6268,9 +6369,11 @@ class BubbleNavApp(_TkBase):
                 else:
                     col = COLORS['plan_pt']
                 r = 2.5
-                if st.modified():
-                    col, r = COLORS['edit'], 3.5
-                self.plan.create_oval(x - r, y - r, x + r, y + r, fill=col, outline='')
+                ring = ''
+                if st.modified():                 # couleur du local, cerclée d'orange
+                    r, ring = 3.5, COLORS['edit']
+                self.plan.create_oval(x - r, y - r, x + r, y + r, fill=col,
+                                      outline=ring, width=1.5 if ring else 1)
                 if st.modified() and st.moved():
                     ox, oy = to_screen(st.ox, st.oy)
                     self.plan.create_line(ox, oy, x, y, fill=COLORS['edit'], width=1)
@@ -7005,8 +7108,8 @@ class CompareView(tk.Frame if _TK_OK else object):
         tk.Label(bar, text="Vue B", font=F_TITLE, bg=COLORS['bg_medium'],
                  fg=COLORS['sel']).pack(side='left', padx=(10, 8), pady=4)
         self.title_lbl = tk.Label(bar, text="—", font=F_UI_B, bg=COLORS['bg_medium'],
-                                  fg=COLORS['text'])
-        self.title_lbl.pack(side='left', padx=4)
+                                  fg=COLORS['text'])     # (détail de la bulle, gardé caché)
+        self.app.build_view_header(bar, 'B')
 
         self.app._mk_button(bar, "✕", self.close,
                             tip="Fermer la vue B (touche C).").pack(side='right',
@@ -7020,7 +7123,7 @@ class CompareView(tk.Frame if _TK_OK else object):
                      "ou zoomer d'un côté agit sur les deux.").pack(side='right', padx=6)
         tk.Label(bar, text="Suivi de A", font=F_UI, bg=COLORS['bg_medium'],
                  fg=COLORS['text_muted']).pack(side='right', padx=(8, 2))
-        cb = ttk.Combobox(bar, textvariable=self.follow, state='readonly', width=18,
+        cb = ttk.Combobox(bar, textvariable=self.follow, state='readonly', width=14,
                           style='BN.TCombobox', values=self.FOLLOW_MODES)
         cb.pack(side='right', pady=4)
         cb.bind('<<ComboboxSelected>>', lambda e: self.follow_a(self.app.current))
@@ -7073,6 +7176,16 @@ class CompareView(tk.Frame if _TK_OK else object):
         self.app.store.prefetch([self.app.stations[lk.target].photo
                                  for lk in self.app.links[idx]]
                                 if idx < len(self.app.links) else [])
+
+    def go_back(self) -> None:
+        """Vue B : revenir à la bulle précédente."""
+        if self.came_from is not None and self.came_from != self.idx:
+            self.goto(self.came_from, record=True)
+
+    def look_back(self) -> None:
+        """Vue B : regarder la bulle d'où l'on vient."""
+        if self.came_from is not None and self.came_from != self.idx:
+            self.aim_at_station(self.came_from)
 
     def aim_at_station(self, idx: int) -> None:
         """Tourne B vers une bulle (la vue liée est suspendue pour garder ce regard)."""

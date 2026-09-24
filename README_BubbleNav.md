@@ -163,7 +163,9 @@ relevé déjà renommé.
 | **Ctrl+clic** ou **clic droit** sur une pastille | **sonder** : la bulle s'ouvre dans l'autre vue et les deux se font face (voir « Contrôler H et Δ ») |
 | **`G`** / **`I`** | face à face / inverser A et B |
 | Glisser | tourner la vue |
-| Molette, `+` / `−` | champ de vision, de 30° à **200°** (105° par défaut) ; au-delà de 110°, passage progressif en **grand angle** |
+| Molette, `+` / `−` | champ de vision, de 30° à **200°** (105° par défaut), avec un **cran à 120°** ; au-delà de 110°, passage progressif en **grand angle** |
+| Bouton **120°** (à côté du champ) | les **deux vues** à 120° |
+| **Espace + glisser** | **déplacer en plan** la bulle visée, le long de X ou de Y (axe choisi par le geste, ou verrouillé par X / Y). Hors pastille : la bulle active. Sans passer par le mode édition. Un **appui bref** sur Espace avance vers la pastille centrale |
 | Double-clic | recentrer la vue sur ce point |
 | `Entrée` / `Espace` | avancer vers la pastille la plus centrale |
 | `Retour arrière` | revenir à la bulle précédente |
@@ -431,10 +433,30 @@ dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
    inverse les deux vues (bulles et regards). **A → B** et **B → A** recopient
    une vue dans l'autre.
 
-**Barre de contrôle** (sous la barre d'outils) : ◀ Retour · ↩ Origine · ⇆ Face
-à face · ⇄ Inverser · A → B · B → A · puis, pour A et pour B, le nom, **H** et
-**Δ** avec leurs boutons − / +, et le pas. Les valeurs corrigées passent en
-orange.
+**En-tête de chaque vue** : A et B ont le même, pour la bulle qu'elles
+affichent : ◀ Retour · ↩ Origine · nom · **H** et **Δ** avec leurs boutons
+− / +. L'en-tête de A porte aussi le pas des réglages. Celui de B porte en plus
+les commandes qui **lient les deux vues** : ⇆ Face à face · ⇄ Inverser ·
+A → B · B → A · Suivi de A · Vue liée. Les valeurs corrigées passent en orange.
+
+**Déplacer en plan sans le mode édition** : maintenir **Espace** et glisser une
+pastille la déplace le long de X ou de Y. L'axe est choisi par le début du
+geste, ou verrouillé par les touches X / Y. Le repère gradué et la lecture
+ΔX / ΔY s'affichent pendant le geste, et Ctrl+Z l'annule. Hors pastille, c'est
+la bulle active qui se déplace. Avec Alt / Maj + molette pour Δ / H, tout se
+corrige donc sans changer de mode.
+
+**Bulle corrigée** : elle garde la couleur de son local ; ce sont son nom et
+sa distance qui passent en **orange** (sur le plan, point cerclé d'orange).
+
+**Pourquoi tout bouge quand on déplace la bulle active ?** Ce n'est pas un
+bug. L'image est attachée à l'appareil : déplacer la bulle active, c'est
+déclarer que la photo a été prise ailleurs. Toutes les autres bulles sont
+alors vues depuis ce nouvel endroit, et leurs pastilles se déplacent dans
+l'image, en sens inverse. C'est justement ce qui permet de recaler la bulle
+active : on la déplace jusqu'à ce que les pastilles voisines tombent sur leur
+vrai emplacement dans la photo. Pour corriger une **voisine** sans rien faire
+bouger d'autre, on agit sur **sa** pastille.
 
 Un **clic simple** reste un déplacement ordinaire : on arrive sur la bulle en
 gardant le sens de la marche. Sur le plan, clic gauche = vue A (repère
