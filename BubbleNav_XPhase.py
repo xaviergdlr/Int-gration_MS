@@ -235,7 +235,7 @@ DEFAULT_CONFIG = {
     'plan_links': 'squelette',       # réseau du plan : 'squelette' | 'complet' | 'aucun'
     'drag_axis': 'auto',             # axe du glisser en édition : 'auto' | 'x' | 'y' | 'z'
     'drag_z': 'ddelta',              # l'axe Z agit sur 'ddelta' (sol + caméra) ou 'dh'
-    'hotspot_anchor': 'sol',         # pastille au 'sol' ou au point de 'vue' (mât)
+    'bubble_anchor': 'vue',          # bulle au point de 'vue' (appareil, mât, ombre) ou au 'sol'
     'hotspots_mode': 'plancher',     # 'plancher' : toutes les bulles du plancher ;
                                      # 'reseau' : réseau élagué (portée, nombre, direction)
     'color_mode': 'local',           # couleur des pastilles : 'local' ou 'lien'
@@ -1406,7 +1406,9 @@ def aim_at(view: View, calib: Calib, frm: Station, to: Station,
     """
     dx, dy = to.x - frm.x, to.y - frm.y
     dh = math.hypot(dx, dy)
-    cible = to.z if anchor == 'vue' else to.ground(eye)
+    # bulle au point de vue : on vise le milieu du mât, pour voir à la fois la
+    # sphère (l'appareil) et son empreinte au sol
+    cible = (to.z + to.ground(eye)) / 2.0 if anchor == 'vue' else to.ground(eye)
     dz = cible - frm.z
     if dh < 0.05:                            # à l'aplomb : on regarde en haut ou en bas
         view.pitch = PITCH_MAX if dz > 0 else PITCH_MIN
@@ -2378,12 +2380,19 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
                     else (90.0 if dz > 0 else -90.0))
             return project(view, psi, elev)
 
-        sol = at(tgt.ground(eye) - st.z)          # sol de la cible : plancher + delta
+        dz_sol = tgt.ground(eye) - st.z
+        sol = at(dz_sol)                          # sol de la cible : plancher + delta
         foot = None
+        foot_r = (0.0, 0.0)
         if anchor == 'vue':
             pr = at(tgt.z - st.z)                 # point de vue : sol + hauteur appareil
             if sol is not None:
                 foot = (sol[0], sol[1])
+                # ombre : disque au sol, du rayon de la sphère, vu en perspective
+                d_sol = math.hypot(dh, dz_sol)
+                rx = f * SPHERE_RADIUS * disc / max(d_sol, 0.35)
+                squash = abs(dz_sol) / max(d_sol, 1e-6)      # sinus de la plongée
+                foot_r = (rx, rx * clamp(squash, 0.06, 1.0))
         else:
             pr = sol
         if pr is None:
@@ -2393,7 +2402,7 @@ def compute_hotspots(stations: Sequence[Station], links: Sequence["Link"],
             continue
         # rayon a l'ecran = focale x rayon physique / distance, borne des deux cotes
         radius = clamp(f * disc / max(lk.dist, 0.35), r_min, r_max)
-        out.append(Hotspot(lk, col, row, radius, tgt.locator, foot))
+        out.append(Hotspot(lk, col, row, radius, tgt.locator, foot, foot_r))
     out.sort(key=lambda h: -h.link.dist)     # les plus lointaines dessinees d'abord
     return out, masques
 
@@ -2415,11 +2424,14 @@ AXIS_Z_PX_M = 0.002            # m par pixel pour Z sur la bulle active (vertica
 DRAG_AXIS_MODES = ('auto', 'x', 'y', 'z')
 
 
-def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2):
+def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2,
+                  floating: bool = False):
     """Pastille en relief : sphère éclairée reposant sur son ombre portée.
 
     Retourne (image RGBA PIL, (ax, ay)) où (ax, ay) est le point du sol dans
     l'image — c'est lui qui se place sur la position projetée de la bulle.
+    `floating` : sphère suspendue au point de vue, sans ombre attachée (son
+    ombre est dessinée au sol, en perspective) ; l'ancre est alors son centre.
     Sur-échantillonnage `ss` pour des bords lisses ; ~4 ms par sprite, mis en
     cache par l'application.
     """
@@ -2441,7 +2453,7 @@ def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2):
     # ombre portée : ellipse douce, un peu decalee (lumiere en haut a gauche)
     ox, oy = cx + 0.06 * R, gy + 0.10 * sy
     d = np.sqrt(((xx - ox) / sx) ** 2 + ((yy - oy) / sy) ** 2)
-    shadow_a = np.clip((1.0 - d) / 0.35, 0, 1) * 0.55
+    shadow_a = np.clip((1.0 - d) / 0.35, 0, 1) * (0.0 if floating else 0.55)
     shadow = Image.fromarray((shadow_a * 255).astype(np.uint8), 'L').filter(
         ImageFilter.GaussianBlur(blur))
     out = np.zeros((H, W, 4), np.float32)
@@ -2484,15 +2496,26 @@ def sphere_sprite(color: str, r: int, hover: bool = False, ss: int = 2):
     img = Image.fromarray((out * 255).astype(np.uint8), 'RGBA')
     if ss > 1:
         img = img.resize((W // ss, H // ss), Image.LANCZOS)
-    return img, (cx / ss, gy / ss)
+    return img, (cx / ss, (cy if floating else gy) / ss)
 
 
 def hotspot_hit(hotspots: Sequence["Hotspot"], x: float, y: float,
                 relief: bool = True) -> Optional[int]:
-    """Pastille sous le curseur : sphère (au-dessus du sol) ou ombre au sol."""
-    best, best_d = None, float('inf')
-    for i, hs in enumerate(hotspots):
+    """Pastille sous le curseur : celle du dessus, comme à l'écran.
+
+    Les pastilles sont dessinées de la plus lointaine à la plus proche : on les
+    parcourt à l'envers et la première touchée l'emporte. Indispensable quand
+    les bulles sont au point de vue : toutes celles du plancher s'alignent sur
+    l'horizon et se recouvrent.
+    """
+    for i in range(len(hotspots) - 1, -1, -1):
+        hs = hotspots[i]
         r = hs.radius
+        if hs.foot is not None:             # sphère au point de vue : centrée sur lui
+            rs = (SPHERE_RADIUS * r if relief else r) + HIT_SLACK_PX
+            if (x - hs.col) ** 2 + (y - hs.row) ** 2 <= rs * rs:
+                return i
+            continue
         rx, ry = r + HIT_SLACK_PX, r * 0.55 + HIT_SLACK_PX
         d = ((x - hs.col) / rx) ** 2 + ((y - hs.row) / ry) ** 2
         if relief:
@@ -2500,9 +2523,9 @@ def hotspot_hit(hotspots: Sequence["Hotspot"], x: float, y: float,
             cy = hs.row - rs * SPHERE_LIFT
             ds = ((x - hs.col) ** 2 + (y - cy) ** 2) / (rs + HIT_SLACK_PX) ** 2
             d = min(d, ds)
-        if d <= 1.0 and d < best_d:
-            best, best_d = i, d
-    return best
+        if d <= 1.0:
+            return i
+    return None
 
 
 class Tooltip:
@@ -2700,6 +2723,7 @@ class Hotspot:
     radius: float
     label: str
     foot: Optional[Tuple[float, float]] = None   # pied du mât (pastille au point de vue)
+    foot_r: Tuple[float, float] = (0.0, 0.0)     # ombre au sol : demi-axes à l'écran (px)
 
 
 class BubbleNavApp(_TkBase):
@@ -3521,10 +3545,10 @@ class BubbleNavApp(_TkBase):
             menu.add_checkbutton(label=txt, variable=var, command=self._on_marks)
         menu.add_separator()
         self.anchor_var = tk.StringVar(value=self.anchor())
+        menu.add_radiobutton(label="Bulle au point de vue (appareil), mât et ombre au sol",
+                             value='vue', variable=self.anchor_var, command=self._set_anchor)
         menu.add_radiobutton(label="Pastille posée au sol (plancher + Δ)", value='sol',
                              variable=self.anchor_var, command=self._set_anchor)
-        menu.add_radiobutton(label="Pastille au point de vue (sol + H), mât au sol",
-                             value='vue', variable=self.anchor_var, command=self._set_anchor)
         menu.add_separator()
         self.all_var = tk.BooleanVar(value=self.whole_floor())
         menu.add_checkbutton(label="Toutes les bulles du plancher  (T)",
@@ -4185,16 +4209,17 @@ class BubbleNavApp(_TkBase):
         self.hidden_count = masques
         return out
 
-    def _sprite(self, color: str, r: float, hover: bool = False, alpha: float = 1.0):
+    def _sprite(self, color: str, r: float, hover: bool = False, alpha: float = 1.0,
+                floating: bool = False):
         """Sphère ombrée prête à afficher, mise en cache par couleur, taille, opacité."""
         rq = max(3, int(round(r / 2.0) * 2))          # pas de 2 px : cache compact
         alpha = round(clamp(alpha, 0.05, 1.0), 2)
-        key = (color, rq, hover, alpha)
+        key = (color, rq, hover, alpha, floating)
         hit = self._sprites.get(key)
         if hit is not None:
             return hit
         from PIL import ImageTk
-        img, (ax, ay) = sphere_sprite(color, rq, hover)
+        img, (ax, ay) = sphere_sprite(color, rq, hover, floating=floating)
         if alpha < 1.0:                               # fantôme : opacité réduite
             a = img.getchannel('A').point(lambda v: int(v * alpha))
             img.putalpha(a)
@@ -4225,10 +4250,10 @@ class BubbleNavApp(_TkBase):
 
     def anchor(self) -> str:
         """Hauteur des pastilles : 'sol' (plancher + delta) ou 'vue' (+ hauteur)."""
-        return 'vue' if self.cfg.get('hotspot_anchor') == 'vue' else 'sol'
+        return 'sol' if self.cfg.get('bubble_anchor', 'vue') == 'sol' else 'vue'
 
     def _set_anchor(self) -> None:
-        self.cfg['hotspot_anchor'] = self.anchor_var.get()
+        self.cfg['bubble_anchor'] = self.anchor_var.get()
         save_config(self.cfg)
         self._draw_overlay()
         self._redraw_compare()
@@ -4288,20 +4313,29 @@ class BubbleNavApp(_TkBase):
                      selected: bool = False) -> None:
         """Dessine une pastille (relief ou plate) sur un canevas."""
         r = hs.radius * (1.25 if hovered else 1.0)
-        if hs.foot is not None:                 # mât : du sol au point de vue
+        floating = hs.foot is not None
+        if floating:
+            # Sphère au point de vue (là où était l'appareil), ombre posée au sol
+            # en perspective, mât entre les deux : la profondeur se lit d'un coup
+            # d'œil, et la hauteur de l'appareil aussi.
             fx, fy = hs.foot
-            canvas.create_line(fx, fy, hs.col, hs.row, fill='#000000', width=4, tags='hs')
-            canvas.create_line(fx, fy, hs.col, hs.row, fill=color, width=2, tags='hs')
-            e = max(3.0, 0.45 * r)
-            canvas.create_oval(fx - e, fy - e * 0.4, fx + e, fy + e * 0.4,
-                               outline=color, width=1.5, tags='hs')
+            sx, sy = hs.foot_r
+            if sx >= 1.0:
+                canvas.create_oval(fx - sx, fy - sy, fx + sx, fy + sy, fill='#000000',
+                                   outline='', stipple='gray50', tags='hs')
+                canvas.create_oval(fx - sx, fy - sy, fx + sx, fy + sy, outline=color,
+                                   width=1.5, tags='hs')
+            rs_ = SPHERE_RADIUS * r if self.relief() else r
+            top = hs.row + rs_ * (1 if fy > hs.row else -1)
+            canvas.create_line(fx, fy, hs.col, top, fill='#000000', width=4, tags='hs')
+            canvas.create_line(fx, fy, hs.col, top, fill=color, width=2, tags='hs')
         if self.relief():
-            photo, ax, ay = self._sprite(color, r, hovered)
+            photo, ax, ay = self._sprite(color, r, hovered, floating=floating)
             canvas.create_image(hs.col - ax, hs.row - ay, anchor='nw', image=photo,
                                 tags='hs')
             if selected:
                 rs = SPHERE_RADIUS * r * 1.35
-                cy = hs.row - SPHERE_RADIUS * r * SPHERE_LIFT
+                cy = hs.row - (0 if floating else SPHERE_RADIUS * r * SPHERE_LIFT)
                 canvas.create_oval(hs.col - rs, cy - rs, hs.col + rs, cy + rs,
                                    outline=COLORS['sel'], width=2, tags='hs')
             return
@@ -4380,7 +4414,8 @@ class BubbleNavApp(_TkBase):
         if tag:                              # bulle quittée, ou bulle de l'autre vue
             r = hs.radius * (1.25 if hovered else 1.0)
             rs = (SPHERE_RADIUS * r if self.relief() else r) * 1.7
-            cy = hs.row - (SPHERE_RADIUS * r * SPHERE_LIFT if self.relief() else 0)
+            cy = hs.row - (SPHERE_RADIUS * r * SPHERE_LIFT
+                           if self.relief() and hs.foot is None else 0)
             canvas.create_oval(hs.col - rs, cy - rs, hs.col + rs, cy + rs,
                                outline='white', width=2, dash=(4, 3), tags='hs')
         # Pastilles lointaines (à leur taille minimale) : la sphère seule, pour
@@ -4418,10 +4453,14 @@ class BubbleNavApp(_TkBase):
 
     def label_y(self, hs: "Hotspot", hovered: bool) -> float:
         r = hs.radius * (1.25 if hovered else 1.0)
+        if hs.foot is not None:
+            return hs.row + (SPHERE_RADIUS * r if self.relief() else r) + 10
         return hs.row + (SHADOW_RY * r if self.relief() else 0.55 * r) + 10
 
     def glyph_y(self, hs: "Hotspot", hovered: bool) -> float:
         r = hs.radius * (1.25 if hovered else 1.0)
+        if hs.foot is not None:
+            return hs.row - (SPHERE_RADIUS * r if self.relief() else r) - 8
         if self.relief():
             return hs.row - SPHERE_RADIUS * r * (SPHERE_LIFT + 1.0) - 8
         return hs.row - r * 0.9
@@ -4624,7 +4663,7 @@ class BubbleNavApp(_TkBase):
         if hit is None or hit >= len(self.hotspots):
             return
         lines, modified = self.tooltip_lines(self.hotspots[hit], self.station())
-        lines.append("clic droit   ouvrir dans la vue B")
+        lines.append("Ctrl+clic    sonder : face à face dans la vue B")
         self.draw_tooltip(self.canvas, x, y, lines, self.view.width, self.view.height,
                           modified)
 
@@ -5823,7 +5862,8 @@ class BubbleNavApp(_TkBase):
         r = clamp(view.focal() * float(self.cfg.get('disc_radius', DISC_RADIUS_M)) / dist,
                   r_min, r_max)
         if self.relief():
-            photo, ax, ay = self._sprite(COLORS['hot'], r, False, alpha=0.38)
+            photo, ax, ay = self._sprite(COLORS['hot'], r, False, alpha=0.38,
+                                         floating=self.anchor() == 'vue')
             self.canvas.create_image(pr[0] - ax, pr[1] - ay, anchor='nw', image=photo,
                                      tags='hs')
         else:
@@ -7306,7 +7346,7 @@ class CompareView(tk.Frame if _TK_OK else object):
         if hit is None or hit >= len(self.hotspots):
             return
         lines, modified = self.app.tooltip_lines(self.hotspots[hit], self.station())
-        lines.append("clic droit   ouvrir dans la vue A")
+        lines.append("Ctrl+clic    sonder : face à face dans la vue A")
         self.app.draw_tooltip(self.canvas, x, y, lines, self.view.width, self.view.height,
                               modified)
 

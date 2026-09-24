@@ -251,11 +251,23 @@ droites). Au-delà, elle passe progressivement en projection
 on peut voir jusqu'à 200°, avec des lignes courbées mais des formes
 préservées. Pastilles, clics et glisser suivent exactement la même projection.
 
-**Hauteur des pastilles** (menu « Affichage ▾ ») :
-* **au sol** (par défaut) : la pastille se pose sur le sol de la bulle cible,
-  c'est-à-dire **plancher + Δ = Z − H** ;
-* **au point de vue** : la sphère est à la hauteur de l'appareil (**Z**), et un
-  **mât** la relie à son pied au sol. On lit ainsi H d'un coup d'œil.
+**Bulles au point de vue** (défaut ; menu « Affichage ▾ ») : chaque bulle
+voisine est représentée **là où était l'appareil**, à sa hauteur (Z = plancher
++ Δ + H, soit 1,65 m au-dessus de son sol). Trois indices donnent la
+profondeur :
+* la **sphère** : l'appareil, de taille réelle (environ 25 cm de rayon), donc
+  d'autant plus petite qu'elle est loin ;
+* le **mât** : de la sphère jusqu'au sol de la bulle ;
+* l'**ombre au sol** : un disque posé à plat sous la bulle, en perspective.
+  Aplati quand il est loin, plus rond quand il est proche et vu d'en haut.
+
+Les bulles d'un même plancher sont toutes à la hauteur de l'œil : elles
+s'alignent donc sur l'horizon, et c'est normal. C'est leur mât et leur ombre
+qui les situent en profondeur. Quand elles se recouvrent, le clic va toujours
+à celle du dessus (la plus proche).
+
+L'autre mode, *pastille posée au sol*, reste disponible dans le menu : la
+pastille se pose alors sur le sol de la bulle.
 
 Le point de vue se calcule toujours de la même façon, **Z = plancher + Δ + H**
 (voir § 2). La fiche détaille le calcul :
@@ -396,7 +408,9 @@ dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
 1. **Sonder** : Ctrl+clic (ou clic droit) sur une pastille. Elle s'ouvre dans
    la vue B, et A et B **se font face** : A voit la pastille de B, B voit celle
    de A, chacune au centre.
-2. **Lire la mire** : la bulle de l'autre vue (et la pastille survolée) porte
+2. **Lire la mire** : la vue est tournée vers le milieu du mât, pour voir à la
+   fois l'appareil et son sol. La bulle de l'autre vue (et la pastille
+   survolée) porte
    une **empreinte au sol** et une **mire graduée** :
    * l'empreinte est un cercle de 50 cm posé sur son sol, vu en perspective ;
      il doit s'inscrire à plat sur le sol de la photo ;
