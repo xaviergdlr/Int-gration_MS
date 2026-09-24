@@ -170,7 +170,7 @@ relevé déjà renommé.
 | `Entrée` / `Espace` | avancer vers la pastille la plus centrale |
 | `Retour arrière` | revenir à la bulle précédente |
 | **`Ctrl+Z`** | **annuler la dernière opération**, quelle qu'elle soit : entrée dans une bulle (retour à la bulle quittée, avec le même cap, site et champ), correction, bulle ouverte dans la vue B |
-| Liste **Voir** | pastilles montrées : **Local**, **Locaux voisins** (défaut), **Distance**, **Plancher entier** |
+| Liste **Voir** | pastilles montrées : **Local**, **Locaux voisins**, **De proche en proche** (défaut), **Distance**, **Plancher entier** |
 | `L` / `T` | Voir : Local / Plancher entier (2e appui : retour au choix précédent) |
 | `M` | module principal (fichiers, état) |
 | **`O`** | **regarder d'où l'on vient** : la vue se tourne vers la pastille de la bulle quittée |
@@ -229,14 +229,17 @@ plus serré au plus large :
 | Voir | Pastilles montrées |
 |---|---|
 | **Local** (touche L) | les stations du local de la bulle affichée |
-| **Locaux voisins** (défaut) | le local, plus tous les locaux ayant une station à moins de la **distance de voisinage** (6 m par défaut, dans Réglages) : les voisines « au second plan » |
+| **Locaux voisins** | le local, plus tous les locaux ayant une station à moins de la **distance de voisinage** (6 m par défaut, dans Réglages) : les voisines « au second plan » |
+| **De proche en proche** (défaut) | les locaux voisins, **plus** les stations atteintes en cheminant de station en station (sauts de 4 m environ, adaptés à la densité du plancher) jusqu'à la **portée de proche en proche** (15 m de cheminement par défaut, dans Réglages) : on voit loin dans un couloir ou par une porte, sans tout le plancher |
 | **Distance** | les stations à moins de la distance de voisinage |
 | **Plancher entier** (touche T) | toutes les stations du plancher |
 
 Dans tous les cas, les pastilles ▲ ▼ vers les planchers voisins restent
-visibles. Le choix suit la bulle quand on navigue. Sur les relevés, *Locaux
-voisins* montre en médiane 36 pastilles sur GRA6 (local seul : 21, plancher :
-71) et 25 sur BUG_BR (8 et 112).
+visibles. Le choix suit la bulle quand on navigue. Sur le relevé BUG_BR,
+*De proche en proche* montre en médiane 40 pastilles (Locaux voisins : 24,
+plancher : 112) ; surtout, là où l'on voyait le moins loin (10 % des points de
+vue), la portée passe de 9 m à 13 m. Une configuration enregistrée par une
+version précédente passe une fois à ce nouveau défaut.
 
 Pour rester lisible :
 * seules les pastilles **proches** portent leurs étiquettes. Les lointaines,
@@ -437,6 +440,10 @@ dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
    * **Alt + molette** : son **Δ** (sol et caméra montent ou descendent
      ensemble) ;
    * **Maj + molette** : sa **H** (la caméra seule) ;
+   * la molette agit aussi quand le curseur est **dans B** : c'est toujours la
+     station active qui bouge, et on voit sa pastille monter ou descendre dans
+     B — comme Espace + glisser dans B, qui déplace la pastille de la station
+     active ;
    * pour corriger la voisine sondée, **I** l'échange avec A : elle devient
      active ;
    * l'en-tête de chaque vue affiche en permanence H et Δ de sa bulle.

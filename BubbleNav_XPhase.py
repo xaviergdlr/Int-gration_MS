@@ -31,6 +31,7 @@ os.environ.setdefault('OPENCV_LOG_LEVEL', 'ERROR')
 import argparse
 import csv
 import fnmatch
+import heapq
 import itertools
 import json
 import math
@@ -69,7 +70,11 @@ FOV_SNAP = 120.0               # cran aimanté du champ (bouton « 120° »)
 FOV_SNAP_TOL = 5.0
 # Ce que l'on voit : du plus serré au plus large
 SCOPE_LABELS = {'local': "Local", 'voisins': "Locaux voisins",
+                'chaine': "De proche en proche",
                 'distance': "Distance", 'plancher': "Plancher entier"}
+SCOPE_DEFAULT = 'chaine'
+CHAIN_DIST_DEFAULT = 15.0      # m — portée « de proche en proche », le long des stations
+CHAIN_STEP_MIN, CHAIN_STEP_MAX = 4.0, 10.0   # m — pas maxi entre deux stations de la chaîne
 PITCH_MIN, PITCH_MAX = -89.0, 89.0
 PITCH_DEFAULT = -20.0          # les pastilles au sol sont sous l'horizon
 DRAG_SCALE = 0.5               # sous-echantillonnage pendant la manipulation
@@ -247,8 +252,11 @@ DEFAULT_CONFIG = {
     'show_mire': True,               # mire de hauteur sur les bulles comparées
     'show_tooltip': True,            # infobulle au survol des pastilles
     'wheel_step': 0.05,              # pas de la molette pour H / Δ (m) : 0,05 ou 0,01
-    'view_scope': 'voisins',         # pastilles : 'local' | 'voisins' | 'distance' | 'plancher'
+    'view_scope': SCOPE_DEFAULT,     # pastilles : 'local' | 'voisins' | 'chaine' | 'distance'
+                                     # | 'plancher'
     'scope_dist': 6.0,               # distance de voisinage (m) : local + second plan
+    'chain_dist': CHAIN_DIST_DEFAULT,   # portée de proche en proche (m, le long des stations)
+    'scope_version': 1,              # migration du choix « Voir » par défaut
     'focus_origin': False,           # à l'arrivée, regarder la bulle d'où l'on vient
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
@@ -278,6 +286,11 @@ def load_config() -> dict:
                 elif isinstance(ref, dict) and isinstance(v, dict):
                     cfg[k] = {str(a): str(b) for a, b in v.items()
                               if isinstance(b, str)}
+            if not isinstance(data.get('scope_version'), int) or data['scope_version'] < 1:
+                # une fois : le nouveau défaut « de proche en proche » remplace
+                # le choix « Voir » enregistré par une version précédente
+                cfg['view_scope'] = SCOPE_DEFAULT
+                cfg['scope_version'] = 1
     except Exception:
         pass
     return cfg
@@ -1073,10 +1086,13 @@ class HotspotFilter:
     hide_missing: bool = False    # masquer les bulles sans image
     same_local: bool = False      # seulement le local de la bulle courante (touche L)
     # Portée de la vue (toujours appliquée, filtres actifs ou non) : 'local',
-    # 'voisins' (le local et les locaux proches), 'distance' ou 'plancher'.
+    # 'voisins' (le local et les locaux proches), 'chaine' (de proche en proche,
+    # le long des stations), 'distance' ou 'plancher'.
     scope: str = 'plancher'
     scope_dist: float = 6.0
+    chain_dist: float = CHAIN_DIST_DEFAULT
     near_locals: object = None    # fonction : indice de bulle -> locaux voisins
+    chain: object = None          # fonction : indice de bulle -> {bulle: distance de chemin}
 
     def match_local(self, target: Station) -> bool:
         motifs = [m.strip().lower()
@@ -1101,6 +1117,10 @@ class HotspotFilter:
         theirs = target.parts().local or target.locator
         if self.scope == 'local':
             return theirs == mine
+        if self.scope == 'chaine':
+            # de proche en proche : la chaîne des stations, en plus des locaux voisins
+            if theirs == mine or (callable(self.chain) and target.idx in self.chain(current.idx)):
+                return True
         near = self.near_locals(current.idx) if callable(self.near_locals) else {mine}
         return theirs in near or link.dist_h <= self.scope_dist * 0.5
 
@@ -1152,6 +1172,8 @@ class HotspotFilter:
             return f"≤ {self.scope_dist:g} m"
         if self.scope == 'voisins':
             return f"locaux voisins ({self.scope_dist:g} m)"
+        if self.scope == 'chaine':
+            return f"de proche en proche ({self.chain_dist:g} m)"
         return {'local': "local", 'plancher': "plancher entier"}.get(self.scope, self.scope)
 
 
@@ -2683,9 +2705,12 @@ CORRIGER SANS LE MODE ÉDITION — seule la STATION ACTIVE (vue A) est modifiée
                                sur le sol de la photo
 
 AFFICHAGE
-  Liste « Voir » ............. pastilles montrées : Local, Locaux voisins
-                               (défaut : le local et ceux à moins de 6 m),
-                               Distance, Plancher entier
+  Liste « Voir » ............. pastilles montrées : Local, Locaux voisins,
+                               De proche en proche (défaut : les locaux
+                               voisins, plus les stations atteintes de station
+                               en station jusqu'à 15 m de cheminement — loin
+                               dans les couloirs et par les portes), Distance,
+                               Plancher entier
   L / T ...................... Voir : Local / Plancher entier (2e appui : retour)
   M .......................... module (fichiers, état)
   F .......................... activer / couper les filtres
@@ -2841,10 +2866,14 @@ class BubbleNavApp(_TkBase):
             inter_floor=bool(cfg.get('filter_inter', True)),
             hide_missing=bool(cfg.get('filter_hide_missing', False)),
             same_local=bool(cfg.get('filter_same_local', False)),
-            scope=str(cfg.get('view_scope', 'voisins')),
-            scope_dist=float(cfg.get('scope_dist', 6.0)))
+            scope=str(cfg.get('view_scope', SCOPE_DEFAULT)),
+            scope_dist=float(cfg.get('scope_dist', 6.0)),
+            chain_dist=float(cfg.get('chain_dist', CHAIN_DIST_DEFAULT)))
+        if self.filters.scope not in SCOPE_LABELS:
+            self.filters.scope = SCOPE_DEFAULT
         self.filters.near_locals = self._near_locals
-        self._near_cache: Dict[Tuple[int, float], frozenset] = {}
+        self.filters.chain = self._chain
+        self._near_cache: Dict[tuple, object] = {}    # locaux voisins, chaînes, pas
         self.hidden_count = 0
         self.focus_idx: Optional[int] = None      # bulle décrite dans le panneau
         self.came_from: Optional[int] = None      # bulle quittée (A), pour s'y retourner
@@ -3717,17 +3746,19 @@ class BubbleNavApp(_TkBase):
         # Ce que l'on voit : un seul choix, du plus serré au plus large
         tk.Label(bar, text="Voir", bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
                  font=F_UI).pack(side='left', padx=(2, 4))
-        sc = self.cfg.get('view_scope', 'voisins')
-        self.scope_var = tk.StringVar(value=SCOPE_LABELS.get(sc, SCOPE_LABELS['voisins']))
-        scb = ttk.Combobox(bar, textvariable=self.scope_var, width=15, state='readonly',
+        sc = self.filters.scope
+        self.scope_var = tk.StringVar(value=SCOPE_LABELS.get(sc, SCOPE_LABELS[SCOPE_DEFAULT]))
+        scb = ttk.Combobox(bar, textvariable=self.scope_var, width=18, state='readonly',
                            style='BN.TCombobox', values=list(SCOPE_LABELS.values()))
         scb.pack(side='left', padx=2)
         scb.bind('<<ComboboxSelected>>', lambda e: self.set_scope(
             next(k for k, v in SCOPE_LABELS.items() if v == self.scope_var.get())))
         Tooltip(scb, "Stations montrées en pastilles : le local de la bulle (L), les "
-                     "locaux voisins (défaut : le local et ceux qui ont une station à "
-                     "moins de la distance de voisinage), une distance, ou tout le "
-                     "plancher (T). Distance réglable dans Réglages.")
+                     "locaux voisins, de proche en proche (défaut : on suit les stations "
+                     "de station en station jusqu'à 15 m de cheminement, en plus des locaux "
+                     "voisins — on voit loin "
+                     "dans les couloirs et par les portes), une distance, ou tout le "
+                     "plancher (T). Portées réglables dans Réglages.")
 
         self.labels_var = tk.BooleanVar(value=bool(self.cfg.get('show_labels', True)))
         self.names_var = tk.BooleanVar(value=bool(self.cfg.get('show_names', True)))
@@ -4553,6 +4584,52 @@ class BubbleNavApp(_TkBase):
         self._near_cache[key] = res
         return res
 
+    def _chain_step(self, floor: str) -> float:
+        """Pas maxi entre deux stations de la chaîne, selon la densité du plancher :
+        deux fois l'écart médian à la plus proche voisine, borné à 4 – 10 m."""
+        key = ('pas', floor)
+        hit = self._near_cache.get(key)
+        if hit is not None:
+            return hit
+        nn = sorted(min((lk.dist_h for lk in self.links[st.idx] if lk.kind == 'same'),
+                        default=float('inf'))
+                    for st in self.stations if st.floor == floor and st.idx < len(self.links))
+        nn = [d for d in nn if d < float('inf')]
+        step = clamp(2.0 * nn[len(nn) // 2], CHAIN_STEP_MIN, CHAIN_STEP_MAX) if nn \
+            else CHAIN_STEP_MIN
+        self._near_cache[key] = step
+        return step
+
+    def _chain(self, idx: int) -> Dict[int, float]:
+        """Stations atteintes « de proche en proche » depuis une bulle : on chemine
+        de station en station (pas ≤ pas du plancher) jusqu'à la portée, en
+        distance cumulée. On voit ainsi loin dans un couloir ou par une porte,
+        sans tout le plancher. Mis en cache (vidé à chaque recalcul du réseau)."""
+        budget = self.filters.chain_dist
+        key = ('chaine', idx, budget)
+        hit = self._near_cache.get(key)
+        if hit is not None:
+            return hit
+        dist: Dict[int, float] = {idx: 0.0}
+        if 0 <= idx < len(self.links):
+            step = self._chain_step(self.stations[idx].floor)
+            heap = [(0.0, idx)]
+            while heap:
+                d, u = heapq.heappop(heap)
+                if d > dist.get(u, float('inf')) or u >= len(self.links):
+                    continue
+                for lk in self.links[u]:
+                    if lk.kind != 'same' or lk.dist_h > step:
+                        continue
+                    nd = d + lk.dist_h
+                    if nd <= budget and nd < dist.get(lk.target, float('inf')):
+                        dist[lk.target] = nd
+                        heapq.heappush(heap, (nd, lk.target))
+        if len(self._near_cache) > 4000:
+            self._near_cache.clear()
+        self._near_cache[key] = dist
+        return dist
+
     def set_scope(self, scope: str) -> None:
         """Ce que l'on voit : local, locaux voisins, distance ou plancher entier."""
         if scope not in SCOPE_LABELS:
@@ -4575,8 +4652,8 @@ class BubbleNavApp(_TkBase):
     def _toggle_scope(self, scope: str) -> None:
         """L et T : bascule vers « local » / « plancher entier », puis retour."""
         if self.filters.scope == scope:
-            prev = getattr(self, '_prev_scope', 'voisins')
-            self.set_scope(prev if prev != scope else 'voisins')
+            prev = getattr(self, '_prev_scope', SCOPE_DEFAULT)
+            self.set_scope(prev if prev != scope else SCOPE_DEFAULT)
         else:
             self.set_scope(scope)
 
@@ -7218,6 +7295,17 @@ class BubbleNavApp(_TkBase):
             self._draw_plan()
 
         slider(vue, "Distance de voisinage (m)", scope_d, 3, 40, 1, apply_scope_dist)
+        chain_d = tk.DoubleVar(value=self.filters.chain_dist)
+
+        def apply_chain_dist(_=None):
+            self.filters.chain_dist = float(chain_d.get())
+            self.cfg['chain_dist'] = self.filters.chain_dist
+            self._near_cache.clear()
+            self._draw_overlay()
+            self._redraw_compare()
+            self._draw_plan()
+
+        slider(vue, "Portée de proche en proche (m)", chain_d, 5, 40, 1, apply_chain_dist)
         row = tk.Frame(vue, bg=COLORS['bg_dark'])
         row.pack(fill='x', pady=(4, 0))
         tk.Label(row, text="Pas de la molette H / Δ", width=22, anchor='w', font=F_UI,
