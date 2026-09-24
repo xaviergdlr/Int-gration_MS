@@ -42,7 +42,7 @@ et seulement ceci :
 
 | Correction | Geste | Où elle va |
 |---|---|---|
-| **Position XY** | Espace + glisser sa pastille, dans la vue B | CSV de sortie |
+| **Position XY** | Espace + glisser son point sur le **plan**, ou sa pastille dans la **vue B** | CSV de sortie |
 | **Δ** | Alt + molette | CSV de sortie |
 | **H** | Maj + molette | CSV de sortie |
 | **Orientation** de l'image | Ctrl + molette (1°, ou 0,1° dans Réglages) | les **images** (jamais le CSV) |
@@ -106,19 +106,31 @@ trépieds.
 1. **Choisir la station** : elle est active dans la vue A. Pour corriger une
    voisine, faites Ctrl+clic dessus (elle s'ouvre en B), puis **I** pour
    échanger A et B : elle devient active.
-2. **Δ et H** : Alt + molette et Maj + molette, que le curseur soit dans A ou
-   dans B. Le pas est de 5 cm (1 cm dans Réglages). Dans B, on voit la sphère
-   de la station active monter ou descendre sur son mât, l'ancrage au plancher
-   restant fixe.
-3. **Position XY** : dans B, maintenez **Espace** et glissez **la pastille de
-   la station active** (sphère, mât ou ombre).
-   * Son pied suit le curseur sur le plancher, en direct, dans toutes les
-     directions.
-   * Son point de départ reste visible en transparence.
-   * X / Y verrouillent un axe si besoin.
-   * La vue A reste figée pendant le geste et se recale au lâcher.
-   * Dans A, qui est la vue prise *depuis* la station active, le geste est
-     refusé : tout s'y décalerait et l'on croirait les voisines modifiées.
+2. **Δ et H** : Alt + molette et Maj + molette, que le curseur soit dans A,
+   dans B ou sur le plan. Le pas est de 5 cm (1 cm dans Réglages).
+   * Le tronçon Δ monte du plancher ; H part du sol local et mène à la sphère.
+     Alt fait donc monter Δ, puis H et la sphère avec lui ; Maj ne fait monter
+     que H et la sphère.
+   * **Dans la fiche**, présente en A comme en B, une **coupe** de la station
+     active le montre à chaque cran : plancher, Δ en rose, mire H, sphère. La
+     position du CSV reste en pointillé.
+   * **Dans B**, la vraie sphère de la station active monte ou descend sur son
+     mât, et l'ancrage au plancher reste fixe.
+   * **Dans A**, qui est la vue prise *depuis* la station, changer Δ ou H
+     déplace la caméra. Toutes les voisines se recalent sur la photo : c'est
+     là qu'on juge si H et Δ sont justes (les pieds doivent tomber sur le sol
+     de l'image).
+3. **Position XY** : maintenez **Espace** et glissez :
+   * **sur le plan**, le point cerclé de la station active : il suit la
+     souris. Aucun autre point ne peut être déplacé ;
+   * ou **dans B**, la pastille de la station active (sphère, mât ou ombre) :
+     son pied suit le curseur sur le plancher, en direct, et son point de
+     départ reste visible en transparence.
+
+   Pendant le geste, la vue A reste figée ; elle se recale au lâcher. Dans A
+   elle-même, le geste est refusé : on y est *dans* la station, tout s'y
+   décalerait et l'on croirait les voisines modifiées. X / Y verrouillent un
+   axe si besoin.
 4. **Orientation** : Ctrl + molette, par pas de 1° (ou 0,1°). L'image tourne
    sous les pastilles ; le trait du centre de l'image montre le décalage.
 5. **Suivi** : la **fiche**, en bas à gauche, en gros sur fond sombre, donne
@@ -126,8 +138,14 @@ trépieds.
    chaque cran et surligne la valeur qui vient de changer. Les valeurs
    corrigées passent en orange, avec leur valeur du CSV.
 6. **Revenir en arrière** : Ctrl+Z (une rafale de molette compte pour une
-   seule étape). Le bouton **↺ CSV**, dans l'en-tête de A, rend à la station
-   active ses valeurs du CSV.
+   seule étape). Le bouton **↺ CSV**, dans l'en-tête de A comme dans celui de
+   B, rend à la station active ses valeurs du CSV.
+
+**Règle unique** : les gestes agissent toujours sur la station active, où que
+soit le curseur (A, B ou plan). Chaque vue montre ce qu'elle peut montrer :
+* A (vue *depuis* la station) : l'orientation et le recalage de la caméra ;
+* B (vue *sur* la station) : sa sphère, son mât, sa position ;
+* le plan : sa position en XY.
 
 Les corrections s'enregistrent en continu dans un **fichier de corrections**
 séparé (`…_corrections.csv`, écrit par numéro de scan). Il est relu à la
@@ -155,7 +173,7 @@ réouverture. Le CSV d'entrée et les images d'origine ne sont jamais modifiés.
 | Clic sur une pastille | y aller (sens de navigation conservé) |
 | Ctrl+clic ou clic droit | **sonder** : la bulle s'ouvre dans l'autre vue, face à face |
 | Glisser / double-clic | tourner la vue / recentrer |
-| Molette, + / − | champ de vision (30° à 200°, cran à 120°) |
+| Molette, + / − | champ de vision (30° à 200°, cran à 120°). Au-delà de 110°, le grand angle est « droit » (projection **Pannini**) : les verticales restent verticales et droites. L'ancien rendu fisheye reste disponible dans Réglages |
 | Entrée ou Espace bref | avancer vers la pastille la plus centrale |
 | Retour arrière | bulle précédente |
 | O / G / I | d'où l'on vient / face à face / inverser A et B |
@@ -165,7 +183,8 @@ réouverture. Le CSV d'entrée et les images d'origine ne sont jamais modifiés.
 | F1 ou ? | aide complète |
 
 Le **plan** sert à naviguer : un clic va sur une station, un clic droit l'ouvre
-en B. Le plan ne modifie rien.
+en B. Espace + glisser le point de la station active la déplace en XY ; aucun
+autre point ne peut être déplacé.
 
 ## 7. Performance
 

@@ -250,6 +250,7 @@ DEFAULT_CONFIG = {
     'viewer_start': 'plein écran',   # 'plein écran' | 'maximisé' | 'mémorisé'
     'plan_links': 'squelette',       # réseau du plan : 'squelette' | 'complet' | 'aucun'
     'yaw_step': 1.0,                 # pas de Ctrl + molette pour l'orientation (deg)
+    'wide_mode': 'pannini',          # grand angle > 110° : 'pannini' (droit) ou 'stereo'
     'bubble_anchor': 'vue',          # bulle au point de 'vue' (appareil, mât, ombre) ou au 'sol'
     'hotspots_mode': 'plancher',     # 'plancher' : toutes les bulles du plancher ;
                                      # 'reseau' : réseau élagué (portée, nombre, direction)
@@ -1048,6 +1049,31 @@ def lens_focal(fov: float, width: int) -> float:
     return (width / 2.0) / lens_g(math.radians(fov) / 2.0, lens_mix(fov))
 
 
+# Projection grand angle (au-delà de 110°) : 'pannini' (défaut) garde les
+# verticales droites et verticales, les lignes passant par le centre droites :
+# l'image reste « rectangulaire ». 'stereo' est l'ancien rendu, plus « fisheye ».
+# Les deux se confondent avec la perspective normale jusqu'à 110°.
+WIDE_MODES = ('pannini', 'stereo')
+_WIDE = {'mode': 'pannini'}
+
+
+def set_wide_mode(mode: str) -> None:
+    _WIDE['mode'] = mode if mode in WIDE_MODES else 'pannini'
+
+
+def wide_mode() -> str:
+    return _WIDE['mode']
+
+
+def pannini_inv(xn: float, yn: float, d: float) -> Tuple[float, float, float]:
+    """Pannini : point image (en focales, y vers le haut) -> rayon caméra unitaire."""
+    lam = math.copysign(lens_inv(abs(xn), d), xn)
+    s_ = (d + 1.0) / (d + math.cos(lam))
+    phi = math.atan(yn / s_)
+    cph = math.cos(phi)
+    return cph * math.cos(lam), cph * math.sin(lam), math.sin(phi)
+
+
 def project(view: View, pano_yaw_deg: float, elev_deg: float
             ) -> Optional[Tuple[float, float, float]]:
     """Projette une direction (cap image, elevation) en pixels ecran.
@@ -1079,6 +1105,16 @@ def project(view: View, pano_yaw_deg: float, elev_deg: float
         col = view.width / 2.0 + f * yc / xc
         row = view.height / 2.0 - f * zc / xc
         return col, row, xc
+    if _WIDE['mode'] == 'pannini':
+        h = math.hypot(xc, yc)
+        if h < 1e-9:
+            return None
+        cl = xc / h
+        if d + cl <= 1e-6:
+            return None
+        s_ = (d + 1.0) / (d + cl)
+        return (view.width / 2.0 + f * s_ * (yc / h),
+                view.height / 2.0 - f * s_ * (zc / h), d + cl)
     side = math.hypot(yc, zc)
     if side < 1e-12:
         return view.width / 2.0, view.height / 2.0, margin
@@ -1364,6 +1400,8 @@ def _pano_ray(view: View, col: float, row: float) -> Tuple[float, float, float]:
     if d == 0.0:
         norm = math.sqrt(f * f + xg * xg + yg * yg)
         xc, yc, zc = f / norm, xg / norm, -yg / norm
+    elif _WIDE['mode'] == 'pannini':
+        xc, yc, zc = pannini_inv(xg / f, -yg / f, d)
     else:
         rpx = math.hypot(xg, yg)
         if rpx < 1e-9:
@@ -2291,7 +2329,7 @@ class PanoRenderer:
     def _ray_grid(self, fov: float, w: int, h: int):
         """Rayons camera unitaires (3, N) : X avant, Y droite, Z haut."""
         np, _ = self._mods()
-        key = (round(fov, 3), w, h)
+        key = (round(fov, 3), w, h, _WIDE['mode'])
         with self._lock:
             rays = self._rays.get(key)
             if rays is not None:
@@ -2308,6 +2346,18 @@ class PanoRenderer:
             rays[0] = (f / norm).reshape(-1)
             rays[1] = (gx / norm).reshape(-1)
             rays[2] = (-gy / norm).reshape(-1)
+        elif _WIDE['mode'] == 'pannini':  # grand angle Pannini : inverse exact
+            xn = np.abs(gx) / np.float32(f)
+            r = np.sqrt((d + 1.0) ** 2 + xn * xn, dtype=np.float32)
+            lam = np.arctan2(xn, np.float32(d + 1.0)) + np.arcsin(
+                np.clip(xn * np.float32(d) / r, -1.0, 1.0))
+            lam = np.where(gx < 0, -lam, lam)
+            s_ = np.float32(d + 1.0) / (np.float32(d) + np.cos(lam))
+            phi = np.arctan((-gy / np.float32(f)) / s_)
+            cph = np.cos(phi)
+            rays[0] = (cph * np.cos(lam)).reshape(-1)
+            rays[1] = (cph * np.sin(lam)).reshape(-1)
+            rays[2] = np.sin(phi).reshape(-1)
         else:                             # grand angle : inverse exact de lens_g
             rpx = np.sqrt(gx * gx + gy * gy, dtype=np.float32)
             rho = rpx / np.float32(f)
@@ -2340,7 +2390,7 @@ class PanoRenderer:
     def _remap_grids(self, view: View, sw: int, sh: int):
         np, _ = self._mods()
         key = (round(view.yaw, 2), round(view.pitch, 2), round(view.fov, 2),
-               view.width, view.height, sw, sh)
+               view.width, view.height, sw, sh, _WIDE['mode'])
         with self._lock:
             maps = self._maps.get(key)
             if maps is not None:
@@ -2641,21 +2691,25 @@ PRINCIPE
   position XY, Δ, H — plus l'orientation de son image. Tout est borné :
   XY à 5 m au plus du CSV, H entre 0,10 et 3 m, |Δ| ≤ 3 m.
 
-CORRIGER LA STATION ACTIVE  (le curseur peut être dans A ou dans B)
-  Alt + molette .............. Δ ± un pas (5 cm, ou 1 cm dans Réglages)
-  Maj + molette .............. H ± un pas
+CORRIGER LA STATION ACTIVE  (le curseur peut être dans A, dans B ou sur le plan)
+  Alt + molette .............. Δ ± un pas (5 cm, ou 1 cm dans Réglages) : le
+                               tronçon Δ monte du plancher, H et la sphère suivent
+  Maj + molette .............. H ± un pas : la sphère monte, le sol local reste
   Ctrl + molette ............. orientation de l'image ± 1° (0,1° dans Réglages) ;
-                               appliquée à l'image, jamais au CSV
-  Espace + glisser (vue B) ... position XY : saisir la pastille de la station
-                               active (sphère, mât ou ombre) ; elle suit le
-                               curseur, son point de départ reste en transparence
+                               elle tourne dans la vue A ; jamais dans le CSV
+  Espace + glisser ........... position XY, sur le PLAN (le point cerclé de la
+                               station active) ou dans la VUE B (sa pastille) ;
+                               la vue A reste figée et se recale au lâcher
   X / Y ...................... verrouiller un axe pour Espace + glisser (2e appui :
                                libre)
   Ctrl+Z ..................... annuler (une rafale de molette = une étape)
   Corriger une voisine ....... Ctrl+clic dessus (elle s'ouvre en B), puis I :
                                A et B s'échangent, elle devient active
-  Fiche (en bas à gauche) .... Z plancher, Δ, H, Z final, ΔX / ΔY, orientation ;
-                               à jour à chaque cran, valeur changée surlignée
+  Fiche (A et B) ............. Z plancher, Δ, H, Z final, ΔX / ΔY, orientation,
+                               et une COUPE : plancher, Δ (rose), mire H, sphère ;
+                               à jour à chaque cran (CSV d'origine en pointillé)
+  Dans A ..................... changer Δ ou H déplace la CAMÉRA : les voisines se
+                               recalent sur la photo — c'est le contrôle de H / Δ
 
 LIRE LA 3D DANS LA BULLE
   Sphère ..................... le point de vue (Z final), à sa taille réelle :
@@ -2674,7 +2728,9 @@ NAVIGATION  (vue A ou B)
   Ctrl+clic ou clic droit .... SONDER : la bulle s'ouvre dans l'autre vue et
                                les deux se font face
   Glisser .................... tourner la vue ; double-clic : recentrer
-  Molette, + / - ............. champ de vision, 30° à 200°, cran à 120°
+  Molette, + / - ............. champ de vision, 30° à 200°, cran à 120° ; au-delà
+                               de 110°, grand angle « droit » (Pannini) : les
+                               verticales restent droites (fisheye dans Réglages)
   Flèches (Maj = pas large) .. tourner ; Origine (Home) : redresser
   Entrée, ou Espace bref ..... avancer vers la pastille la plus centrale
   Retour arrière ............. revenir à la bulle précédente
@@ -2691,7 +2747,8 @@ AFFICHAGE
 
 PLAN
   Clic : aller sur la station ; clic droit : l'ouvrir en B ; clic droit glissé :
-  déplacer le plan ; molette : zoom. Le plan ne modifie rien.
+  déplacer le plan ; molette : zoom. Espace + glisser le point de la station
+  active : la déplacer en XY (les autres points ne se déplacent jamais).
 
 FICHIERS
   Ctrl+S ..................... « Appliquer / enregistrer » : CSV de sortie = le
@@ -2781,6 +2838,7 @@ class BubbleNavApp(_TkBase):
         self.store = ImageStore(int(cfg.get('src_width', SRC_WIDTH_DEFAULT)),
                                 int(cfg.get('cache_size', IMG_CACHE_DEFAULT)))
         self.renderer = PanoRenderer()
+        set_wide_mode(str(cfg.get('wide_mode', 'pannini')))
 
         self.view = View(fov=float(cfg.get('fov', FOV_DEFAULT)))
         self.hotspots: List[Hotspot] = []
@@ -3223,10 +3281,9 @@ class BubbleNavApp(_TkBase):
                     else (f"Delta Δ de la bulle {which}. Alt + molette : Δ de la station "
                           "ACTIVE (vue A), où que soit le curseur."))
             self.ctrl_vals[(which, comp)] = val
-        if which == 'A':
-            mk(bar, "↺ CSV", self._revert_active,
-               tip="Station active : revenir à ses valeurs du CSV (annulable par Ctrl+Z)."
-               ).pack(side='left', padx=(8, 2), pady=3)
+        mk(bar, "↺ CSV", self._revert_active,             # mêmes commandes dans A et B
+           tip="Station active : revenir à ses valeurs du CSV (annulable par Ctrl+Z)."
+           ).pack(side='left', padx=(8, 2), pady=3)
         self._refresh_ctrlbar()
 
     def _refresh_ctrlbar(self) -> None:
@@ -3417,8 +3474,8 @@ class BubbleNavApp(_TkBase):
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         if comp == 'yaw_fix':
             self._after_edit(turned=True)
-            msg = (f"orientation de l'image {st.yaw_fix:+.2f}° (appliquée à l'image, "
-                   "pas au CSV)")
+            msg = (f"orientation de l'image {st.yaw_fix:+.2f}° — elle tourne dans la vue A "
+                   "(appliquée à l'image, pas au CSV)")
         else:
             self._refresh_links_of(st.idx)
             self._after_edit(moved=True)
@@ -3647,11 +3704,8 @@ class BubbleNavApp(_TkBase):
         self._redraw_compare()
 
     def card_in_b(self) -> bool:
-        """La fiche s'affiche aussi dans B quand on y corrige la station active."""
-        if self._hs_drag and self._hs_drag[0] == 'plan' and \
-                self._hs_drag[1]['mode'] == 'pastille':
-            return True
-        return time.monotonic() < getattr(self, '_card_b_until', 0.0)
+        """La fiche de la station active s'affiche dans les deux vues, la même."""
+        return bool(self.cfg.get('show_card', True))
 
     def _card_bg(self, w: int, h: int, border: str):
         """Fond de la fiche : sombre, semi-opaque, coins arrondis (mis en cache)."""
@@ -3729,8 +3783,9 @@ class BubbleNavApp(_TkBase):
             if r[2]]] or [0])
         canvas.delete('_m')
         canvas.delete(t)
-        width = int(max(w_head, lw + 18 + vw + 14 + nw) + 2 * pad)
-        height = int(pad + 22 + len(rows) * lh + pad - 4)
+        coupe_w = 118                                  # coupe verticale, à droite
+        width = int(max(w_head, lw + 18 + vw + 14 + nw) + 2 * pad) + coupe_w
+        height = int(max(pad + 22 + len(rows) * lh + pad - 4, 150))
         y0 = bottom - height
         border = COLORS['edit'] if st.modified() else '#5a6270'
         canvas.create_image(x0, y0, anchor='nw', image=self._card_bg(width, height, border),
@@ -3752,6 +3807,62 @@ class BubbleNavApp(_TkBase):
                 canvas.create_text(x0 + pad + lw + 18 + vw + 14, y + 3, text=note,
                                    anchor='nw', font=F_UI, fill='#9aa3b2', tags=tag)
             y += lh
+        self._draw_coupe(canvas, st, eye, x0 + width - coupe_w, y0 + 8, coupe_w - 10,
+                         height - 16, flash, tag)
+
+    def _draw_coupe(self, canvas, st: Station, eye: float, x: float, y: float, w: float,
+                    h: float, flash: Optional[str], tag) -> None:
+        """Coupe verticale de la station active, dans la fiche : le plancher (fixe),
+        le tronçon Δ (rose) qui monte du plancher, la mire H qui part du sol local,
+        la sphère au Z final. Chaque cran de molette la fait bouger ; la position
+        du CSV reste en pointillé."""
+        d0, h0 = st.delta0, (st.h0 if st.h0 is not None else eye)
+        d1, h1 = st.delta(eye), st.height(eye)
+        # échelle FIXE pour la station (d'après le CSV, avec 50 cm de marge) : un cran
+        # de molette déplace toujours le dessin de la même longueur
+        lo = min(0.0, d0) - 0.10
+        hi = max(d0 + h0, 0.5) + 0.50
+        k = min(70.0, (h - 34) / (hi - lo))               # px par mètre
+        cx = x + w / 2 - 6
+        top, bot = y + 8, y + h - 8
+
+        def yy_(z: float) -> float:
+            return clamp(y + h - 16 - (z - lo) * k, top, bot)
+        yf, ys, yz = yy_(0.0), yy_(d1), yy_(d1 + h1)       # plancher, sol local, sphère
+        canvas.create_line(x + 4, yf, x + w - 4, yf, fill='#8a93a0', width=2, tags=tag)
+        canvas.create_text(x + w - 4, yf + 2, text="plancher", anchor='ne', font=F_TINY,
+                           fill='#8a93a0', tags=tag)
+        # position du CSV, en pointillé
+        if st.z_changed():
+            yz0, ys0 = yy_(d0 + h0), yy_(d0)
+            canvas.create_oval(cx - 7, yz0 - 7, cx + 7, yz0 + 7, outline='#9aa3b2',
+                               dash=(2, 2), tags=tag)
+            canvas.create_line(cx - 14, ys0, cx + 14, ys0, fill='#9aa3b2', dash=(2, 2),
+                               tags=tag)
+        # Δ : du plancher au sol local
+        if abs(d1) >= 0.0005:
+            canvas.create_line(cx, yf, cx, ys, fill=MIRE_DELTA_COLOR,
+                               width=7 if flash == 'ddelta' else 5, tags=tag)
+        canvas.create_line(cx - 12, ys, cx + 12, ys, fill=MIRE_DELTA_COLOR, width=2, tags=tag)
+        canvas.create_text(cx - 16, (yf + ys) / 2 if abs(d1) >= 0.05 else ys, text="Δ",
+                           anchor='e', font=F_UI_B, fill=MIRE_DELTA_COLOR, tags=tag)
+        # H : mire graduée du sol local à la sphère
+        col_h = COLORS['hot'] if flash == 'dh' else '#e8e8e8'
+        canvas.create_line(cx, ys, cx, yz, fill=col_h, width=3 if flash == 'dh' else 2,
+                           tags=tag)
+        for n in range(1, int(h1 / 0.1 + 1e-9) + 1):
+            yy = yy_(d1 + n * 0.1)
+            ww = 5 if n % 5 == 0 else 3
+            canvas.create_line(cx - ww, yy, cx + ww, yy, fill=col_h, tags=tag)
+        canvas.create_text(cx + 10, (ys + yz) / 2, text="H", anchor='w', font=F_UI_B,
+                           fill=col_h, tags=tag)
+        # sphère au Z final
+        colr = local_color(st.parts().local or st.floor)
+        canvas.create_oval(cx - 8, yz - 8, cx + 8, yz + 8, fill=colr,
+                           outline=COLORS['hot'] if flash in ('dh', 'ddelta') else 'white',
+                           width=2, tags=tag)
+        canvas.create_text(cx + 12, yz, text="Z", anchor='w', font=F_UI_B, fill='white',
+                           tags=tag)
 
     def wheel_step(self) -> float:
         """Pas de la molette pour H et Δ (Réglages : 1 ou 5 cm, 5 par défaut)."""
@@ -5290,9 +5401,9 @@ class BubbleNavApp(_TkBase):
             self._space_used = True
             self._drag = None
             self._set_status(
-                "Déplacement en plan : dans la vue B, Espace + glisser la pastille de la "
-                "station active" + ('' if self.compare is not None else
-                                    " — Ctrl+clic sur une voisine pour ouvrir B"),
+                "Déplacement XY de la station active : Espace + glisser son point sur le "
+                "plan (à droite), ou sa pastille dans la vue B" + (
+                    '' if self.compare is not None else " (Ctrl+clic sur une voisine)"),
                 COLORS['warning'])
             return
         self._drag = (event.x, event.y, self.view.yaw, self.view.pitch)
@@ -6370,12 +6481,53 @@ class BubbleNavApp(_TkBase):
         return best
 
     def _on_plan_press_left(self, event) -> None:
+        """Clic : aller sur une station. Espace + glisser le point de la STATION
+        ACTIVE : la déplacer en plan (seule elle peut l'être)."""
         self._plan_press = (event.x, event.y)
+        if not getattr(self, '_space_down', False) or self.current < 0:
+            return
+        self._space_used = True
+        st = self.station()
+        if self._plan_nearest(event, 14.0) != self.current:
+            self._set_status("Plan : Espace + glisser le point de la station active "
+                             f"{self._nom(st.idx)} (cerclé)", COLORS['warning'])
+            return
+        self.corrections.apply(st)                    # état avant le geste
+        self._hs_drag = ('plan', {'idx': st.idx, 'start': (st.x, st.y), 'mode': 'carte',
+                                  'press': (event.x, event.y)})
+        self._redraw_card_a()
 
     def _on_plan_drag_left(self, event) -> None:
-        """Le plan ne modifie rien : il sert à naviguer."""
+        hd = self._hs_drag
+        if not (hd and hd[0] == 'plan' and hd[1]['mode'] == 'carte'):
+            return
+        info = hd[1]
+        st = self.stations[info['idx']]
+        k = max(1e-9, float(self._plan_view.get('scale', 1.0)))
+        dx = (event.x - info['press'][0]) / k
+        dy = -(event.y - info['press'][1]) / k
+        axis = self._locked_axis()
+        if axis == 'x':
+            dy = 0.0
+        elif axis == 'y':
+            dx = 0.0
+        x0, y0 = info['start']
+        self.corrections.apply(st, x=st.ox + round(x0 + dx - st.ox, 3),
+                               y=st.oy + round(y0 + dy - st.oy, 3), record=False)
+        self._refresh_links_of(st.idx)
+        self._draw_plan()
+        self._redraw_compare()
+        self._redraw_card_a()                        # A figée pendant le geste
+        self._refresh_ctrlbar()
+        self._set_status(f"Station active {self._nom(st.idx)} : ΔX {st.x - st.ox:+.3f}  "
+                         f"ΔY {st.y - st.oy:+.3f} m depuis le CSV", COLORS['edit'])
 
     def _on_plan_release_left(self, event) -> None:
+        hd = self._hs_drag
+        if hd and hd[0] == 'plan' and hd[1]['mode'] == 'carte':
+            self._end_plan_drag()
+            self._draw_plan()
+            return
         press = getattr(self, '_plan_press', None)
         if press and abs(event.x - press[0]) + abs(event.y - press[1]) <= 3:
             idx = self._plan_nearest(event, 22.0)
@@ -6409,6 +6561,8 @@ class BubbleNavApp(_TkBase):
 
     def _on_plan_wheel(self, event, direction: int = 0) -> None:
         step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
+        if self.wheel_alt(event, (), self.current, step):
+            return                          # Alt / Maj / Ctrl : station active, comme partout
         self._plan_view['scale'] *= (1.25 if step > 0 else 0.8)
         self._draw_plan()
 
@@ -6709,6 +6863,27 @@ class BubbleNavApp(_TkBase):
             tk.Radiobutton(row, text=txt, variable=yaw_v, value=val, font=F_UI,
                            command=lambda: self.cfg.__setitem__('yaw_step',
                                                                 float(yaw_v.get())),
+                           bg=COLORS['bg_dark'], fg=COLORS['text'],
+                           selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_dark'],
+                           activeforeground=COLORS['text'], bd=0, highlightthickness=0
+                           ).pack(side='left', padx=4)
+        row = tk.Frame(vue, bg=COLORS['bg_dark'])
+        row.pack(fill='x', pady=(4, 0))
+        tk.Label(row, text="Grand angle (> 110°)", width=22, anchor='w',
+                 font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text']).pack(side='left')
+        wide_v = tk.StringVar(value=wide_mode())
+
+        def apply_wide():
+            set_wide_mode(wide_v.get())
+            self.cfg['wide_mode'] = wide_mode()
+            self.renderer.clear()
+            self._request_render(force=True)
+            if self.compare is not None:
+                self.compare.request_render(force=True)
+
+        for txt, val in (("droit (Pannini)", 'pannini'), ("fisheye", 'stereo')):
+            tk.Radiobutton(row, text=txt, variable=wide_v, value=val, font=F_UI,
+                           command=apply_wide,
                            bg=COLORS['bg_dark'], fg=COLORS['text'],
                            selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_dark'],
                            activeforeground=COLORS['text'], bd=0, highlightthickness=0
@@ -8058,6 +8233,23 @@ def selftest(csv_path: str = '') -> int:
         err_px = max(err_px, math.hypot(back[0] - pr[0], back[1] - pr[1]))
     check("rayon écran ↔ projection d'un point (aller-retour, grand angle compris)",
           err_px < 1e-6, f"écart max {err_px:.1e} px")
+    for mode in WIDE_MODES:
+        set_wide_mode(mode)
+        err_w = 0.0
+        for _ in range(1500):
+            v = View(rng.uniform(-180, 180), rng.uniform(-40, 40), rng.uniform(112, 200), 1280, 800)
+            c_, r_ = rng.uniform(0, 1280), rng.uniform(0, 800)
+            ray = _pano_ray(v, c_, r_)
+            pr = project(v, math.degrees(math.atan2(ray[1], ray[0])),
+                         math.degrees(math.asin(clamp(ray[2], -1.0, 1.0))))
+            if pr is not None:
+                err_w = max(err_w, math.hypot(pr[0] - c_, pr[1] - r_))
+        check(f"grand angle {mode} : pixel ↔ direction exact", err_w < 1e-6, f"{err_w:.1e} px")
+    set_wide_mode('pannini')
+    v = View(30, 0, 160, 1280, 800)
+    cols = [project(v, 70, e)[0] for e in range(-60, 61, 10)]
+    check("grand angle Pannini : une verticale reste droite", max(cols) - min(cols) < 1e-6,
+          f"écart {max(cols) - min(cols):.1e} px")
     grid = [Station(idx=k, photo=f"g{k}", locator=f"G{k}", x=float(k % 6) * 2.0,
                     y=float(k // 6) * 2.0, z=1.65, north_pct=50.0, floor='P')
             for k in range(36)]
