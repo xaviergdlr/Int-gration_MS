@@ -143,6 +143,9 @@ F_TITLE = ('Segoe UI', 11, 'bold')
 F_MONO = ('Consolas', 9)
 F_TINY = ('Segoe UI', 8)
 F_TINY_B = ('Segoe UI', 8, 'bold')
+F_CARD = ('Segoe UI', 12, 'bold')        # fiche de la station active
+F_CARD_V = ('Consolas', 14, 'bold')
+PLAN_GRAB_MAX_M = 30.0         # Espace + glisser : sol saisi à moins de 30 m
 MARK_TEXT = '#d9dee2'          # étiquettes discrètes des pastilles
 
 
@@ -251,6 +254,7 @@ DEFAULT_CONFIG = {
     'color_mode': 'local',           # couleur des pastilles : 'local' ou 'lien'
     'show_mire': True,               # mire de hauteur sur les bulles comparées
     'show_tooltip': True,            # infobulle au survol des pastilles
+    'show_card': True,               # fiche de la station active : sol, Δ, H, Z
     'wheel_step': 0.05,              # pas de la molette pour H / Δ (m) : 0,05 ou 0,01
     'view_scope': SCOPE_DEFAULT,     # pastilles : 'local' | 'voisins' | 'chaine' | 'distance'
                                      # | 'plancher'
@@ -2691,10 +2695,15 @@ CORRIGER SANS LE MODE ÉDITION — seule la STATION ACTIVE (vue A) est modifiée
   Alt + molette .............. Δ (delta plancher) de la station active
   Maj + molette .............. H (hauteur station) de la station active
   Espace + glisser dans A .... position en plan, libre dans toutes les directions :
-                               on « attrape » le sol ; les pastilles d'avant
-                               restent visibles en transparence
-  Espace + glisser dans B .... la pastille de la station active suit le curseur ;
-                               sa position CSV d'origine reste en transparence
+                               on saisit le sol ou une pastille, qui reste sous
+                               le curseur ; les pastilles d'avant restent
+                               visibles en transparence
+  Espace + glisser dans B .... saisir la pastille de la station active (sphère,
+                               mât ou ombre) : elle suit le curseur, en direct ;
+                               son point de départ reste en transparence
+  Fiche (en bas à gauche) .... station active : sol plancher, Δ, H appareil,
+                               Z final = sol + Δ + H, ΔX / ΔY ; à jour à chaque
+                               cran de molette, valeur changée surlignée
   X / Y (pendant Espace) ..... verrouiller un axe (2e appui : libre)
   Corriger une voisine ....... Ctrl+clic dessus (elle s'ouvre en B), puis I
                                pour l'échanger avec A : elle devient active
@@ -2719,7 +2728,7 @@ AFFICHAGE
                                par local ou par lien, pastille au sol ou au
                                point de vue, regarder d'où l'on vient,
                                infobulle au survol (courte ; masquée pendant
-                               une modification)
+                               une modification), fiche de la station active
   F11 / Échap ................ plein écran
   V .......................... afficher le visualiseur
   F1 ou ? .................... cette aide
@@ -2874,6 +2883,8 @@ class BubbleNavApp(_TkBase):
         self.filters.near_locals = self._near_locals
         self.filters.chain = self._chain
         self._near_cache: Dict[tuple, object] = {}    # locaux voisins, chaînes, pas
+        self._rev_links: Dict[int, list] = {}         # liens vers une station (geste)
+        self._card_job = None
         self.hidden_count = 0
         self.focus_idx: Optional[int] = None      # bulle décrite dans le panneau
         self.came_from: Optional[int] = None      # bulle quittée (A), pour s'y retourner
@@ -3453,6 +3464,32 @@ class BubbleNavApp(_TkBase):
         self._request_render(force=True)
 
     # ── réglage fin des altitudes ────────────────────────────────────
+    def _refresh_links_of(self, idx: int) -> None:
+        """Liens de et vers une station, recalculés sur place à sa position
+        actuelle. Pendant un geste (molette, Espace + glisser), sphère, mât,
+        ombre et mire suivent ainsi la station en direct, sans attendre le
+        recalcul complet du réseau."""
+        if not (0 <= idx < len(self.stations)):
+            return
+        rev = self._rev_links.get(idx)
+        if rev is None:
+            rev = [(j, lk) for j, lks in enumerate(self.links) if j != idx
+                   for lk in lks if lk.target == idx]
+            self._rev_links[idx] = rev
+
+        def upd(src: Station, lk: Link) -> None:
+            o = self.stations[lk.target]
+            dx, dy, dz = o.x - src.x, o.y - src.y, o.z - src.z
+            az, _, d3 = azimuth_elev(dx, dy, dz)
+            lk.azimuth, lk.dist, lk.dist_h, lk.dz = az, d3, math.hypot(dx, dy), dz
+
+        me = self.stations[idx]
+        if idx < len(self.links):
+            for lk in self.links[idx]:
+                upd(me, lk)
+        for j, lk in rev:
+            upd(self.stations[j], lk)
+
     def adjust_alt(self, which, comp: str, sign: int) -> None:
         """Hauteur (dh) ou delta (ddelta) d'une bulle, ± un pas.
 
@@ -3475,6 +3512,10 @@ class BubbleNavApp(_TkBase):
         self._last_adj = (st.idx, comp, now)
         self.corrections.apply(st, **{comp: round(getattr(st, comp) + sign * step, 6)},
                                record=not burst)
+        self._refresh_links_of(st.idx)
+        if self._card_job:
+            self.after_cancel(self._card_job)
+        self._card_job = self.after(1600, self._card_expire)   # fin du surlignage
         self._after_edit(moved=True)
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         self._set_status(f"Station active {self._nom(st.idx)} : " + (
@@ -3493,44 +3534,89 @@ class BubbleNavApp(_TkBase):
         a = math.radians(az)
         return dist * math.sin(a), dist * math.cos(a)
 
-    def start_plan_drag(self, event, view: View, cam_idx: int, mode: str) -> bool:
-        """Début d'un déplacement en plan de la STATION ACTIVE.
+    def start_plan_drag(self, event, view: View, cam_idx: int, mode: str,
+                        hotspots: Sequence["Hotspot"] = ()) -> bool:
+        """Début d'un déplacement en plan de la STATION ACTIVE (et d'elle seule).
 
-        mode 'monde' (vue A) : on tire le terrain, la station part en sens
-        inverse ; le point du sol saisi reste sous le curseur.
-        mode 'pastille' (vue B) : la pastille de la station active suit le
-        curseur sur son sol.
+        mode 'monde' (vue A, la vue de la station active) : on tire le
+        terrain ; la station part en sens inverse. Saisir une pastille ancre
+        le geste sur son pied (son sol) : elle reste sous le curseur.
+        mode 'pastille' (vue B) : seule la pastille de la station active se
+        saisit (sphère, mât ou ombre) ; son pied suit le curseur sur le sol.
+        Le geste se calcule toujours sur un sol (plan bien conditionné, pas de
+        visée rasante vers l'horizon) : ce que l'on vise reste sous le curseur.
         Libre dans toutes les directions ; X / Y verrouillés le contraignent.
+        Retourne True si l'appui est pris par Espace (geste lancé ou refusé).
         """
         st = self.station()
         if st is None or not (0 <= cam_idx < len(self.stations)):
             return False
         cam = self.stations[cam_idx]
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        dz = -st.height(eye) if mode == 'monde' else st.ground(eye) - cam.z
         v = dc_replace(view)
-        p0 = self._ground_rel(v, cam, event.x, event.y, dz)
-        if p0 is None:
-            self._set_status("Espace + glisser : visez le sol (vers le bas de l'image)",
-                             COLORS['warning'])
-            return False
+        ax, ay = float(event.x), float(event.y)
+        grab = None
+        if mode == 'pastille':
+            hs = next((h for h in hotspots if h.link.target == st.idx), None)
+            if hs is None or not self._grabs_hotspot(hs, event.x, event.y):
+                self._set_status("Espace + glisser dans B : saisir la pastille de la "
+                                 f"station active {self._nom(st.idx)} (sphère, mât ou "
+                                 "ombre)", COLORS['warning'])
+                return True
+            grab = hs
+            dz = st.ground(eye) - cam.z
+        else:
+            hit = hotspot_hit(hotspots, event.x, event.y, self.relief()) if hotspots else None
+            if hit is not None:
+                grab = hotspots[hit]
+                dz = self.stations[grab.link.target].ground(eye) - cam.z
+            else:
+                dz = -st.height(eye)
+        if grab is not None:                   # ancrage : le pied de la pastille
+            ax, ay = grab.foot if grab.foot is not None else (grab.col, grab.row)
+        p0 = self._ground_rel(v, cam, ax, ay, dz)
+        if p0 is None or math.hypot(*p0) > PLAN_GRAB_MAX_M:
+            self._set_status("Espace + glisser : saisir le sol (ou une pastille) à moins "
+                             f"de {PLAN_GRAB_MAX_M:.0f} m, sous l'horizon", COLORS['warning'])
+            return True
         self.corrections.apply(st)                    # état avant le geste
         self._hs_drag = ('plan', {'idx': st.idx, 'start': (st.x, st.y), 'p0': p0,
-                                  'dz': dz, 'cam': cam_idx, 'view': v, 'mode': mode})
+                                  'dz': dz, 'cam': cam_idx, 'view': v, 'mode': mode,
+                                  'off': (event.x - ax, event.y - ay)})
         # fantômes : où étaient les pastilles avant le geste (vue A)
         self._ghosts = ([(h.col, h.row, h.radius, self.hotspot_color(h.link,
-                          self.stations[h.link.target]), h.foot is not None)
+                          self.stations[h.link.target]), h.foot)
                          for h in self.hotspots] if mode == 'monde' else [])
         self._draw_overlay()
+        self._redraw_compare()
         return True
+
+    def _grabs_hotspot(self, hs: "Hotspot", x: float, y: float) -> bool:
+        """Le point (x, y) touche-t-il la pastille : sphère, ombre ou mât ?"""
+        if hotspot_hit([hs], x, y, self.relief()) is not None:
+            return True
+        if hs.foot is None:
+            return False
+        fx, fy = hs.foot
+        rx, ry = hs.foot_r
+        if ((x - fx) / (rx + 10)) ** 2 + ((y - fy) / (ry + 10)) ** 2 <= 1.0:
+            return True
+        px, py, _ = self.sphere_pole(hs, False)       # mât : du pied au pôle sud
+        vx, vy = px - fx, py - fy
+        n2 = vx * vx + vy * vy
+        if n2 < 1e-6:
+            return False
+        t = clamp(((x - fx) * vx + (y - fy) * vy) / n2, 0.0, 1.0)
+        return math.hypot(x - (fx + t * vx), y - (fy + t * vy)) <= 8.0
 
     def _drag_plan(self, event) -> None:
         info = self._hs_drag[1]
         st = self.stations[info['idx']]
         cam = self.stations[info['cam']]
-        p = self._ground_rel(info['view'], cam, event.x, event.y, info['dz'])
-        if p is None:
-            return
+        ox, oy = info['off']
+        p = self._ground_rel(info['view'], cam, event.x - ox, event.y - oy, info['dz'])
+        if p is None or math.hypot(*p) > 2.0 * PLAN_GRAB_MAX_M:
+            return                                   # visée rasante : on ignore
         dx, dy = p[0] - info['p0'][0], p[1] - info['p0'][1]
         if info['mode'] == 'monde':                  # on tire le terrain
             dx, dy = -dx, -dy
@@ -3541,6 +3627,7 @@ class BubbleNavApp(_TkBase):
             dx = 0.0
         x0, y0 = info['start']
         self.corrections.apply(st, x=round(x0 + dx, 3), y=round(y0 + dy, 3), record=False)
+        self._refresh_links_of(st.idx)               # sphère, mât, ombre : en direct
         self._draw_overlay()
         self._redraw_compare()
         self._draw_plan()
@@ -3557,39 +3644,180 @@ class BubbleNavApp(_TkBase):
             if self.journal and self.journal[-1] == ('edit',):
                 self.journal.pop()
             self._draw_overlay()
+            self._redraw_compare()
             return
+        self._refresh_links_of(st.idx)
         self._after_edit(moved=True)
 
-    def ghost_of_active(self, canvas, view: View, cam: Station) -> None:
-        """Vue B : position d'origine (CSV) de la station active, en transparence,
-        reliée à sa position corrigée."""
-        st = self.station()
-        if st is None or st.idx == cam.idx or not (st.moved() or st.z_changed()):
-            return
+    def _ghost_station(self, canvas, view: View, cam: Station, st: Station, x: float,
+                       y: float, label: str, link_to_current: bool) -> None:
+        """Station fantôme (en transparence) : sphère, mât et empreinte au sol."""
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        h0 = st.h0 if st.h0 is not None else eye
         vue = self.anchor() == 'vue'
-        z0 = st.oz if vue else st.oz - h0
-        z1 = st.z if vue else st.ground(eye)
-        a = project_point(view, self.calib, cam.north_pct, st.ox - cam.x, st.oy - cam.y,
-                          z0 - cam.z)
-        b = project_point(view, self.calib, cam.north_pct, st.x - cam.x, st.y - cam.y,
-                          z1 - cam.z)
+        north = cam.north_pct
+        dx, dy = x - cam.x, y - cam.y
+        g = st.ground(eye) - cam.z
+        top = (st.z if vue else st.ground(eye)) - cam.z
+        a = project_point(view, self.calib, north, dx, dy, top)
         if a is None or a[2] < 0.05:
             return
-        d = max(0.35, math.hypot(st.ox - cam.x, st.oy - cam.y))
+        grey = '#c8c8c8'
+        pts = []
+        for k in range(25):                         # empreinte au sol, pointillée
+            t = 2 * math.pi * k / 24
+            pr = project_point(view, self.calib, north, dx + MIRE_RING_M * math.sin(t),
+                               dy + MIRE_RING_M * math.cos(t), g)
+            if pr is None or pr[2] < 0.05:
+                pts = []
+                break
+            pts += [pr[0], pr[1]]
+        if pts:
+            canvas.create_line(*pts, fill=grey, width=1, dash=(3, 3), tags='hs')
+        d = max(0.35, math.hypot(dx, dy))
         r_min, r_max = self.disc_bounds()
         r = clamp(view.focal() * float(self.cfg.get('disc_radius', DISC_RADIUS_M)) / d,
                   r_min, r_max)
-        if b is not None and b[2] > 0.05:
-            canvas.create_line(a[0], a[1], b[0], b[1], fill=COLORS['edit'], width=2,
-                               dash=(4, 3), tags='hs')
+        if vue:                                     # mât pointillé : sol → pôle sud
+            f = project_point(view, self.calib, north, dx, dy, g)
+            if f is not None and f[2] > 0.05:
+                rs = SPHERE_RADIUS * r if self.relief() else r
+                canvas.create_line(f[0], f[1], a[0], a[1] + rs, fill=grey, width=1,
+                                   dash=(3, 3), tags='hs')
+        if link_to_current:                         # trajet au sol jusqu'à la position actuelle
+            f0 = project_point(view, self.calib, north, dx, dy, g)
+            f1 = project_point(view, self.calib, north, st.x - cam.x, st.y - cam.y, g)
+            if f0 and f1 and f0[2] > 0.05 and f1[2] > 0.05:
+                canvas.create_line(f0[0], f0[1], f1[0], f1[1], fill=COLORS['edit'],
+                                   width=2, dash=(4, 3), arrow='last', tags='hs')
         if self.relief():
             photo, ax, ay = self._sprite(local_color(st.parts().local or st.floor), r,
                                          False, alpha=0.35, floating=vue)
             canvas.create_image(a[0] - ax, a[1] - ay, anchor='nw', image=photo, tags='hs')
-        canvas.create_text(a[0], a[1] - SPHERE_RADIUS * r - 8, text="origine CSV",
-                           fill=MARK_TEXT, font=F_TINY, tags='hs')
+        lx = a[0] - SPHERE_RADIUS * r - 6            # à gauche de la sphère
+        canvas.create_text(lx + 1, a[1] + 1, text=label, anchor='e',
+                           fill='#000000', font=F_TINY_B, tags='hs')
+        canvas.create_text(lx, a[1], text=label, anchor='e',
+                           fill='white', font=F_TINY_B, tags='hs')
+
+    def ghost_of_active(self, canvas, view: View, cam: Station) -> None:
+        """Vue B : la station active en transparence à son point de départ (pendant
+        Espace + glisser) et à sa position d'origine du CSV (si elle a bougé)."""
+        st = self.station()
+        if st is None or st.idx == cam.idx:
+            return
+        start = None
+        if self._hs_drag and self._hs_drag[0] == 'plan':
+            start = self._hs_drag[1]['start']
+        orig_moved = math.hypot(st.x - st.ox, st.y - st.oy) > 0.005
+        if start is not None and math.hypot(start[0] - st.ox, start[1] - st.oy) > 0.005:
+            self._ghost_station(canvas, view, cam, st, start[0], start[1], "départ", True)
+        if orig_moved:
+            self._ghost_station(canvas, view, cam, st, st.ox, st.oy,
+                                "origine CSV" if start is None or
+                                math.hypot(start[0] - st.ox, start[1] - st.oy) > 0.005
+                                else "départ · origine CSV", start is None or
+                                math.hypot(start[0] - st.ox, start[1] - st.oy) <= 0.005)
+
+    # ── fiche de la station active : sol, Δ, H, Z ────────────────────
+    def _card_expire(self) -> None:
+        self._card_job = None
+        self._draw_overlay()
+        self._redraw_compare()
+
+    def card_in_b(self) -> bool:
+        """La fiche s'affiche aussi dans B quand on y corrige la station active."""
+        if self._hs_drag and self._hs_drag[0] == 'plan' and \
+                self._hs_drag[1]['mode'] == 'pastille':
+            return True
+        return time.monotonic() < getattr(self, '_card_b_until', 0.0)
+
+    def _card_bg(self, w: int, h: int, border: str):
+        """Fond de la fiche : sombre, semi-opaque, coins arrondis (mis en cache)."""
+        key = ('fiche', w, h, border)
+        hit = self._sprites.get(key)
+        if hit is not None:
+            return hit
+        from PIL import Image, ImageDraw, ImageTk
+        ss = 2
+        img = Image.new('RGBA', (w * ss, h * ss), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(img)
+        rgb = tuple(int(border[i:i + 2], 16) for i in (1, 3, 5))
+        dr.rounded_rectangle((0, 0, w * ss - 1, h * ss - 1), radius=9 * ss,
+                             fill=(12, 14, 18, 212), outline=rgb + (255,), width=2 * ss)
+        img = img.resize((w, h), Image.LANCZOS)
+        entry = ImageTk.PhotoImage(img)
+        if len(self._sprites) >= 400:
+            self._sprites.pop(next(iter(self._sprites)))
+        self._sprites[key] = entry
+        return entry
+
+    def draw_active_card(self, canvas, view: View, bottom: float) -> None:
+        """Fiche de la station active, en bas à gauche de la vue : sol (plancher),
+        Δ, H appareil et Z final = sol + Δ + H, à jour à chaque cran de molette ;
+        ΔX / ΔY depuis le CSV si elle a bougé. La valeur qui vient de changer est
+        surlignée ; les valeurs corrigées sont en orange, avec leur valeur CSV."""
+        st = self.station()
+        if st is None or not self.cfg.get('show_card', True):
+            return
+        eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        h0 = st.h0 if st.h0 is not None else eye
+        sol = st.floor_alt if st.floor_alt is not None else st.ground(eye) - st.delta(eye)
+        last = getattr(self, '_last_adj', None)
+        flash = (last[1] if last is not None and last[0] == st.idx
+                 and time.monotonic() - last[2] < 1.5 else None)
+        def num(v: float, sg: bool = True) -> str:
+            v = round(v, 3) + 0.0                     # jamais « -0,000 »
+            return (f"{v:+.3f}" if sg else f"{v:.3f}").replace('.', ',')
+        rows = [("Sol plancher", num(sol, False), '', None, False),
+                ("Δ delta", num(st.delta(eye)), f"CSV {num(st.delta(eye) - st.ddelta)}",
+                 'ddelta', st.shifted()),
+                ("H appareil", num(st.height(eye), False), f"CSV {num(h0, False)}",
+                 'dh', st.raised()),
+                ("Z final", num(st.z, False), "sol + Δ + H", None, st.z_changed())]
+        if st.moved() or (self._hs_drag and self._hs_drag[0] == 'plan'):
+            rows.append(("ΔX / ΔY", f"{num(st.x - st.ox)} / {num(st.y - st.oy)}",
+                         "depuis le CSV", 'xy', st.moved()))
+        scan = st.key if st.key_explicit and st.key and st.key != st.locator else ''
+        head = (f"{scan} · " if scan else '') + f"{st.locator} — station active"
+        pad, lh = 12, 24
+        x0 = 14
+        tag = 'hs'
+        items = []
+        t = canvas.create_text(0, 0, text=head, anchor='nw', font=F_CARD, tags=tag)
+        items.append(t)
+        w_head = canvas.bbox(t)[2] - canvas.bbox(t)[0]
+        lw = max(canvas.bbox(i)[2] for i in [canvas.create_text(
+            0, 0, text=r[0], anchor='nw', font=F_CARD, tags=('hs', '_m')) for r in rows])
+        vw = max(canvas.bbox(i)[2] for i in [canvas.create_text(
+            0, 0, text=r[1], anchor='nw', font=F_CARD_V, tags=('hs', '_m')) for r in rows])
+        nw = max([canvas.bbox(i)[2] for i in [canvas.create_text(
+            0, 0, text=r[2], anchor='nw', font=F_UI, tags=('hs', '_m')) for r in rows
+            if r[2]]] or [0])
+        canvas.delete('_m')
+        canvas.delete(t)
+        width = int(max(w_head, lw + 18 + vw + 14 + nw) + 2 * pad)
+        height = int(pad + 22 + len(rows) * lh + pad - 4)
+        y0 = bottom - height
+        border = COLORS['edit'] if st.modified() else '#5a6270'
+        canvas.create_image(x0, y0, anchor='nw', image=self._card_bg(width, height, border),
+                            tags=tag)
+        canvas.create_text(x0 + pad, y0 + pad - 2, text=head, anchor='nw', font=F_CARD,
+                           fill=COLORS['edit'] if st.modified() else COLORS['hot'], tags=tag)
+        y = y0 + pad + 24
+        for label, val, note, comp, changed in rows:
+            hot = flash is not None and comp == flash
+            if hot:
+                canvas.create_rectangle(x0 + 4, y - 3, x0 + width - 4, y + lh - 5,
+                                        fill='#3a3000', outline='', tags=tag)
+            canvas.create_text(x0 + pad, y, text=label, anchor='nw', font=F_CARD,
+                               fill='#d8dde6', tags=tag)
+            col = (COLORS['hot'] if hot else COLORS['edit'] if changed else 'white')
+            canvas.create_text(x0 + pad + lw + 18 + vw, y - 1, text=val, anchor='ne',
+                               font=F_CARD_V, fill=col, tags=tag)
+            if note and (changed or comp is None):
+                canvas.create_text(x0 + pad + lw + 18 + vw + 14, y + 3, text=note,
+                                   anchor='nw', font=F_UI, fill='#9aa3b2', tags=tag)
+            y += lh
 
     def wheel_step(self) -> float:
         """Pas de la molette pour H et Δ (Réglages : 1 ou 5 cm, 5 par défaut)."""
@@ -3609,6 +3837,8 @@ class BubbleNavApp(_TkBase):
         if not (alt or shift):
             return False
         if self.current >= 0:
+            if station_idx != self.current:
+                self._card_b_until = time.monotonic() + 2.5
             self.adjust_alt(self.current, 'ddelta' if alt else 'dh', direction)
         return True
 
@@ -3805,6 +4035,12 @@ class BubbleNavApp(_TkBase):
                                                                    bool(self.tip_var.get())),
                                               self.canvas.delete('tip'),
                                               self.compare and self.compare.canvas.delete('tip')))
+        self.card_var = tk.BooleanVar(value=bool(self.cfg.get('show_card', True)))
+        menu.add_checkbutton(label="Fiche de la station active (sol, Δ, H, Z)",
+                             variable=self.card_var,
+                             command=lambda: (self.cfg.__setitem__('show_card',
+                                                                   bool(self.card_var.get())),
+                                              self._draw_overlay(), self._redraw_compare()))
         self.mire_var = tk.BooleanVar(value=bool(self.cfg.get('show_mire', True)))
         menu.add_checkbutton(label="Mire de hauteur (empreinte au sol, sol → caméra)",
                              variable=self.mire_var,
@@ -4192,6 +4428,7 @@ class BubbleNavApp(_TkBase):
         self.links = build_graph(self.stations, self.graph_params())
         if hasattr(self, '_near_cache'):
             self._near_cache.clear()
+        self._rev_links = {}
         self.plan_edges = plan_skeleton(self.stations, self.links)
         dt = (time.perf_counter() - t0) * 1000.0
         n_links = sum(len(v) for v in self.links)
@@ -4897,10 +5134,14 @@ class BubbleNavApp(_TkBase):
             self._axis_hits = []
             self._axis_labels = []
         if espace:                               # avant le geste, en transparence
-            for col, row, rad, color, flot in getattr(self, '_ghosts', []):
+            for col, row, rad, color, foot in getattr(self, '_ghosts', []):
+                if foot is not None:                 # mât d'avant, pointillé
+                    rs = SPHERE_RADIUS * rad if self.relief() else rad
+                    self.canvas.create_line(foot[0], foot[1], col, row + rs,
+                                            fill='#c8c8c8', width=1, dash=(3, 3), tags='hs')
                 if self.relief():
                     photo, ax, ay = self._sprite(color, rad, False, alpha=0.30,
-                                                 floating=flot)
+                                                 floating=foot is not None)
                     self.canvas.create_image(col - ax, row - ay, anchor='nw', image=photo,
                                              tags='hs')
         libres = self.declutter(self.hotspots)
@@ -4975,8 +5216,8 @@ class BubbleNavApp(_TkBase):
                 text="ÉDITION — glisser pastille ou axe : déplacement sur un axe "
                      "(X/Y/Z verrouille) · Ctrl : bulle active · Maj : tourner l'image")
             self._axis_readout(view)
-        elif self._hs_drag and self._hs_drag[0] == 'plan':
-            self._axis_readout(view)
+        self.draw_active_card(self.canvas, view,
+                              view.height - (48 if self.edit_mode else 12))
         # rose des vents : direction du nord dans la vue
         pr = project(view, self.calib.pano_yaw(0.0, st.north_pct), 0.0)
         if pr is not None:
@@ -5107,7 +5348,8 @@ class BubbleNavApp(_TkBase):
             # on tire le terrain, les pastilles suivent le curseur
             self._space_used = True
             if self.start_plan_drag(event, self._frame_view or self.view, self.current,
-                                    'monde'):
+                                    'monde', self.hotspots):
+                self._drag = None
                 return
         if self.edit_mode and self.current >= 0:
             st = self.station()
@@ -7773,6 +8015,8 @@ class CompareView(tk.Frame if _TK_OK else object):
                 app.draw_mire(self.canvas, view, me, app.stations[idx],
                               COLORS['hot'] if idx == app.current else 'white',
                               hs=h, hovered=k is not None and k == self._hover)
+        if app.card_in_b():
+            app.draw_active_card(self.canvas, view, view.height - 12)
         if self._hover is not None and self._hover_xy:
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
         st = self.station()
@@ -7822,7 +8066,7 @@ class CompareView(tk.Frame if _TK_OK else object):
             # Espace + glisser dans B : la pastille de la station active suit le curseur
             app._space_used = True
             if app.start_plan_drag(event, self._frame_view or self.view, self.idx,
-                                   'pastille'):
+                                   'pastille', self.hotspots):
                 self._drag = None
                 return
         self._drag = (event.x, event.y, self.view.yaw, self.view.pitch,

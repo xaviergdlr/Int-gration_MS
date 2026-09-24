@@ -446,7 +446,14 @@ dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
      active ;
    * pour corriger la voisine sondée, **I** l'échange avec A : elle devient
      active ;
-   * l'en-tête de chaque vue affiche en permanence H et Δ de sa bulle.
+   * l'en-tête de chaque vue affiche en permanence H et Δ de sa bulle ;
+   * la **fiche de la station active**, en bas à gauche de A (en gros, sur
+     fond sombre), centralise **sol plancher, Δ, H appareil et Z final**
+     (= sol + Δ + H), et ΔX / ΔY si elle a bougé. Elle se met à jour à chaque
+     cran de molette, la valeur qui change est surlignée, les valeurs
+     corrigées passent en orange avec leur valeur CSV. Elle apparaît aussi
+     dans B quand on y corrige. Affichage › Fiche de la station active pour
+     la masquer.
 
    Le pas de la molette est de **5 cm** (1 cm au choix, dans Réglages). Une rafale
    de molette ne compte que pour une étape de **Ctrl+Z**. Tout s'enregistre dans
@@ -463,13 +470,17 @@ A → B · B → A · Suivi de A · Vue liée. Les valeurs corrigées passent en
 
 **Déplacer en plan sans le mode édition** — toujours la **station active**,
 en X / Y seulement (le Z se règle à la molette) :
-* **dans A** : maintenir **Espace** et glisser en visant le sol. On « attrape »
-  le sol et le monde suit la main, dans **toutes les directions** ; les
-  pastilles d'avant le geste restent affichées **en transparence**, pour voir
-  le point de vue se décaler par rapport à elles ;
-* **dans B** (après un Ctrl+clic sur une voisine) : Espace + glisser, et la
-  pastille de la station active **suit le curseur** au sol ; sa position CSV
-  d'origine reste visible en transparence (« origine CSV », trait pointillé) ;
+* **dans A** : maintenir **Espace** et glisser en saisissant le sol ou une
+  pastille. Ce que l'on saisit **reste sous le curseur** et le monde suit la
+  main, dans **toutes les directions** ; les pastilles d'avant le geste restent
+  affichées **en transparence** (sphère et mât pointillé) ;
+* **dans B** (après un Ctrl+clic sur une voisine) : Espace + glisser **sur la
+  pastille de la station active** (sphère, mât ou ombre) — ailleurs, le geste
+  est refusé. Sphère, mât, ombre et mire suivent le curseur **en direct** ; le
+  **point de départ** reste en transparence (sphère, mât et empreinte
+  pointillés, flèche vers la nouvelle position), comme l'origine CSV ;
+* le geste se calcule toujours sur le sol (jamais en visée rasante vers
+  l'horizon, au-delà de 30 m) : ce qui est lâché reste là où on l'a posé ;
 * **X / Y** verrouillent un axe si besoin (2e appui : libre) ;
 * la lecture ΔX / ΔY par rapport au CSV s'affiche pendant le geste ; le geste
   entier s'annule d'un **Ctrl+Z**.
