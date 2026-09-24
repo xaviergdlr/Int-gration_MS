@@ -2687,36 +2687,41 @@ HELP_TEXT = """\
 PRINCIPE
   Le CSV d'entrée donne pour chaque station : X, Y, Z plancher, Delta (Δ),
   Hauteur instrument (H). Le Z final (point de vue) = plancher + Δ + H.
-  Seule la STATION ACTIVE (celle de la vue A) se corrige, et seulement en :
-  position XY, Δ, H — plus l'orientation de son image. Tout est borné :
-  XY à 5 m au plus du CSV, H entre 0,10 et 3 m, |Δ| ≤ 3 m.
+  A et B sont deux POINTS DE VUE fixes : on ne corrige jamais la station où
+  l'on se trouve. On corrige une VOISINE, que l'on voit sous deux angles.
+  La STATION ACTIVE est celle que l'on SURVOLE (dans A, dans B ou sur le
+  plan) : elle est cerclée, sa fiche et sa mire s'affichent dans A et dans B.
+  Tout est borné : XY à 5 m au plus du CSV, H entre 0,10 et 3 m, |Δ| ≤ 3 m.
 
-CORRIGER LA STATION ACTIVE  (le curseur peut être dans A, dans B ou sur le plan)
+CORRIGER LA STATION SURVOLÉE
   Alt + molette .............. Δ ± un pas (5 cm, ou 1 cm dans Réglages) : le
-                               tronçon Δ monte du plancher, H et la sphère suivent
-  Maj + molette .............. H ± un pas : la sphère monte, le sol local reste
-  Ctrl + molette ............. orientation de l'image ± 1° (0,1° dans Réglages) ;
-                               elle tourne dans la vue A ; jamais dans le CSV
-  Espace + glisser ........... position XY, sur le PLAN (le point cerclé de la
-                               station active) ou dans la VUE B (sa pastille) ;
-                               la vue A reste figée et se recale au lâcher
+                               tronçon rose monte du plancher (le cercle au
+                               plancher ne bouge jamais), H et la sphère suivent
+  Maj + molette .............. H ± un pas : la mire H s'allonge depuis le haut
+                               de Δ, seule la sphère monte
+  Espace + glisser ........... position XY : saisir sa pastille (sphère, mât ou
+                               ombre) dans A ou dans B, ou son point sur le plan ;
+                               elle suit le curseur, son départ reste en
+                               transparence ; rien d'autre ne bouge
   X / Y ...................... verrouiller un axe pour Espace + glisser (2e appui :
                                libre)
+  Ctrl + molette ............. orientation de l'image DE LA VUE où est le curseur
+                               ± 1° (0,1° dans Réglages) ; appliquée à l'image,
+                               jamais au CSV
+  ↺ CSV ...................... station active : revenir à ses valeurs du CSV
   Ctrl+Z ..................... annuler (une rafale de molette = une étape)
-  Corriger une voisine ....... Ctrl+clic dessus (elle s'ouvre en B), puis I :
-                               A et B s'échangent, elle devient active
-  Fiche (A et B) ............. Z plancher, Δ, H, Z final, ΔX / ΔY, orientation,
-                               et une COUPE : plancher, Δ (rose), mire H, sphère ;
-                               à jour à chaque cran (CSV d'origine en pointillé)
-  Dans A ..................... changer Δ ou H déplace la CAMÉRA : les voisines se
-                               recalent sur la photo — c'est le contrôle de H / Δ
+  J ou « ◎ Station active » .. B se tourne vers la station active (second angle)
+  Fiche (A et B) ............. Z plancher, Δ, H, Z final, ΔX / ΔY de la station
+                               active, et une coupe : plancher, Δ (rose), mire H,
+                               sphère ; à jour à chaque cran
 
 LIRE LA 3D DANS LA BULLE
   Sphère ..................... le point de vue (Z final), à sa taille réelle :
                                plus elle est petite, plus elle est loin ; les
                                stations lointaines sont estompées
-  Mât, ombre, empreinte ...... ancrés au Z plancher ; tronçon Δ rose jusqu'au sol
-                               local, puis mire H graduée (10 cm) jusqu'à la sphère
+  Cercle, ombre, pied du mât . au Z plancher : IMMUABLES ; au-dessus, le tronçon
+                               Δ rose (fixe en bas, variable en haut), puis la
+                               mire H graduée (du haut de Δ à la sphère)
   Réseau au sol .............. les liens entre stations, tracés sur le plancher :
                                ils fuient vers l'horizon et donnent la profondeur
   Trait pointillé vertical ... centre de l'image (« nord image ») ; il tourne avec
@@ -2734,7 +2739,8 @@ NAVIGATION  (vue A ou B)
   Flèches (Maj = pas large) .. tourner ; Origine (Home) : redresser
   Entrée, ou Espace bref ..... avancer vers la pastille la plus centrale
   Retour arrière ............. revenir à la bulle précédente
-  O / G / I .................. d'où l'on vient / face à face / inverser A et B
+  O / G / I / J .............. d'où l'on vient / face à face / inverser A et B /
+                               B regarde la station active
 
 AFFICHAGE
   Liste « Voir » ............. Local, Locaux voisins, De proche en proche (défaut),
@@ -2747,8 +2753,8 @@ AFFICHAGE
 
 PLAN
   Clic : aller sur la station ; clic droit : l'ouvrir en B ; clic droit glissé :
-  déplacer le plan ; molette : zoom. Espace + glisser le point de la station
-  active : la déplacer en XY (les autres points ne se déplacent jamais).
+  déplacer le plan ; molette : zoom. Survol : la station devient active ;
+  Espace + glisser son point : la déplacer en XY ; Alt / Maj + molette : Δ / H.
 
 FICHIERS
   Ctrl+S ..................... « Appliquer / enregistrer » : CSV de sortie = le
@@ -2776,8 +2782,8 @@ BUTTON_TIPS: Dict[str, str] = {
     "?": "Aide : tous les raccourcis clavier et gestes (F1).",
     "Quitter": "Fermer le programme (les corrections sont enregistrées).",
     "Module": "Revenir au module principal (fichiers, état, réglages).",
-    "Comparer  (C)": "Ouvrir / fermer la seconde vue bulle (B). Dans B, Espace + glisser la "
-                     "pastille de la station active corrige sa position XY.",
+    "Comparer  (C)": "Ouvrir / fermer la seconde vue bulle (B) : un second point de vue "
+                     "sur la station que l'on corrige depuis A.",
     "✕": "Masquer le visualiseur (touche V pour le rouvrir).",
     "⛶": "Plein écran (F11), Échap pour en sortir.",
     "Recadrer": "Recadrer le plan sur tout le plancher affiché.",
@@ -2789,7 +2795,7 @@ BUTTON_TIPS: Dict[str, str] = {
     "Parcourir…": "Choisir le fichier ou le dossier de sortie.",
     "Tout réinitialiser": "Revenir aux valeurs du CSV pour toutes les stations "
                           "(confirmation demandée, annulable).",
-    "↺ CSV": "Station active : revenir à ses valeurs du CSV (annulable par Ctrl+Z).",
+    "↺ CSV": "Station active (survolée) : revenir à ses valeurs du CSV (annulable).",
 }
 
 
@@ -2871,7 +2877,10 @@ class BubbleNavApp(_TkBase):
         self.by_key: Dict[str, Station] = {}
         self.csv_mapping: Optional[Dict[str, str]] = None   # correspondance imposee
         self.incoherences: Dict[int, str] = {}     # étage déduit contredit par Z
-        self._hs_drag = None                     # Espace + glisser en cours (vue B)
+        self._hs_drag = None                     # Espace + glisser en cours
+        # STATION ACTIVE = la station voisine survolée et corrigée (jamais le point
+        # de vue A ni B : on corrige ce que l'on voit, sous deux angles)
+        self.target: Optional[int] = None
         self._axis_lock: Optional[str] = None    # X / Y verrouillé pour ce geste
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
@@ -3265,7 +3274,10 @@ class BubbleNavApp(_TkBase):
                      "A regarde B et B regarde A : chaque vue montre la pastille de l'autre (G)."),
                     ("⇄ Inverser", self.swap_ab, "Échanger A et B, bulles et regards compris (I)."),
                     ("A → B", self.a_to_b, "Mettre dans B la bulle et le regard de A."),
-                    ("B → A", self.b_to_a, "Mettre dans A la bulle et le regard de B.")):
+                    ("B → A", self.b_to_a, "Mettre dans A la bulle et le regard de B."),
+                    ("◎ Station active", self.b_look_target,
+                     "B se tourne vers la station active (survolée), pour la voir sous un "
+                     "second angle (touche J).")):
                 mk(bar, txt, cmd, tip=tip).pack(side='left', padx=2, pady=3)
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y', padx=6, pady=5)
         name = tk.Label(bar, text=which, font=F_UI_B, bg=COLORS['bg_medium'],
@@ -3276,13 +3288,13 @@ class BubbleNavApp(_TkBase):
             val = tk.Label(bar, text=f"{lib} —", font=F_MONO, bg=COLORS['bg_medium'],
                            fg=COLORS['text'], width=9)
             val.pack(side='left')
-            Tooltip(val, (f"Hauteur instrument H de la bulle {which}. Maj + molette : H de la "
-                          "station ACTIVE (vue A), où que soit le curseur.") if comp == 'dh'
-                    else (f"Delta Δ de la bulle {which}. Alt + molette : Δ de la station "
-                          "ACTIVE (vue A), où que soit le curseur."))
+            Tooltip(val, (f"Hauteur instrument H du point de vue {which} (fixe). Maj + "
+                          "molette corrige la station SURVOLÉE.") if comp == 'dh'
+                    else (f"Delta Δ du point de vue {which} (fixe). Alt + molette corrige "
+                          "la station SURVOLÉE."))
             self.ctrl_vals[(which, comp)] = val
         mk(bar, "↺ CSV", self._revert_active,             # mêmes commandes dans A et B
-           tip="Station active : revenir à ses valeurs du CSV (annulable par Ctrl+Z)."
+           tip="Station active (survolée) : revenir à ses valeurs du CSV (annulable)."
            ).pack(side='left', padx=(8, 2), pady=3)
         self._refresh_ctrlbar()
 
@@ -3371,6 +3383,16 @@ class BubbleNavApp(_TkBase):
         self._set_status(f"Face à face : {self._nom(self.current)} ↔ {self._nom(b.idx)}",
                          COLORS['sel'])
 
+    def b_look_target(self) -> None:
+        """Touche J : B se tourne vers la station active (sur demande seulement)."""
+        cv, st = self.compare, self.target_station()
+        if cv is None or st is None:
+            self._set_status("Survolez d'abord une station voisine, et ouvrez B "
+                             "(Ctrl+clic sur une autre voisine)")
+            return
+        cv.aim_at_station(st.idx)
+        self._set_status(f"B regarde la station active {self._nom(st.idx)}", COLORS['sel'])
+
     def swap_ab(self) -> None:
         """Touche I : A et B échangent bulles et regards."""
         cv = self.compare
@@ -3451,16 +3473,57 @@ class BubbleNavApp(_TkBase):
         for j, lk in rev:
             upd(self.stations[j], lk)
 
-    def adjust_active(self, comp: str, sign: int) -> None:
-        """Station ACTIVE seulement : Δ ('ddelta'), H ('dh') ou orientation
-        ('yaw_fix'), d'un pas dans le sens `sign`.
+    # ── station active : la voisine survolée ─────────────────────────
+    def can_edit(self, idx: Optional[int]) -> bool:
+        """Station corrigeable : une voisine vue, jamais un point de vue (A ou B)."""
+        if idx is None or not (0 <= idx < len(self.stations)) or idx == self.current:
+            return False
+        return self.compare is None or idx != self.compare.idx
+
+    def target_station(self) -> Optional[Station]:
+        if self.target is not None and not self.can_edit(self.target):
+            self.target = None                # devenue point de vue : plus corrigeable
+        return self.stations[self.target] if self.target is not None else None
+
+    def set_target(self, idx: Optional[int]) -> None:
+        """La station survolée devient la station active (elle le reste jusqu'au
+        survol d'une autre) : fiche, mire et fantôme la suivent dans A et B."""
+        if not self.can_edit(idx) or idx == self.target:
+            return
+        self.target = idx
+        self._draw_overlay()
+        self._redraw_compare()
+        self._draw_plan()
+
+    def station_at(self, hotspots: Sequence["Hotspot"], x: float, y: float) -> Optional[int]:
+        """Station désignée au point (x, y) : sphère, mât ou cercle au plancher.
+        La station active passe d'abord (sa sphère monte sous la molette, son mât
+        et son cercle restent sous le curseur), puis la sphère du dessus, puis
+        un mât ou un cercle."""
+        if not hotspots:
+            return None
+        tst = self.target_station()
+        if tst is not None:
+            th = next((h for h in hotspots if h.link.target == tst.idx), None)
+            if th is not None and self._grabs_hotspot(th, x, y):
+                return tst.idx
+        hit = hotspot_hit(hotspots, x, y, self.relief())
+        if hit is not None:
+            return hotspots[hit].link.target
+        for h in reversed(hotspots):
+            if self._grabs_hotspot(h, x, y):
+                return h.link.target
+        return None
+
+    def adjust_station(self, idx: int, comp: str, sign: int) -> None:
+        """Δ ('ddelta'), H ('dh') ou orientation ('yaw_fix') d'une station, d'un pas.
 
         Bornes et arrondis : voir Corrections.apply (la borne atteinte est
         affichée). Une rafale de molette ne compte que pour une annulation.
         """
-        st = self.station()
-        if st is None:
+        if not (0 <= idx < len(self.stations)):
             return
+        st = self.stations[idx]
         step = self.yaw_step() if comp == 'yaw_fix' else self.wheel_step()
         now = time.monotonic()
         last = getattr(self, '_last_adj', None)
@@ -3474,15 +3537,19 @@ class BubbleNavApp(_TkBase):
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         if comp == 'yaw_fix':
             self._after_edit(turned=True)
-            msg = (f"orientation de l'image {st.yaw_fix:+.2f}° — elle tourne dans la vue A "
-                   "(appliquée à l'image, pas au CSV)")
+            if self.compare is not None and self.compare.idx == idx:
+                self.compare.request_render(force=True)
+            vue = 'A' if idx == self.current else 'B'
+            msg = (f"orientation de l'image {st.yaw_fix:+.2f}° (vue {vue} ; appliquée à "
+                   "l'image, jamais au CSV)")
+            nom = f"Image de la vue {vue} ({self._nom(idx)})"
         else:
             self._refresh_links_of(st.idx)
             self._after_edit(moved=True)
             msg = (f"H {st.height(eye):.3f}" if comp == 'dh' else f"Δ {st.delta(eye):+.3f}") \
                 + f" → Z final {st.z:.3f}"
-        self._set_status(f"Station active {self._nom(st.idx)} : {msg}"
-                         + (f"   ⚠ {borne}" if borne else ''),
+            nom = f"Station active {self._nom(idx)}"
+        self._set_status(f"{nom} : {msg}" + (f"   ⚠ {borne}" if borne else ''),
                          COLORS['warning'] if borne else COLORS['edit'])
 
     # ── déplacement en plan de la station active (Espace + glisser) ────
@@ -3498,27 +3565,30 @@ class BubbleNavApp(_TkBase):
 
     def start_plan_drag(self, event, view: View, cam_idx: int,
                         hotspots: Sequence["Hotspot"] = ()) -> bool:
-        """Début d'un déplacement en plan de la STATION ACTIVE, depuis la vue B.
-
-        Seule la pastille de la station active se saisit (sphère, mât ou
-        ombre) ; son pied, ancré au plancher, suit le curseur sur le plancher.
-        Le geste se calcule sur ce plan (bien conditionné, jamais en visée
-        rasante vers l'horizon) : ce que l'on saisit reste sous le curseur.
+        """Début d'un déplacement en plan de la station SAISIE (sphère, mât ou
+        ombre) dans la vue A ou B : elle devient la station active. Son pied,
+        ancré au plancher, suit le curseur sur le plancher ; les points de vue ne
+        bougent pas, donc rien d'autre ne bouge. Le geste se calcule sur ce plan
+        (jamais en visée rasante) : ce que l'on saisit reste sous le curseur.
         Libre dans toutes les directions ; X / Y verrouillés le contraignent.
         Retourne True si l'appui est pris par Espace (geste lancé ou refusé).
         """
-        st = self.station()
-        if st is None or not (0 <= cam_idx < len(self.stations)) or cam_idx == st.idx:
+        if not (0 <= cam_idx < len(self.stations)):
             return False
+        hs = None
+        for h in reversed(hotspots):                  # la pastille du dessus
+            if self._grabs_hotspot(h, event.x, event.y):
+                hs = h
+                break
+        if hs is None or not self.can_edit(hs.link.target):
+            self._set_status("Espace + glisser : saisir la pastille d'une station voisine "
+                             "(sphère, mât ou ombre) — pas un point de vue A ou B",
+                             COLORS['warning'])
+            return True
+        st = self.stations[hs.link.target]
         cam = self.stations[cam_idx]
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         v = dc_replace(view)
-        hs = next((h for h in hotspots if h.link.target == st.idx), None)
-        if hs is None or not self._grabs_hotspot(hs, event.x, event.y):
-            self._set_status("Espace + glisser dans B : saisir la pastille de la "
-                             f"station active {self._nom(st.idx)} (sphère, mât ou "
-                             "ombre)", COLORS['warning'])
-            return True
         # ancrage : le pied du mât (Z plancher), ou la pastille posée au sol local
         dz = (st.plancher(eye) if hs.foot is not None else st.ground(eye)) - cam.z
         ax, ay = hs.foot if hs.foot is not None else (hs.col, hs.row)
@@ -3527,10 +3597,12 @@ class BubbleNavApp(_TkBase):
             self._set_status("Espace + glisser : pastille trop loin ou trop près de "
                              f"l'horizon (plus de {PLAN_GRAB_MAX_M:.0f} m)", COLORS['warning'])
             return True
+        self.target = st.idx
         self.corrections.apply(st)                    # état avant le geste
         self._hs_drag = ('plan', {'idx': st.idx, 'start': (st.x, st.y), 'p0': p0,
                                   'dz': dz, 'cam': cam_idx, 'view': v, 'mode': 'pastille',
                                   'off': (event.x - ax, event.y - ay)})
+        self._draw_overlay()
         self._redraw_compare()
         return True
 
@@ -3571,10 +3643,9 @@ class BubbleNavApp(_TkBase):
         self.corrections.apply(st, x=st.ox + round(x0 + dx - st.ox, 3),
                                y=st.oy + round(y0 + dy - st.oy, 3), record=False)
         self._refresh_links_of(st.idx)               # sphère, mât, ombre : en direct
-        self._redraw_card_a()                        # A figée pendant le geste
-        self._redraw_compare()
+        self._draw_overlay()                         # les points de vue ne bougent pas :
+        self._redraw_compare()                       # seule la station saisie bouge
         self._draw_plan()
-        self._refresh_ctrlbar()
         self._set_status(f"Station active {self._nom(st.idx)} : ΔX {st.x - st.ox:+.3f}  "
                          f"ΔY {st.y - st.oy:+.3f} m depuis le CSV", COLORS['edit'])
 
@@ -3642,9 +3713,9 @@ class BubbleNavApp(_TkBase):
                            fill='white', font=F_TINY_B, tags='hs')
 
     def ghost_of_active(self, canvas, view: View, cam: Station) -> None:
-        """Vue B : la station active en transparence à son point de départ (pendant
-        Espace + glisser) et à sa position d'origine du CSV (si elle a bougé)."""
-        st = self.station()
+        """Vues A et B : la station active en transparence à son point de départ
+        (pendant Espace + glisser) et à sa position d'origine du CSV (si elle a bougé)."""
+        st = self.target_station()
         if st is None or st.idx == cam.idx:
             return
         start = None
@@ -3727,22 +3798,26 @@ class BubbleNavApp(_TkBase):
         self._sprites[key] = entry
         return entry
 
-    def _redraw_card_a(self) -> None:
-        """Fiche de A seule (les pastilles de A restent figées pendant un geste)."""
-        view = self._frame_view
-        if view is None:
-            return
-        self.canvas.delete('fiche')
-        self.draw_active_card(self.canvas, view,
-                              view.height - 12, extra='fiche')
-
-    def draw_active_card(self, canvas, view: View, bottom: float, extra: str = '') -> None:
+    def draw_active_card(self, canvas, view: View, bottom: float, extra: str = '',
+                         hotspots: Sequence["Hotspot"] = ()) -> None:
         """Fiche de la station active, en bas à gauche de la vue : sol (plancher),
         Δ, H appareil et Z final = sol + Δ + H, à jour à chaque cran de molette ;
         ΔX / ΔY depuis le CSV si elle a bougé. La valeur qui vient de changer est
         surlignée ; les valeurs corrigées sont en orange, avec leur valeur CSV."""
-        st = self.station()
-        if st is None or not self.cfg.get('show_card', True):
+        if not self.cfg.get('show_card', True):
+            return
+        st = self.target_station()
+        if st is None:
+            t = canvas.create_text(24, bottom - 14, anchor='sw', font=F_CARD,
+                                   fill='#d8dde6', tags=(('hs', extra) if extra else 'hs'),
+                                   text="Survolez une station voisine pour la corriger "
+                                        "(Alt / Maj + molette, Espace + glisser)")
+            bb = canvas.bbox(t)
+            canvas.create_image(bb[0] - 10, bb[1] - 8, anchor='nw',
+                                image=self._card_bg(bb[2] - bb[0] + 20, bb[3] - bb[1] + 16,
+                                                    '#5a6270'),
+                                tags=(('hs', extra) if extra else 'hs'))
+            canvas.tag_raise(t)
             return
         eye = float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
         h0 = st.h0 if st.h0 is not None else eye
@@ -3762,11 +3837,11 @@ class BubbleNavApp(_TkBase):
         if st.moved() or (self._hs_drag and self._hs_drag[0] == 'plan'):
             rows.append(("ΔX / ΔY", f"{num(st.x - st.ox)} / {num(st.y - st.oy)}",
                          "depuis le CSV", 'xy', st.moved()))
-        if st.turned() or flash == 'yaw_fix':
-            rows.append(("Orient. Ctrl+mol.", f"{st.yaw_fix:+.2f}°".replace('.', ','),
+        if st.turned():
+            rows.append(("Orientation", f"{st.yaw_fix:+.2f}°".replace('.', ','),
                          "image seule", 'yaw_fix', st.turned()))
         scan = st.key if st.key_explicit and st.key and st.key != st.locator else ''
-        head = (f"{scan} · " if scan else '') + f"{st.locator} — station active"
+        head = (f"{scan} · " if scan else '') + f"{st.locator} — station active (survolée)"
         pad, lh = 12, 24
         x0 = 14
         tag = ('hs', extra) if extra else 'hs'
@@ -3787,6 +3862,10 @@ class BubbleNavApp(_TkBase):
         width = int(max(w_head, lw + 18 + vw + 14 + nw) + 2 * pad) + coupe_w
         height = int(max(pad + 22 + len(rows) * lh + pad - 4, 150))
         y0 = bottom - height
+        # la fiche se met du côté opposé à la station active, pour ne pas la cacher
+        th = next((h for h in hotspots if h.link.target == st.idx), None)
+        if th is not None and th.col < view.width * 0.55:
+            x0 = view.width - width - 14
         border = COLORS['edit'] if st.modified() else '#5a6270'
         canvas.create_image(x0, y0, anchor='nw', image=self._card_bg(width, height, border),
                             tags=tag)
@@ -3874,24 +3953,40 @@ class BubbleNavApp(_TkBase):
         v = parse_float(str(self.cfg.get('yaw_step', 1.0)))
         return v if v and v > 0 else 1.0
 
-    def wheel_alt(self, event, hotspots, station_idx: int, direction: int) -> bool:
-        """Molette avec modificateur, TOUJOURS sur la STATION ACTIVE (vue A) :
-        Alt → Δ, Maj → H, Ctrl → orientation de l'image.
-
-        Une seule station est modifiable à la fois : pas de correction
-        accidentelle d'une voisine survolée. Depuis la vue B, on voit la
-        pastille de la station active monter ou descendre.
-        Retourne True si la molette a servi à cela.
+    def wheel_alt(self, event, hotspots, station_idx: int, direction: int,
+                  hovered: Optional[int] = -1) -> bool:
+        """Molette avec modificateur :
+          Alt → Δ, Maj → H de la STATION SURVOLÉE (une voisine : jamais le point
+          de vue A ni B) — elle devient la station active ;
+          Ctrl → orientation de l'image de la vue (la seule qu'on voit tourner).
+        `hovered` : station survolée si l'appelant la connaît (plan) ; sinon, la
+        pastille sous le curseur dans `hotspots`.
+        Retourne True si la molette a servi à cela (jamais de zoom avec un
+        modificateur).
         """
         alt = alt_down(event.state)
         shift = bool(event.state & 0x0001)
         ctrl = bool(event.state & 0x0004)
         if not (alt or shift or ctrl):
             return False
-        if self.current >= 0:
-            if station_idx != self.current:
-                self._card_b_until = time.monotonic() + 2.5
-            self.adjust_active('ddelta' if alt else 'dh' if shift else 'yaw_fix', direction)
+        if ctrl and not (alt or shift):
+            if 0 <= station_idx < len(self.stations):
+                self.adjust_station(station_idx, 'yaw_fix', direction)
+            return True
+        if hovered == -1:
+            hovered = self.station_at(hotspots, event.x, event.y)
+            tst = self.target_station()
+            last = getattr(self, '_last_adj', None)
+            if hovered is None and tst is not None and last is not None \
+                    and last[0] == tst.idx and last[1] == ('ddelta' if alt else 'dh') \
+                    and time.monotonic() - last[2] < 1.5:
+                hovered = tst.idx                     # rafale en cours : même réglage
+        if not self.can_edit(hovered):
+            self._set_status("Alt / Maj + molette : survolez la station voisine à corriger "
+                             "(pas un point de vue A ou B)", COLORS['warning'])
+            return True
+        self.set_target(hovered)
+        self.adjust_station(hovered, 'ddelta' if alt else 'dh', direction)
         return True
 
     # ── réseau au sol, dans la vue bulle ─────────────────────────────
@@ -4030,10 +4125,12 @@ class BubbleNavApp(_TkBase):
         if not self.cfg.get('show_mire', True):
             return []
         out = []
-        if partner_idx is not None and partner_idx != current_idx:
-            out.append(partner_idx)
+        if self.target_station() is not None and self.target != current_idx:
+            out.append(self.target)
         if hover is not None and hover < len(hotspots):
             out.append(hotspots[hover].link.target)
+        if partner_idx is not None and partner_idx != current_idx:
+            out.append(partner_idx)
         return [i for k, i in enumerate(out) if i not in out[:k] and 0 <= i < len(self.stations)]
 
     def _build_toolbar(self, parent) -> None:
@@ -4305,6 +4402,7 @@ class BubbleNavApp(_TkBase):
             '<m>': self._show_module, '<M>': self._show_module,
             '<g>': self.face_a_face, '<G>': self.face_a_face,
             '<i>': self.swap_ab, '<I>': self.swap_ab,
+            '<j>': self.b_look_target, '<J>': self.b_look_target,
             '<F1>': self._dlg_help, '<question>': self._dlg_help,
             '<x>': lambda: self._lock_axis('x'), '<X>': lambda: self._lock_axis('x'),
             '<y>': lambda: self._lock_axis('y'), '<Y>': lambda: self._lock_axis('y'),
@@ -5247,6 +5345,7 @@ class BubbleNavApp(_TkBase):
         self.hotspots = self._compute_hotspots(view)
         self.draw_image_center(self.canvas, view, self.station())
         self.draw_floor_network(self.canvas, view, self.station(), self.hotspots)
+        self.ghost_of_active(self.canvas, view, self.station())
         libres = self.declutter(self.hotspots)
         mires = set(self.mire_targets(self.current,
                                       self.compare.idx if self.compare is not None else None,
@@ -5257,7 +5356,8 @@ class BubbleNavApp(_TkBase):
             missing = not self.store.has(tgt.photo)
             color = self.hotspot_color(lk, tgt)
             hovered = (i == self._hover)
-            self.draw_hotspot(self.canvas, hs, color, hovered, mast=tgt.idx not in mires)
+            self.draw_hotspot(self.canvas, hs, color, hovered, selected=tgt.idx == self.target,
+                              mast=tgt.idx not in mires)
             tag = ("↩ origine" if tgt.idx == self.came_from else
                    "B" if self.compare is not None and tgt.idx == self.compare.idx else '')
             self.draw_marks(self.canvas, hs, tgt, color, hovered, False, missing, tag,
@@ -5269,6 +5369,7 @@ class BubbleNavApp(_TkBase):
                                      self.hotspots, self._hover):
             k, h = par_bulle.get(idx, (None, None))
             self.draw_mire(self.canvas, view, cur, self.stations[idx],
+                           COLORS['hot'] if idx == self.target else
                            COLORS['sel'] if self.compare is not None
                            and idx == self.compare.idx else 'white',
                            hs=h, hovered=k is not None and k == self._hover)
@@ -5305,7 +5406,8 @@ class BubbleNavApp(_TkBase):
                 text=f"FILTRES : {self.filters.resume()}\n"
                      f"{len(self.hotspots)} pastille(s) affichée(s), "
                      f"{self.hidden_count} masquée(s)", justify='right')
-        self.draw_active_card(self.canvas, view, view.height - 12, extra='fiche')
+        self.draw_active_card(self.canvas, view, view.height - 12, extra='fiche',
+                              hotspots=self.hotspots)
         # rose des vents : direction du nord dans la vue
         pr = project(view, self.calib.pano_yaw(0.0, st.north_pct), 0.0)
         if pr is not None:
@@ -5395,20 +5497,19 @@ class BubbleNavApp(_TkBase):
         self._press_xy = (event.x, event.y)
         self._hs_drag = None
         if getattr(self, '_space_down', False) and self.current >= 0:
-            # Espace + glisser se fait dans B, sur la pastille de la station active :
-            # dans A (vue prise depuis elle), tout se décalerait et on croirait
-            # les voisines modifiées
+            # Espace + glisser : la station voisine saisie, dans A comme dans B
             self._space_used = True
             self._drag = None
-            self._set_status(
-                "Déplacement XY de la station active : Espace + glisser son point sur le "
-                "plan (à droite), ou sa pastille dans la vue B" + (
-                    '' if self.compare is not None else " (Ctrl+clic sur une voisine)"),
-                COLORS['warning'])
+            self.start_plan_drag(event, self._frame_view or self.view, self.current,
+                                 self.hotspots)
             return
         self._drag = (event.x, event.y, self.view.yaw, self.view.pitch)
 
     def _on_drag(self, event) -> None:
+        if self._hs_drag is not None and self._hs_drag[0] == 'plan' \
+                and self._hs_drag[1]['mode'] == 'pastille':
+            self._drag_plan(event)                   # Espace + glisser une voisine
+            return
         if self._drag is None:
             return
         x0, y0, yaw0, pitch0 = self._drag
@@ -5423,6 +5524,10 @@ class BubbleNavApp(_TkBase):
         moved = 0
         if getattr(self, '_press_xy', None):
             moved = abs(event.x - self._press_xy[0]) + abs(event.y - self._press_xy[1])
+        if self._hs_drag is not None and self._hs_drag[0] == 'plan' \
+                and self._hs_drag[1]['mode'] == 'pastille':
+            self._end_plan_drag()
+            return
         self._drag = None
         if moved <= 4:
             hit = self._hotspot_at(event.x, event.y)
@@ -5445,12 +5550,15 @@ class BubbleNavApp(_TkBase):
                 self.focus_idx = self.hotspots[hit].link.target
                 self._refresh_side()
             self._draw_overlay()
+        pointee = self.station_at(self.hotspots, event.x, event.y)   # sphère, mât, cercle
+        if self.can_edit(pointee) and pointee != self.target:
+            self.set_target(pointee)                     # la survolée devient active
         self._draw_tooltip(event.x, event.y, hit)
 
     def _on_wheel(self, event, direction: int = 0) -> None:
         step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
         if self.wheel_alt(event, self.hotspots, self.current, step):
-            return                          # Alt / Maj + molette : Δ / H
+            return                          # Alt / Maj : station survolée ; Ctrl : image
         self._zoom(-6 * step)
 
     def _on_double(self, event) -> None:
@@ -5866,8 +5974,8 @@ class BubbleNavApp(_TkBase):
 
     # ── réinitialisation, verrou d'axe (Espace + glisser) ─────────────
     def _revert_active(self) -> None:
-        """Station active : retour aux valeurs du CSV (annulable par Ctrl+Z)."""
-        st = self.station()
+        """Station active (survolée) : retour aux valeurs du CSV (annulable par Ctrl+Z)."""
+        st = self.target_station()
         if st is None or not st.modified():
             return
         self.corrections.revert(st)
@@ -6302,6 +6410,9 @@ class BubbleNavApp(_TkBase):
                 if st.modified() and st.moved():
                     ox, oy = to_screen(st.ox, st.oy)
                     self.plan.create_line(ox, oy, x, y, fill=COLORS['edit'], width=1)
+                if st.idx == self.target:          # station active (survolée)
+                    self.plan.create_oval(x - 7, y - 7, x + 7, y + 7,
+                                          outline=COLORS['hot'], width=2)
         cur = self.station()
         if cur is not None:
             # voisins mis en evidence (filtres compris)
@@ -6428,6 +6539,8 @@ class BubbleNavApp(_TkBase):
     def _set_plan_hover(self, idx: Optional[int]) -> None:
         if idx != self._plan_hover:
             self._plan_hover = idx
+            if self.can_edit(idx) and not self._hs_drag:
+                self.set_target(idx)              # la survolée devient la station active
             self._draw_plan_tip()
 
     def _draw_plan_tip(self) -> None:
@@ -6481,21 +6594,25 @@ class BubbleNavApp(_TkBase):
         return best
 
     def _on_plan_press_left(self, event) -> None:
-        """Clic : aller sur une station. Espace + glisser le point de la STATION
-        ACTIVE : la déplacer en plan (seule elle peut l'être)."""
+        """Clic : aller sur une station. Espace + glisser le point d'une station
+        voisine (pas un point de vue A ou B) : la déplacer en plan ; elle devient
+        la station active."""
         self._plan_press = (event.x, event.y)
         if not getattr(self, '_space_down', False) or self.current < 0:
             return
         self._space_used = True
-        st = self.station()
-        if self._plan_nearest(event, 14.0) != self.current:
-            self._set_status("Plan : Espace + glisser le point de la station active "
-                             f"{self._nom(st.idx)} (cerclé)", COLORS['warning'])
+        idx = self._plan_nearest(event, 14.0)
+        if not self.can_edit(idx):
+            self._set_status("Plan : Espace + glisser le point d'une station voisine "
+                             "(pas un point de vue A ou B)", COLORS['warning'])
             return
+        st = self.stations[idx]
+        self.target = idx
         self.corrections.apply(st)                    # état avant le geste
         self._hs_drag = ('plan', {'idx': st.idx, 'start': (st.x, st.y), 'mode': 'carte',
                                   'press': (event.x, event.y)})
-        self._redraw_card_a()
+        self._draw_overlay()
+        self._redraw_compare()
 
     def _on_plan_drag_left(self, event) -> None:
         hd = self._hs_drag
@@ -6516,9 +6633,8 @@ class BubbleNavApp(_TkBase):
                                y=st.oy + round(y0 + dy - st.oy, 3), record=False)
         self._refresh_links_of(st.idx)
         self._draw_plan()
+        self._draw_overlay()                         # seule la station saisie bouge
         self._redraw_compare()
-        self._redraw_card_a()                        # A figée pendant le geste
-        self._refresh_ctrlbar()
         self._set_status(f"Station active {self._nom(st.idx)} : ΔX {st.x - st.ox:+.3f}  "
                          f"ΔY {st.y - st.oy:+.3f} m depuis le CSV", COLORS['edit'])
 
@@ -6561,8 +6677,9 @@ class BubbleNavApp(_TkBase):
 
     def _on_plan_wheel(self, event, direction: int = 0) -> None:
         step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
-        if self.wheel_alt(event, (), self.current, step):
-            return                          # Alt / Maj / Ctrl : station active, comme partout
+        if self.wheel_alt(event, (), self.current, step,
+                          hovered=self._plan_nearest(event, 14.0)):
+            return                          # Alt / Maj : station survolée, comme partout
         self._plan_view['scale'] *= (1.25 if step > 0 else 0.8)
         self._draw_plan()
 
@@ -7330,7 +7447,8 @@ class CompareView(tk.Frame if _TK_OK else object):
             tgt = app.stations[hs.link.target]
             color = app.hotspot_color(hs.link, tgt)
             hovered = i == self._hover
-            app.draw_hotspot(self.canvas, hs, color, hovered, mast=tgt.idx not in mires)
+            app.draw_hotspot(self.canvas, hs, color, hovered, selected=tgt.idx == app.target,
+                             mast=tgt.idx not in mires)
             tag = ("A" if tgt.idx == app.current else
                    "↩ origine" if tgt.idx == self.came_from else '')
             app.draw_marks(self.canvas, hs, tgt, color, hovered,
@@ -7343,10 +7461,11 @@ class CompareView(tk.Frame if _TK_OK else object):
             for idx in app.mire_targets(self.idx, app.current, self.hotspots, self._hover):
                 k, h = par_bulle.get(idx, (None, None))
                 app.draw_mire(self.canvas, view, me, app.stations[idx],
-                              COLORS['hot'] if idx == app.current else 'white',
+                              COLORS['hot'] if idx == app.target else
+                              COLORS['sel'] if idx == app.current else 'white',
                               hs=h, hovered=k is not None and k == self._hover)
         if app.card_in_b():
-            app.draw_active_card(self.canvas, view, view.height - 12)
+            app.draw_active_card(self.canvas, view, view.height - 12, hotspots=self.hotspots)
         if self._hover is not None and self._hover_xy:
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
         st = self.station()
@@ -7451,6 +7570,9 @@ class CompareView(tk.Frame if _TK_OK else object):
             self._draw_overlay()
         else:
             self._draw_tooltip(event.x, event.y, hit)
+        pointee = self.app.station_at(self.hotspots, event.x, event.y)
+        if self.app.can_edit(pointee) and pointee != self.app.target:
+            self.app.set_target(pointee)                 # la survolée devient active
 
     def _draw_tooltip(self, x: int, y: int, hit: Optional[int]) -> None:
         self.canvas.delete('tip')
