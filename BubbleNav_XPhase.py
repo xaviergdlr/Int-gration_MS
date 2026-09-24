@@ -66,7 +66,10 @@ FOV_MIN, FOV_MAX = 30.0, 200.0
 WIDE_START, WIDE_FULL = 110.0, 160.0
 FOV_DEFAULT = 105.0            # vue large demandee
 FOV_SNAP = 120.0               # cran aimanté du champ (bouton « 120° »)
-FOV_SNAP_TOL = 3.0
+FOV_SNAP_TOL = 5.0
+# Ce que l'on voit : du plus serré au plus large
+SCOPE_LABELS = {'local': "Local", 'voisins': "Locaux voisins",
+                'distance': "Distance", 'plancher': "Plancher entier"}
 PITCH_MIN, PITCH_MAX = -89.0, 89.0
 PITCH_DEFAULT = -20.0          # les pastilles au sol sont sous l'horizon
 DRAG_SCALE = 0.5               # sous-echantillonnage pendant la manipulation
@@ -242,7 +245,9 @@ DEFAULT_CONFIG = {
                                      # 'reseau' : réseau élagué (portée, nombre, direction)
     'color_mode': 'local',           # couleur des pastilles : 'local' ou 'lien'
     'show_mire': True,               # mire de hauteur sur les bulles comparées
-    'fine_step': '0.01',             # pas des réglages rapides H / Δ (m)
+    'wheel_step': 0.05,              # pas de la molette pour H / Δ (m) : 0,05 ou 0,01
+    'view_scope': 'voisins',         # pastilles : 'local' | 'voisins' | 'distance' | 'plancher'
+    'scope_dist': 6.0,               # distance de voisinage (m) : local + second plan
     'focus_origin': False,           # à l'arrivée, regarder la bulle d'où l'on vient
     'csv_mappings': {},        # format de CSV -> correspondance de colonnes choisie
 }
@@ -1066,6 +1071,11 @@ class HotspotFilter:
     inter_floor: bool = True      # garder les pastilles ▲ / ▼
     hide_missing: bool = False    # masquer les bulles sans image
     same_local: bool = False      # seulement le local de la bulle courante (touche L)
+    # Portée de la vue (toujours appliquée, filtres actifs ou non) : 'local',
+    # 'voisins' (le local et les locaux proches), 'distance' ou 'plancher'.
+    scope: str = 'plancher'
+    scope_dist: float = 6.0
+    near_locals: object = None    # fonction : indice de bulle -> locaux voisins
 
     def match_local(self, target: Station) -> bool:
         motifs = [m.strip().lower()
@@ -1080,8 +1090,23 @@ class HotspotFilter:
                 return True
         return False
 
+    def in_scope(self, current: Station, target: Station, link: "Link") -> bool:
+        """Portée de la vue ; les liens ▲▼ vers les planchers voisins passent toujours."""
+        if link.kind != 'same' or self.scope == 'plancher':
+            return True
+        if self.scope == 'distance':
+            return link.dist_h <= self.scope_dist
+        mine = current.parts().local or current.locator
+        theirs = target.parts().local or target.locator
+        if self.scope == 'local':
+            return theirs == mine
+        near = self.near_locals(current.idx) if callable(self.near_locals) else {mine}
+        return theirs in near or link.dist_h <= self.scope_dist * 0.5
+
     def accepts(self, current: Station, target: Station, link: "Link",
                 has_image: bool = True) -> bool:
+        if not self.in_scope(current, target, link):
+            return False
         if not self.active:
             return True
         if not self.inter_floor and link.kind != 'same':
@@ -1120,6 +1145,13 @@ class HotspotFilter:
         if self.same_local:
             bits.append("local courant")
         return ' · '.join(bits) if bits else "actifs (tout passe)"
+
+    def scope_text(self) -> str:
+        if self.scope == 'distance':
+            return f"≤ {self.scope_dist:g} m"
+        if self.scope == 'voisins':
+            return f"locaux voisins ({self.scope_dist:g} m)"
+        return {'local': "local", 'plancher': "plancher entier"}.get(self.scope, self.scope)
 
 
 @dataclass
@@ -1378,6 +1410,25 @@ def alt_down(state: int) -> bool:
 
 MIRE_RING_M = 0.50       # rayon de l'empreinte au sol de la mire (m)
 MIRE_TICK_M = 0.10       # graduation de la mire (m)
+
+
+def shadow_sprite(rx: int, ry: int, ss: int = 2):
+    """Ombre douce au sol (ellipse floue, noire translucide) — image RGBA PIL."""
+    import numpy as np
+    from PIL import Image, ImageFilter
+    rx, ry = max(2, int(rx)) * ss, max(1, int(ry)) * ss
+    pad = int(0.35 * rx) + 2 * ss
+    W, H = 2 * (rx + pad), 2 * (ry + pad)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.sqrt(((xx - W / 2) / rx) ** 2 + ((yy - H / 2) / ry) ** 2)
+    a = np.clip(1.0 - d, 0, 1) ** 0.7 * 0.55
+    alpha = Image.fromarray((a * 255).astype(np.uint8), 'L').filter(
+        ImageFilter.GaussianBlur(max(1.0, 0.18 * min(rx, ry * 3))))
+    img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+    img.putalpha(alpha)
+    if ss > 1:
+        img = img.resize((W // ss, H // ss), Image.LANCZOS)
+    return img
 
 
 @lru_cache(maxsize=4096)
@@ -2605,7 +2656,7 @@ NAVIGATION  (vue A ou B)
   Espace + glisser ........... DÉPLACER EN PLAN la bulle visée (hors pastille :
                                la bulle active), le long de X ou de Y
   Retour arrière ............. revenir à la bulle précédente
-  En-tête de chaque vue ...... Retour, Origine, H et Δ de la bulle de la vue ;
+  En-tête de chaque vue ...... Retour, Origine, H et Δ lus de la bulle de la vue ;
                                celui de B lie les deux vues (face à face,
                                inverser, A → B, B → A)
   O .......................... regarder d'où l'on vient
@@ -2614,19 +2665,23 @@ NAVIGATION  (vue A ou B)
   Ctrl+Z ..................... annuler la dernière opération (navigation,
                                correction, bulle ouverte en B)
 
-HAUTEUR ET DELTA  (sans passer par l'édition)
+CORRIGER SANS LE MODE ÉDITION
   Alt + molette .............. Δ (delta plancher) de la pastille survolée,
                                ou de la bulle de la vue hors pastille
   Maj + molette .............. H (hauteur station), idem
-  Barre de contrôle .......... A / B : H et Δ avec boutons − / +, pas réglable
+  Espace + glisser ........... position en plan (X ou Y)
+  Pas de la molette .......... 5 cm (1 cm possible, dans Réglages)
   Mire ....................... empreinte au sol (50 cm) et mire graduée du sol
                                à la caméra, sur la bulle de l'autre vue et la
                                pastille survolée : elle doit se poser à plat
                                sur le sol de la photo
 
 AFFICHAGE
-  T .......................... toutes les bulles du plancher <-> réseau élagué
-  L .......................... seulement les pastilles du local courant
+  Liste « Voir » ............. pastilles montrées : Local, Locaux voisins
+                               (défaut : le local et ceux à moins de 6 m),
+                               Distance, Plancher entier
+  L / T ...................... Voir : Local / Plancher entier (2e appui : retour)
+  M .......................... module (fichiers, état)
   F .......................... activer / couper les filtres
   Filtres › Local ............ choisir un local dans la liste
   Menu « Affichage » ......... étiquettes (nom, distance, H / Δ / Z), couleur
@@ -2777,7 +2832,11 @@ class BubbleNavApp(_TkBase):
             local=str(cfg.get('filter_local', '')),
             inter_floor=bool(cfg.get('filter_inter', True)),
             hide_missing=bool(cfg.get('filter_hide_missing', False)),
-            same_local=bool(cfg.get('filter_same_local', False)))
+            same_local=bool(cfg.get('filter_same_local', False)),
+            scope=str(cfg.get('view_scope', 'voisins')),
+            scope_dist=float(cfg.get('scope_dist', 6.0)))
+        self.filters.near_locals = self._near_locals
+        self._near_cache: Dict[Tuple[int, float], frozenset] = {}
         self.hidden_count = 0
         self.focus_idx: Optional[int] = None      # bulle décrite dans le panneau
         self.came_from: Optional[int] = None      # bulle quittée (A), pour s'y retourner
@@ -3209,31 +3268,13 @@ class BubbleNavApp(_TkBase):
                         fg=COLORS['hot'] if which == 'A' else COLORS['sel'], anchor='w')
         name.pack(side='left', padx=(2, 6))
         self.ctrl_vals[(which, 'name')] = name
-        for comp, lib, tip in (('dh', 'H', "hauteur station : la caméra bouge"),
-                               ('ddelta', 'Δ', "delta plancher : caméra et sol bougent")):
-            b1 = mk(bar, "−", lambda w=which, c=comp: self.adjust_alt(w, c, -1),
-                    tip=f"Vue {which} : {tip}, − un pas")
-            b1.config(padx=5)
-            b1.pack(side='left')
+        for comp, lib in (('dh', 'H'), ('ddelta', 'Δ')):
             val = tk.Label(bar, text=f"{lib} —", font=F_MONO, bg=COLORS['bg_medium'],
                            fg=COLORS['text'], width=9)
             val.pack(side='left')
-            b2 = mk(bar, "+", lambda w=which, c=comp: self.adjust_alt(w, c, +1),
-                    tip=f"Vue {which} : {tip}, + un pas")
-            b2.config(padx=5)
-            b2.pack(side='left', padx=(0, 4))
+            Tooltip(val, "Hauteur station (caméra seule) : Maj + molette." if comp == 'dh'
+                    else "Delta plancher (caméra et sol) : Alt + molette.")
             self.ctrl_vals[(which, comp)] = val
-        if which == 'A':
-            tk.Label(bar, text="pas", font=F_UI, bg=COLORS['bg_medium'],
-                     fg=COLORS['text_muted']).pack(side='left', padx=(8, 2))
-            self.fine_step_var = tk.StringVar(value=str(self.cfg.get('fine_step', '0.01')))
-            cb = ttk.Combobox(bar, textvariable=self.fine_step_var, width=6, state='readonly',
-                              style='BN.TCombobox',
-                              values=('0.001', '0.005', '0.01', '0.05', '0.10'))
-            cb.pack(side='left', pady=3)
-            cb.bind('<<ComboboxSelected>>',
-                    lambda e: self.cfg.__setitem__('fine_step', self.fine_step_var.get()))
-            Tooltip(cb, "Pas des réglages rapides de H et Δ (m), boutons et Alt / Maj + molette.")
         self._refresh_ctrlbar()
 
     def _refresh_ctrlbar(self) -> None:
@@ -3390,8 +3431,7 @@ class BubbleNavApp(_TkBase):
             st = self.stations[which] if 0 <= which < len(self.stations) else None
         if st is None:
             return
-        step = parse_float(self.fine_step_var.get()) if hasattr(self, 'fine_step_var') else None
-        step = step or 0.01
+        step = self.wheel_step()
         now = time.monotonic()
         last = getattr(self, '_last_adj', None)
         burst = last is not None and last[0] == st.idx and last[1] == comp and now - last[2] < 1.2
@@ -3404,6 +3444,11 @@ class BubbleNavApp(_TkBase):
             f"hauteur station {st.height(eye):.3f} (caméra seule)" if comp == 'dh'
             else f"delta plancher {st.delta(eye):+.3f} (caméra et sol)")
             + f" · Z {st.z:.3f}", COLORS['edit'])
+
+    def wheel_step(self) -> float:
+        """Pas de la molette pour H et Δ (Réglages : 1 ou 5 cm, 5 par défaut)."""
+        v = parse_float(str(self.cfg.get('wheel_step', 0.05)))
+        return v if v and v > 0 else 0.05
 
     def wheel_alt(self, event, hotspots, station_idx: int, direction: int) -> bool:
         """Alt+molette : Δ, Maj+molette : H — de la pastille survolée, sinon de la bulle
@@ -3420,7 +3465,8 @@ class BubbleNavApp(_TkBase):
         return True
 
     # ── mire de hauteur ──────────────────────────────────────────────
-    def draw_mire(self, canvas, view: View, cam: Station, tgt: Station, color: str) -> None:
+    def draw_mire(self, canvas, view: View, cam: Station, tgt: Station, color: str,
+                  hs: Optional["Hotspot"] = None, hovered: bool = False) -> None:
         """Empreinte au sol et mire graduée de la bulle `tgt`, vue depuis `cam`.
 
         L'empreinte (cercle de 50 cm posé sur le sol de la bulle, en
@@ -3450,15 +3496,24 @@ class BubbleNavApp(_TkBase):
         sg = project_segment(view, self.calib, north, (dx, dy, g), (dx, dy, top))
         if sg is None:
             return
-        canvas.create_line(*sg, fill='#000000', width=4, tags='hs')
-        canvas.create_line(*sg, fill=color, width=2, tags='hs')
+        pole = None
+        if hs is not None and hs.foot is not None:
+            # la mire EST le mât : même verticale, du sol au pôle sud de la sphère
+            px, py, rs = self.sphere_pole(hs, hovered)
+            pole = (px, py)
+            sg = (sg[0], sg[1], px, py)
+        canvas.create_line(*sg, fill='#000000', width=5, tags='hs')
+        canvas.create_line(*sg, fill=color, width=3, tags='hs')
         h = tgt.height(eye)
         nd = 3 if self.edit_mode else 2          # au millimètre en édition
         n = int(h / MIRE_TICK_M + 1e-9)
+        lim = math.hypot(sg[2] - sg[0], sg[3] - sg[1])
         for k in range(1, n + 1):
             pr = project_point(view, self.calib, north, dx, dy, g + k * MIRE_TICK_M)
             if pr is None or pr[2] < 0.05:
                 continue
+            if pole is not None and math.hypot(pr[0] - sg[0], pr[1] - sg[1]) > lim:
+                continue                          # graduations cachées par la sphère
             w = 7 if k % 5 == 0 else 4
             canvas.create_line(pr[0] - w, pr[1], pr[0] + w, pr[1], fill=color, width=1,
                                tags='hs')
@@ -3471,7 +3526,10 @@ class BubbleNavApp(_TkBase):
                                fill=color, text=f"sol {tgt.ground(eye):.{nd}f}  "
                                                 f"Δ {tgt.delta(eye):+.{nd}f}",
                                tags='hs')
-        if head is not None and head[2] > 0.05:
+        if pole is not None:                      # à côté de la sphère (l'appareil)
+            canvas.create_text(hs.col + rs + 6, hs.row, anchor='w', font=F_TINY_B,
+                               fill=color, text=f"H {h:.{nd}f}  Z {tgt.z:.{nd}f}", tags='hs')
+        elif head is not None and head[2] > 0.05:
             canvas.create_oval(head[0] - 4, head[1] - 4, head[0] + 4, head[1] + 4,
                                outline=color, width=2, tags='hs')
             canvas.create_text(head[0] + 12, head[1], anchor='w', font=F_TINY_B, fill=color,
@@ -3497,11 +3555,6 @@ class BubbleNavApp(_TkBase):
 
         tk.Label(bar, text="BubbleNav", font=F_TITLE, bg=COLORS['bg_medium'],
                  fg=COLORS['accent']).pack(side='left', padx=(10, 12), pady=5)
-        self._mk_button(bar, "Module", self._show_module).pack(side='left', padx=3, pady=4)
-
-        tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
-                                                         padx=8, pady=6)
-
         tk.Label(bar, text="Plancher", bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
                  font=F_UI).pack(side='left', padx=(2, 4))
         self.floor_var = tk.StringVar()
@@ -3517,13 +3570,18 @@ class BubbleNavApp(_TkBase):
                  font=F_UI).pack(side='left', padx=(2, 2))
         self.fov_var = tk.DoubleVar(value=self.view.fov)
         self.fov_scale = tk.Scale(bar, from_=FOV_MIN, to=FOV_MAX, resolution=1,
-                                  orient='horizontal', length=110, showvalue=False,
+                                  orient='horizontal', length=190, showvalue=False,
                                   variable=self.fov_var, command=self._on_fov,
                                   bg=COLORS['text_muted'], fg=COLORS['text'],
                                   troughcolor=COLORS['bg_dark'], highlightthickness=0,
                                   bd=0, sliderrelief='flat',
                                   activebackground=COLORS['accent'])
         self.fov_scale.pack(side='left', padx=2)
+        # la molette agit aussi sur le curseur
+        self.fov_scale.bind('<MouseWheel>', lambda e: self._zoom(
+            -6 if getattr(e, 'delta', 0) > 0 else 6) or 'break')
+        self.fov_scale.bind('<Button-4>', lambda e: self._zoom(-6) or 'break')
+        self.fov_scale.bind('<Button-5>', lambda e: self._zoom(+6) or 'break')
         self.fov_lbl = tk.Label(bar, text=f"{self.view.fov:.0f}°", width=5,
                                 bg=COLORS['bg_medium'], fg=COLORS['text'], font=F_MONO)
         self.fov_lbl.pack(side='left')
@@ -3536,14 +3594,21 @@ class BubbleNavApp(_TkBase):
         tk.Frame(bar, bg=COLORS['border'], width=1).pack(side='left', fill='y',
                                                          padx=8, pady=6)
 
-        tk.Label(bar, text="Qualité", bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
+        self.qual_var = tk.StringVar(value=str(self.store.src_width))   # (Réglages)
+        # Ce que l'on voit : un seul choix, du plus serré au plus large
+        tk.Label(bar, text="Voir", bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
                  font=F_UI).pack(side='left', padx=(2, 4))
-        self.qual_var = tk.StringVar(value=str(self.store.src_width))
-        qual = ttk.Combobox(bar, textvariable=self.qual_var, width=6, state='readonly',
-                            style='BN.TCombobox',
-                            values=[str(v) for v in SRC_WIDTH_CHOICES])
-        qual.pack(side='left', padx=2)
-        qual.bind('<<ComboboxSelected>>', self._on_quality)
+        sc = self.cfg.get('view_scope', 'voisins')
+        self.scope_var = tk.StringVar(value=SCOPE_LABELS.get(sc, SCOPE_LABELS['voisins']))
+        scb = ttk.Combobox(bar, textvariable=self.scope_var, width=15, state='readonly',
+                           style='BN.TCombobox', values=list(SCOPE_LABELS.values()))
+        scb.pack(side='left', padx=2)
+        scb.bind('<<ComboboxSelected>>', lambda e: self.set_scope(
+            next(k for k, v in SCOPE_LABELS.items() if v == self.scope_var.get())))
+        Tooltip(scb, "Stations montrées en pastilles : le local de la bulle (L), les "
+                     "locaux voisins (défaut : le local et ceux qui ont une station à "
+                     "moins de la distance de voisinage), une distance, ou tout le "
+                     "plancher (T). Distance réglable dans Réglages.")
 
         self.labels_var = tk.BooleanVar(value=bool(self.cfg.get('show_labels', True)))
         self.names_var = tk.BooleanVar(value=bool(self.cfg.get('show_names', True)))
@@ -3725,9 +3790,12 @@ class BubbleNavApp(_TkBase):
             '<f>': self._toggle_filters, '<F>': self._toggle_filters,
             '<e>': self._toggle_edit, '<E>': self._toggle_edit,
             '<v>': self._show_viewer, '<V>': self._show_viewer,
-            '<t>': self._toggle_all, '<T>': self._toggle_all,
+            '<t>': lambda: self._toggle_scope('plancher'),
+            '<T>': lambda: self._toggle_scope('plancher'),
             '<o>': self.look_back, '<O>': self.look_back,
-            '<l>': self._toggle_same_local, '<L>': self._toggle_same_local,
+            '<l>': lambda: self._toggle_scope('local'),
+            '<L>': lambda: self._toggle_scope('local'),
+            '<m>': self._show_module, '<M>': self._show_module,
             '<g>': self.face_a_face, '<G>': self.face_a_face,
             '<i>': self.swap_ab, '<I>': self.swap_ab,
             '<F1>': self._dlg_help, '<question>': self._dlg_help,
@@ -3966,6 +4034,8 @@ class BubbleNavApp(_TkBase):
     def rebuild_graph(self) -> None:
         t0 = time.perf_counter()
         self.links = build_graph(self.stations, self.graph_params())
+        if hasattr(self, '_near_cache'):
+            self._near_cache.clear()
         self.plan_edges = plan_skeleton(self.stations, self.links)
         dt = (time.perf_counter() - t0) * 1000.0
         n_links = sum(len(v) for v in self.links)
@@ -4294,6 +4364,21 @@ class BubbleNavApp(_TkBase):
     def relief(self) -> bool:
         return bool(self.cfg.get('disc_3d', True))
 
+    def _shadow(self, rx: float, ry: float):
+        """Ombre douce au sol, mise en cache par taille (pas de 2 px)."""
+        qx, qy = max(2, int(round(rx / 2.0) * 2)), max(1, int(round(ry / 2.0) * 2) or 1)
+        key = ('ombre', qx, qy)
+        hit = self._sprites.get(key)
+        if hit is not None:
+            return hit
+        from PIL import ImageTk
+        img = shadow_sprite(qx, qy)
+        entry = (ImageTk.PhotoImage(img), img.width / 2.0, img.height / 2.0)
+        if len(self._sprites) >= 400:
+            self._sprites.pop(next(iter(self._sprites)))
+        self._sprites[key] = entry
+        return entry
+
     def refresh_altimetry(self, delay_ms: int = 0) -> None:
         """Recalcule les altitudes (hauteur instrument changée)."""
         job = getattr(self, '_alti_job', None)
@@ -4322,6 +4407,53 @@ class BubbleNavApp(_TkBase):
         self._set_status("Pastilles " + ("au point de vue (sol + hauteur appareil), "
                                          "mât jusqu'au sol" if self.anchor() == 'vue'
                                          else "posées au sol (plancher + delta)"))
+
+    def _near_locals(self, idx: int) -> frozenset:
+        """Locaux voisins d'une bulle : le sien et ceux ayant une station à moins de
+        la distance de voisinage, sur le même plancher (mis en cache)."""
+        key = (idx, self.filters.scope_dist)
+        hit = self._near_cache.get(key)
+        if hit is not None:
+            return hit
+        st = self.stations[idx]
+        out = {st.parts().local or st.locator}
+        if idx < len(self.links):
+            for lk in self.links[idx]:
+                if lk.kind == 'same' and lk.dist_h <= self.filters.scope_dist:
+                    t = self.stations[lk.target]
+                    out.add(t.parts().local or t.locator)
+        res = frozenset(out)
+        if len(self._near_cache) > 4000:
+            self._near_cache.clear()
+        self._near_cache[key] = res
+        return res
+
+    def set_scope(self, scope: str) -> None:
+        """Ce que l'on voit : local, locaux voisins, distance ou plancher entier."""
+        if scope not in SCOPE_LABELS:
+            return
+        if self.filters.scope != scope:
+            self._prev_scope = self.filters.scope
+        self.filters.scope = scope
+        self.cfg['view_scope'] = scope
+        if hasattr(self, 'scope_var'):
+            self.scope_var.set(SCOPE_LABELS[scope])
+        save_config(self.cfg)
+        self._draw_overlay()
+        self._redraw_compare()
+        self._refresh_side()
+        self._draw_plan()
+        n = len(self._visible_links(self.current)) if self.current >= 0 else 0
+        self._set_status(f"Voir : {self.filters.scope_text()} — {n} pastille(s)",
+                         COLORS['sel'])
+
+    def _toggle_scope(self, scope: str) -> None:
+        """L et T : bascule vers « local » / « plancher entier », puis retour."""
+        if self.filters.scope == scope:
+            prev = getattr(self, '_prev_scope', 'voisins')
+            self.set_scope(prev if prev != scope else 'voisins')
+        else:
+            self.set_scope(scope)
 
     def whole_floor(self) -> bool:
         """Pastilles de toutes les bulles du plancher (défaut), ou réseau élagué."""
@@ -4370,8 +4502,20 @@ class BubbleNavApp(_TkBase):
         self._redraw_compare()
         self._draw_plan()
 
+    def sphere_pole(self, hs: "Hotspot", hovered: bool) -> Tuple[float, float, float]:
+        """Pôle sud de la sphère (point où la verticale du sol entre dans la
+        sphère, à l'écran) et rayon de la sphère."""
+        r = hs.radius * (1.25 if hovered else 1.0)
+        rs = SPHERE_RADIUS * r if self.relief() else r
+        fx, fy = hs.foot
+        vx, vy = fx - hs.col, fy - hs.row
+        n = math.hypot(vx, vy)
+        if n < 1e-6:
+            return hs.col, hs.row + rs, rs
+        return hs.col + vx / n * rs, hs.row + vy / n * rs, rs
+
     def draw_hotspot(self, canvas, hs: "Hotspot", color: str, hovered: bool,
-                     selected: bool = False) -> None:
+                     selected: bool = False, mast: bool = True) -> None:
         """Dessine une pastille (relief ou plate) sur un canevas."""
         r = hs.radius * (1.25 if hovered else 1.0)
         floating = hs.foot is not None
@@ -4382,14 +4526,14 @@ class BubbleNavApp(_TkBase):
             fx, fy = hs.foot
             sx, sy = hs.foot_r
             if sx >= 1.0:
-                canvas.create_oval(fx - sx, fy - sy, fx + sx, fy + sy, fill='#000000',
-                                   outline='', stipple='gray50', tags='hs')
-                canvas.create_oval(fx - sx, fy - sy, fx + sx, fy + sy, outline=color,
-                                   width=1.5, tags='hs')
-            rs_ = SPHERE_RADIUS * r if self.relief() else r
-            top = hs.row + rs_ * (1 if fy > hs.row else -1)
-            canvas.create_line(fx, fy, hs.col, top, fill='#000000', width=4, tags='hs')
-            canvas.create_line(fx, fy, hs.col, top, fill=color, width=2, tags='hs')
+                photo, ax, ay = self._shadow(sx, sy)       # ombre douce, à plat au sol
+                canvas.create_image(fx - ax, fy - ay, anchor='nw', image=photo, tags='hs')
+            if mast:
+                # la verticale du point de vue : du sol au pôle sud de la sphère (en
+                # perspective, la verticale 3D se projette sur la droite sol → centre)
+                px, py, _ = self.sphere_pole(hs, hovered)
+                canvas.create_line(fx, fy, px, py, fill='#000000', width=4, tags='hs')
+                canvas.create_line(fx, fy, px, py, fill=color, width=2, tags='hs')
         if self.relief():
             photo, ax, ay = self._sprite(color, r, hovered, floating=floating)
             canvas.create_image(hs.col - ax, hs.row - ay, anchor='nw', image=photo,
@@ -4563,7 +4707,8 @@ class BubbleNavApp(_TkBase):
             color = self.hotspot_color(lk, tgt)
             hovered = (i == self._hover)
             selected = self.edit_mode and self.selected == tgt.idx
-            self.draw_hotspot(self.canvas, hs, color, hovered, selected=selected)
+            self.draw_hotspot(self.canvas, hs, color, hovered, selected=selected,
+                              mast=tgt.idx not in mires)
             tag = ("↩ origine" if tgt.idx == self.came_from else
                    "B" if self.compare is not None and tgt.idx == self.compare.idx else '')
             self.draw_marks(self.canvas, hs, tgt, color, hovered, selected, missing, tag,
@@ -4574,12 +4719,15 @@ class BubbleNavApp(_TkBase):
                                         font=F_UI_B, tags='hs')
                 self.canvas.create_text(x, y, text=txt, fill=col, font=F_UI_B, tags='hs')
         cur = self.station()
+        par_bulle = {h.link.target: (k, h) for k, h in enumerate(self.hotspots)}
         for idx in self.mire_targets(self.current,
                                      self.compare.idx if self.compare is not None else None,
                                      self.hotspots, self._hover):
+            k, h = par_bulle.get(idx, (None, None))
             self.draw_mire(self.canvas, view, cur, self.stations[idx],
                            COLORS['sel'] if self.compare is not None
-                           and idx == self.compare.idx else 'white')
+                           and idx == self.compare.idx else 'white',
+                           hs=h, hovered=k is not None and k == self._hover)
         self._draw_hud(view)
         if self._hover is not None and getattr(self, '_hover_xy', None):
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
@@ -4601,6 +4749,11 @@ class BubbleNavApp(_TkBase):
         self.canvas.create_text(14, 12, text=title, anchor='nw',
                                 fill=COLORS['edit'] if st.modified() else COLORS['hot'],
                                 font=('Segoe UI', 12, 'bold'), tags='hs')
+        if not self.filters.active and self.filters.scope != 'plancher':
+            self.canvas.create_text(
+                view.width - 14, 12, anchor='ne', tags='hs', fill=COLORS['text_muted'],
+                font=F_UI, text=f"voir : {self.filters.scope_text()} · "
+                                f"{len(self.hotspots)} pastille(s)")
         if self.filters.active:
             self.canvas.create_text(
                 view.width - 14, 12, anchor='ne', tags='hs', fill=COLORS['sel'],
@@ -4870,8 +5023,9 @@ class BubbleNavApp(_TkBase):
     def _zoom(self, delta: float) -> None:
         old = self.view.fov
         new = clamp(old + delta, FOV_MIN, FOV_MAX)
-        if (old - FOV_SNAP) * (new - FOV_SNAP) < 0:      # cran : on s'arrête à 120°
-            new = FOV_SNAP
+        if (old - FOV_SNAP) * (new - FOV_SNAP) < 0 or (
+                old != FOV_SNAP and abs(new - FOV_SNAP) <= FOV_SNAP_TOL):
+            new = FOV_SNAP                                 # cran : on s'arrête à 120°
         self.view.fov = new
         self.fov_var.set(self.view.fov)
         self.fov_lbl.config(text=f"{self.view.fov:.0f}°")
@@ -4996,8 +5150,7 @@ class BubbleNavApp(_TkBase):
         self.f_inter = tk.BooleanVar(value=self.filters.inter_floor)
         self.f_missing = tk.BooleanVar(value=self.filters.hide_missing)
         self.f_same_local = tk.BooleanVar(value=self.filters.same_local)
-        for text, var in (("local courant (L)", self.f_same_local),
-                          ("liens ▲▼", self.f_inter),
+        for text, var in (("liens ▲▼", self.f_inter),
                           ("masquer images absentes", self.f_missing)):
             tk.Checkbutton(row, text=text, variable=var, command=self._on_filter_change,
                            font=F_UI, bg=COLORS['card'], fg=COLORS['text'],
@@ -6924,6 +7077,41 @@ class BubbleNavApp(_TkBase):
                       "pastilles, sans élagage). Le champ de vision limite aussi l'affichage."
                  ).pack(fill='x')
 
+        # ── Vue et molette ──────────────────────────────────────────
+        vue = section("Vue")
+        scope_d = tk.DoubleVar(value=self.filters.scope_dist)
+
+        def apply_scope_dist(_=None):
+            self.filters.scope_dist = float(scope_d.get())
+            self.cfg['scope_dist'] = self.filters.scope_dist
+            self._near_cache.clear()
+            self._draw_overlay()
+            self._redraw_compare()
+            self._draw_plan()
+
+        slider(vue, "Distance de voisinage (m)", scope_d, 3, 40, 1, apply_scope_dist)
+        row = tk.Frame(vue, bg=COLORS['bg_dark'])
+        row.pack(fill='x', pady=(4, 0))
+        tk.Label(row, text="Pas de la molette H / Δ", width=22, anchor='w', font=F_UI,
+                 bg=COLORS['bg_dark'], fg=COLORS['text']).pack(side='left')
+        step_v = tk.DoubleVar(value=self.wheel_step())
+        for txt, val in (("5 cm", 0.05), ("1 cm", 0.01)):
+            tk.Radiobutton(row, text=txt, variable=step_v, value=val, font=F_UI,
+                           command=lambda: self.cfg.__setitem__('wheel_step',
+                                                                float(step_v.get())),
+                           bg=COLORS['bg_dark'], fg=COLORS['text'],
+                           selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_dark'],
+                           activeforeground=COLORS['text'], bd=0, highlightthickness=0
+                           ).pack(side='left', padx=4)
+        row = tk.Frame(vue, bg=COLORS['bg_dark'])
+        row.pack(fill='x', pady=(4, 0))
+        tk.Label(row, text="Qualité des images (px)", width=22, anchor='w', font=F_UI,
+                 bg=COLORS['bg_dark'], fg=COLORS['text']).pack(side='left')
+        qual = ttk.Combobox(row, textvariable=self.qual_var, width=8, state='readonly',
+                            style='BN.TCombobox', values=[str(v) for v in SRC_WIDTH_CHOICES])
+        qual.pack(side='left')
+        qual.bind('<<ComboboxSelected>>', self._on_quality)
+
         # ── Performance ─────────────────────────────────────────────
         perf = section("Performance")
         cache_var = tk.IntVar(value=self.store.cache_size)
@@ -7354,7 +7542,7 @@ class CompareView(tk.Frame if _TK_OK else object):
             tgt = app.stations[hs.link.target]
             color = app.hotspot_color(hs.link, tgt)
             hovered = i == self._hover
-            app.draw_hotspot(self.canvas, hs, color, hovered)
+            app.draw_hotspot(self.canvas, hs, color, hovered, mast=tgt.idx not in mires)
             tag = ("A" if tgt.idx == app.current else
                    "↩ origine" if tgt.idx == self.came_from else '')
             app.draw_marks(self.canvas, hs, tgt, color, hovered,
@@ -7362,9 +7550,12 @@ class CompareView(tk.Frame if _TK_OK else object):
                            labels=i in libres, mire=tgt.idx in mires)
         me = self.station()
         if me is not None:
+            par_bulle = {h.link.target: (k, h) for k, h in enumerate(self.hotspots)}
             for idx in app.mire_targets(self.idx, app.current, self.hotspots, self._hover):
+                k, h = par_bulle.get(idx, (None, None))
                 app.draw_mire(self.canvas, view, me, app.stations[idx],
-                              COLORS['hot'] if idx == app.current else 'white')
+                              COLORS['hot'] if idx == app.current else 'white',
+                              hs=h, hovered=k is not None and k == self._hover)
         if self._hover is not None and self._hover_xy:
             self._draw_tooltip(self._hover_xy[0], self._hover_xy[1], self._hover)
         st = self.station()

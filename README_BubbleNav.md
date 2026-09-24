@@ -170,9 +170,10 @@ relevé déjà renommé.
 | `Entrée` / `Espace` | avancer vers la pastille la plus centrale |
 | `Retour arrière` | revenir à la bulle précédente |
 | **`Ctrl+Z`** | **annuler la dernière opération**, quelle qu'elle soit : entrée dans une bulle (retour à la bulle quittée, avec le même cap, site et champ), correction, bulle ouverte dans la vue B |
-| `T` | bascule **toutes les bulles du plancher** (défaut) ↔ **réseau élagué** |
+| Liste **Voir** | pastilles montrées : **Local**, **Locaux voisins** (défaut), **Distance**, **Plancher entier** |
+| `L` / `T` | Voir : Local / Plancher entier (2e appui : retour au choix précédent) |
+| `M` | module principal (fichiers, état) |
 | **`O`** | **regarder d'où l'on vient** : la vue se tourne vers la pastille de la bulle quittée |
-| **`L`** | **seulement les pastilles du local courant** ; le filtre suit la bulle quand on navigue (L de nouveau : tout revoir) |
 | `F` | activer / couper les filtres (panneau « Filtres » : plancher, distance, **local choisi dans une liste**) |
 | `C` / `E` / `V` | comparaison (vue B) / mode édition / afficher le visualiseur |
 | **`F1`** ou `?` (bouton « ? ») | **aide : tous les raccourcis** |
@@ -222,24 +223,28 @@ l'orange une bulle corrigée.
 **Infobulles** : chaque bouton, liste, curseur ou case affiche son aide après un
 court survol.
 
-**Toutes les bulles du plancher, par défaut.** Chaque bulle du même plancher a
-sa pastille, quelle que soit sa distance. Seule limite : le champ de la vue ;
-élargissez-le, jusqu'à 200°, pour voir presque tout le tour. S'y ajoutent les
-pastilles ▲ ▼ vers les planchers voisins (la plus proche au-dessus et en
-dessous, à moins de 5 m en plan).
+**Ce que l'on voit : la liste « Voir »** (barre d'outils). Un seul choix, du
+plus serré au plus large :
+
+| Voir | Pastilles montrées |
+|---|---|
+| **Local** (touche L) | les stations du local de la bulle affichée |
+| **Locaux voisins** (défaut) | le local, plus tous les locaux ayant une station à moins de la **distance de voisinage** (6 m par défaut, dans Réglages) : les voisines « au second plan » |
+| **Distance** | les stations à moins de la distance de voisinage |
+| **Plancher entier** (touche T) | toutes les stations du plancher |
+
+Dans tous les cas, les pastilles ▲ ▼ vers les planchers voisins restent
+visibles. Le choix suit la bulle quand on navigue. Sur les relevés, *Locaux
+voisins* montre en médiane 36 pastilles sur GRA6 (local seul : 21, plancher :
+71) et 25 sur BUG_BR (8 et 112).
 
 Pour rester lisible :
-* seules les pastilles **proches** portent leurs étiquettes (nom, distance,
-  H / Δ / Z). Les lointaines, réduites à leur taille minimale, n'affichent que
-  la sphère, et le survol en donne tout le détail ;
+* seules les pastilles **proches** portent leurs étiquettes. Les lointaines,
+  réduites à leur taille minimale, n'affichent que la sphère, et le survol en
+  donne tout le détail ;
 * une étiquette qui chevaucherait celle d'une pastille plus proche est omise ;
-* le filtre de distance (panneau « Filtres ») limite au besoin l'affichage.
-
-**Un seul local** : la touche **L** (ou la case *local courant* du panneau
-« Filtres ») ne garde que les pastilles du local de la bulle affichée, et suit
-la bulle quand on navigue. Sur le plan, les autres locaux s'estompent. On peut
-aussi **choisir un local dans la liste** « Local » des filtres, ou y saisir
-plusieurs motifs (`K256, W25*`).
+* le panneau « Filtres » reste disponible pour des tris plus fins (plancher,
+  liste de locaux, distance, images absentes).
 
 **Réseau élagué** (touche **T**, ou menu « Affichage ▾ ») : c'est l'ancien
 comportement, fait pour naviguer de proche en proche. Il garde au plus
@@ -259,9 +264,14 @@ voisine est représentée **là où était l'appareil**, à sa hauteur (Z = plan
 profondeur :
 * la **sphère** : l'appareil, de taille réelle (environ 25 cm de rayon), donc
   d'autant plus petite qu'elle est loin ;
-* le **mât** : de la sphère jusqu'au sol de la bulle ;
-* l'**ombre au sol** : un disque posé à plat sous la bulle, en perspective.
-  Aplati quand il est loin, plus rond quand il est proche et vu d'en haut.
+* le **mât** : la verticale du point de vue, du sol de la bulle jusqu'au
+  **pôle sud** de la sphère. En perspective, la verticale se projette sur la
+  droite qui va du sol au centre de la sphère : le mât y entre exactement par
+  en dessous. Quand la bulle porte une mire, **la mire est ce mât**, gradué
+  tous les 10 cm ;
+* l'**ombre au sol** : une ombre douce, posée à plat sous la bulle, en
+  perspective. Aplatie quand elle est loin, plus ronde quand elle est proche
+  et vue d'en haut.
 
 Les bulles d'un même plancher sont toutes à la hauteur de l'œil : elles
 s'alignent donc sur l'horizon, et c'est normal. C'est leur mât et leur ombre
@@ -424,9 +434,9 @@ dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
      descendent ensemble) ;
    * **Maj + molette** : sa **H** (la caméra seule) ;
    * hors pastille, la molette agit sur la bulle de la vue elle-même ;
-   * ou les boutons **− / +** de la barre de contrôle, pour A et pour B.
+   * l'en-tête de chaque vue affiche en permanence H et Δ de sa bulle.
 
-   Le pas se règle dans la barre (1 mm à 10 cm, 1 cm par défaut). Une rafale
+   Le pas de la molette est de **5 cm** (1 cm au choix, dans Réglages). Une rafale
    de molette ne compte que pour une étape de **Ctrl+Z**. Tout s'enregistre dans
    le fichier de corrections et part dans le CSV corrigé.
 4. **Vérifier des deux côtés** : **G** remet A et B face à face, **I**
@@ -434,8 +444,8 @@ dans la photo, et de corriger sa hauteur et son delta sans quitter la vue.
    une vue dans l'autre.
 
 **En-tête de chaque vue** : A et B ont le même, pour la bulle qu'elles
-affichent : ◀ Retour · ↩ Origine · nom · **H** et **Δ** avec leurs boutons
-− / +. L'en-tête de A porte aussi le pas des réglages. Celui de B porte en plus
+affichent : ◀ Retour · ↩ Origine · nom · **H** et **Δ** (lus ; on les règle à
+la molette). Celui de B porte en plus
 les commandes qui **lient les deux vues** : ⇆ Face à face · ⇄ Inverser ·
 A → B · B → A · Suivi de A · Vue liée. Les valeurs corrigées passent en orange.
 
