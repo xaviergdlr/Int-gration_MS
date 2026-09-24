@@ -137,7 +137,64 @@ trépieds.
 5. **Orientation** : Ctrl + molette tourne l'image de la vue où est le
    curseur. Le trait du centre de l'image montre le décalage.
 6. **Revenir en arrière** : Ctrl+Z (une rafale de molette compte pour une
-   seule étape). **↺ CSV** rend à la station active ses valeurs du CSV.
+   seule étape). **Suppr** rend à la station active ses valeurs du CSV.
+
+**Vérifier d'abord les points de vue.** Un point de vue corrigé fausse tout
+ce que l'on voit depuis lui, par exemple un reste d'essai relu dans le fichier
+de corrections.
+
+Exemple : avec A relevé de 1,07 m (Δ +1,04, H +0,03), le pied d'une voisine à
+3 m est vu 42° sous l'horizon au lieu de 29°. Il paraît donc à 1,8 m au lieu
+de 3 m, et la sphère n'est plus au-dessus de l'emplacement de l'appareil
+visible dans la photo. Une orientation fausse de 3° décale en plus de 16 cm à
+3 m.
+
+Les valeurs corrigées d'un point de vue sont en orange dans son en-tête.
+**↺ CSV**, dans l'en-tête de A ou de B, remet **ce point de vue** aux valeurs
+du CSV (annulable).
+
+## Vue du sol  (touche N, bouton « Sol »)
+
+Une fenêtre séparée montre le sol **vu de dessus**, nord en haut :
+* chaque bulle est **projetée à la verticale** sur son sol local ;
+* les projections sont assemblées **en pavage** : chaque point du sol vient
+  de la bulle la plus proche.
+
+Le sol (dalles, joints, marquages) doit **se raccorder** d'une tuile à
+l'autre :
+
+| Ce qu'on voit au raccord | Erreur probable |
+|---|---|
+| un décalage | position XY |
+| un pivotement | orientation |
+| un changement d'échelle | hauteur instrument |
+
+Chaque station est marquée d'un point, et un trait pointillé montre la
+direction du centre de son image. Pour une station déplacée, la position du
+CSV reste visible.
+
+Les gestes sont les mêmes que dans les bulles, sur la tuile survolée :
+
+| Geste | Effet |
+|---|---|
+| Survol | la station devient active |
+| Alt / Maj + molette | Δ / H |
+| Espace + glisser | position XY |
+| Ctrl + molette | orientation de son image : la tuile tourne |
+| Molette | zoom |
+| Clic droit glissé | déplacer la vue |
+| Clic | aller sur la station |
+
+Les tuiles se recalculent en direct.
+
+Vérifié sur des panoramas de synthèse d'un même sol en damier :
+* le pavage reconstitue le damier, avec un écart de 4,6/255 ;
+* une erreur de 3° d'orientation, de 30 cm de position ou de 25 cm de hauteur
+  casse nettement les raccords ;
+* une image réellement tournée de 4° se raccorde avec une correction de +4°.
+
+La **vue B** peut aussi se détacher dans sa propre fenêtre (bouton ⧉ de son
+en-tête), par exemple sur un second écran.
 
 Les gestes sur un point de vue (A ou B) sont refusés avec un message. Ailleurs
 que sur une station, Alt / Maj + molette ne fait rien : pas de zoom par

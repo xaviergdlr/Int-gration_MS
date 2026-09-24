@@ -2708,7 +2708,11 @@ CORRIGER LA STATION SURVOLÉE
   Ctrl + molette ............. orientation de l'image DE LA VUE où est le curseur
                                ± 1° (0,1° dans Réglages) ; appliquée à l'image,
                                jamais au CSV
-  ↺ CSV ...................... station active : revenir à ses valeurs du CSV
+  ↺ CSV (en-tête A ou B) ..... ce POINT DE VUE revient aux valeurs du CSV : un
+                               point de vue corrigé (Δ, H, orientation…) décale
+                               tout ce que l'on voit depuis lui — à vérifier
+                               d'abord (valeurs en orange dans l'en-tête)
+  Suppr ...................... la station active revient aux valeurs du CSV
   Ctrl+Z ..................... annuler (une rafale de molette = une étape)
   J ou « ◎ Station active » .. B se tourne vers la station active (second angle)
   Fiche (A et B) ............. Z plancher, Δ, H, Z final, ΔX / ΔY de la station
@@ -2742,12 +2746,22 @@ NAVIGATION  (vue A ou B)
   O / G / I / J .............. d'où l'on vient / face à face / inverser A et B /
                                B regarde la station active
 
+VUE DU SOL  (touche N, bouton « Sol ») — fenêtre séparée
+  Chaque bulle est projetée à la verticale sur son sol, en pavage (chaque point
+  du sol vient de la bulle la plus proche). Le sol doit se raccorder d'une
+  tuile à l'autre : un décalage = position fausse, un pivotement = orientation
+  fausse, un changement d'échelle = hauteur instrument fausse.
+  Survol d'une tuile : sa station devient active ; Alt / Maj + molette : Δ / H ;
+  Espace + glisser : XY ; Ctrl + molette : orientation de son image ; molette :
+  zoom ; clic droit glissé : déplacer ; clic : y aller.
+
 AFFICHAGE
   Liste « Voir » ............. Local, Locaux voisins, De proche en proche (défaut),
                                Distance, Plancher entier ; L / T : raccourcis
   Menu « Affichage » ......... étiquettes, couleurs, fiche, réseau au sol, trait du
                                centre, infobulle, mire
-  C .......................... ouvrir / fermer la vue B (comparaison)
+  C .......................... ouvrir / fermer la vue B (comparaison) ; ⧉ dans
+                               son en-tête : la détacher dans sa propre fenêtre
   F / M / V .................. filtres / module / visualiseur ; F11 plein écran
   F1 ou ? .................... cette aide
 
@@ -2881,6 +2895,7 @@ class BubbleNavApp(_TkBase):
         # STATION ACTIVE = la station voisine survolée et corrigée (jamais le point
         # de vue A ni B : on corrige ce que l'on voit, sous deux angles)
         self.target: Optional[int] = None
+        self.ground: Optional["GroundView"] = None   # fenêtre « vue du sol »
         self._axis_lock: Optional[str] = None    # X / Y verrouillé pour ce geste
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
@@ -3293,8 +3308,10 @@ class BubbleNavApp(_TkBase):
                     else (f"Delta Δ du point de vue {which} (fixe). Alt + molette corrige "
                           "la station SURVOLÉE."))
             self.ctrl_vals[(which, comp)] = val
-        mk(bar, "↺ CSV", self._revert_active,             # mêmes commandes dans A et B
-           tip="Station active (survolée) : revenir à ses valeurs du CSV (annulable)."
+        mk(bar, "↺ CSV", lambda: self._revert_view(which),   # mêmes commandes dans A et B
+           tip=f"Point de vue {which} : revenir aux valeurs du CSV (position, H, Δ, "
+               "orientation) — annulable. Un point de vue corrigé fausse tout ce qu'on "
+               "voit depuis lui. (Suppr : la station survolée.)"
            ).pack(side='left', padx=(8, 2), pady=3)
         self._refresh_ctrlbar()
 
@@ -3382,6 +3399,15 @@ class BubbleNavApp(_TkBase):
         self._cone_sig = None
         self._set_status(f"Face à face : {self._nom(self.current)} ↔ {self._nom(b.idx)}",
                          COLORS['sel'])
+
+    def toggle_ground(self) -> None:
+        """Touche N : fenêtre « vue du sol » (pavage nadir), ouverte ou fermée."""
+        if self.ground is not None:
+            self.ground.close()
+            return
+        if self.station() is None:
+            return
+        self.ground = GroundView(self)
 
     def b_look_target(self) -> None:
         """Touche J : B se tourne vers la station active (sur demande seulement)."""
@@ -4276,6 +4302,11 @@ class BubbleNavApp(_TkBase):
                                                          padx=8, pady=6)
         self.cmp_btn = self._mk_button(bar, "Comparer  (C)", self._toggle_compare)
         self.cmp_btn.pack(side='left', padx=3, pady=4)
+        self._mk_button(bar, "Sol  (N)", self.toggle_ground,
+                        tip="Vue du sol : chaque bulle projetée à la verticale sur son sol, en "
+                            "pavage ; les raccords entre tuiles vérifient position, "
+                            "orientation et hauteur. Fenêtre séparée.").pack(side='left', padx=3,
+                                                                             pady=4)
         self.edit_lbl = tk.Label(bar, text="", bg=COLORS['bg_medium'],
                                  fg=COLORS['edit'], font=F_UI_B)
         self.edit_lbl.pack(side='left', padx=6)
@@ -4408,6 +4439,8 @@ class BubbleNavApp(_TkBase):
             '<y>': lambda: self._lock_axis('y'), '<Y>': lambda: self._lock_axis('y'),
             '<Control-z>': self.undo, '<Control-Z>': self.undo,
             '<Control-s>': self._dlg_apply,
+            '<Delete>': self._revert_active,
+            '<n>': self.toggle_ground, '<N>': self.toggle_ground,
         }
         for seq, fn in raccourcis.items():
             self.bind_all(seq, key(fn))
@@ -5984,6 +6017,26 @@ class BubbleNavApp(_TkBase):
         self._set_status(f"Station active {self._nom(st.idx)} : valeurs du CSV rétablies",
                          COLORS['edit'])
 
+    def _revert_view(self, which: str) -> None:
+        """↺ CSV d'un en-tête : le point de vue de cette vue revient au CSV. Un point
+        de vue corrigé (reste d'essais, fichier de corrections relu) décale tout ce
+        que l'on voit depuis lui : c'est la première chose à vérifier."""
+        st = self.station() if which == 'A' else (
+            self.compare.station() if self.compare is not None else None)
+        if st is None:
+            return
+        if not st.modified():
+            self._set_status(f"Point de vue {which} ({self._nom(st.idx)}) : déjà aux "
+                             "valeurs du CSV")
+            return
+        self.corrections.revert(st)
+        self._refresh_links_of(st.idx)
+        self._after_edit(moved=True, turned=True)
+        if self.compare is not None:
+            self.compare.request_render(force=True)
+        self._set_status(f"Point de vue {which} ({self._nom(st.idx)}) : valeurs du CSV "
+                         "rétablies", COLORS['edit'])
+
     def _revert_all(self) -> None:
         n = sum(1 for s in self.stations if s.modified())
         if not n or not messagebox.askyesno(
@@ -6006,6 +6059,8 @@ class BubbleNavApp(_TkBase):
 
     def _after_edit(self, moved: bool = False, turned: bool = False) -> None:
         """Suites d'une correction : rendu, réseau, panneau, sauvegarde."""
+        if self.ground is not None:
+            self.ground.request()
         if turned:
             self._request_render(force=True)
         if moved:
@@ -7204,6 +7259,11 @@ class CompareView(tk.Frame if _TK_OK else object):
         self.app._mk_button(bar, "✕", self.close,
                             tip="Fermer la vue B (touche C).").pack(side='right',
                                                                      padx=(4, 8), pady=4)
+        self.detach_btn = self.app._mk_button(
+            bar, "⧉", self.toggle_detach,
+            tip="Détacher la vue B dans sa propre fenêtre (par exemple sur un second "
+                "écran) ; même bouton pour la rattacher.")
+        self.detach_btn.pack(side='right', padx=2, pady=4)
         self.app.tip(tk.Checkbutton(bar, text="Vue liée", variable=self.linked,
                        command=self._on_linked, font=F_UI, bg=COLORS['bg_medium'],
                        fg=COLORS['text'], selectcolor=COLORS['bg_light'], bd=0,
@@ -7611,6 +7671,30 @@ class CompareView(tk.Frame if _TK_OK else object):
             self.request_render(force=True)
 
     # ── fermeture ────────────────────────────────────────────────────
+    def toggle_detach(self) -> None:
+        """Détache la vue B dans sa propre fenêtre, ou la rattache sous A."""
+        try:
+            if not getattr(self, '_detached', False):
+                self.app.views.forget(self)
+                self.tk.call('wm', 'manage', self._w)
+                self.tk.call('wm', 'title', self._w, f"{APP_NAME} — vue B")
+                self.tk.call('wm', 'geometry', self._w, "1100x700")
+                self.tk.call('wm', 'protocol', self._w, 'WM_DELETE_WINDOW',
+                             self.register(self.toggle_detach))
+                self._detached = True
+                self.detach_btn.config(text="⧈")
+                self.app._set_status("Vue B détachée (⧈ ou fermeture de sa fenêtre : la "
+                                     "rattacher)")
+            else:
+                self.tk.call('wm', 'forget', self._w)
+                self.app.views.add(self, minsize=160, stretch='always')
+                self._detached = False
+                self.detach_btn.config(text="⧉")
+                self.after(60, self._share_height)
+            self.after(80, lambda: self.request_render(force=True))
+        except Exception as exc:
+            self.app._set_status(f"Vue B : détachement impossible ({exc})", COLORS['warning'])
+
     def close(self) -> None:
         self._closed = True
         if self._idle_job:
@@ -7641,6 +7725,383 @@ class CompareView(tk.Frame if _TK_OK else object):
 # ─────────────────────────────────────────────────────────────────────────────
 # DEPENDANCES
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VUE DU SOL : projection nadir des bulles, en pavage
+# ─────────────────────────────────────────────────────────────────────────────
+
+GROUND_TILE_R = 4.0            # m : rayon maximal d'une tuile autour de sa station
+GROUND_PX_M = 60.0             # px par mètre à l'ouverture
+
+
+def ground_sample_maps(st: Station, xs, ys, calib: Calib, width: int, height: int,
+                       eye: float = EYE_HEIGHT_DEFAULT):
+    """Pixels du panorama de `st` qui voient les points du sol (xs, ys) (tableaux
+    numpy, en m) : projection nadir sur le sol local de la station (caméra à H
+    au-dessus). Même convention que le rendu : cap image 0 = centre, correction
+    d'orientation comprise. Retourne (u, v) en float32."""
+    import numpy as np
+    dx = xs - st.x
+    dy = ys - st.y
+    dist = np.hypot(dx, dy)
+    el = -np.degrees(np.arctan2(st.height(eye), np.maximum(dist, 1e-6)))
+    az = np.degrees(np.arctan2(dx, dy))
+    p = st.north_pct / 100.0
+    if calib.mode == 'centre':
+        psi = calib.sense * (az - p * 360.0) + calib.offset
+    else:
+        psi = calib.sense * az + (p - 0.5) * 360.0 + calib.offset
+    psi = psi - st.yaw_fix                     # l'image est tournée de Δ nord
+    u = (np.mod(psi + 180.0, 360.0) / 360.0 * width).astype(np.float32)
+    v = ((0.5 - el / 180.0) * height).astype(np.float32)
+    return u, v
+
+
+def ground_mosaic(stations: Sequence[Station], images: Dict[int, object], calib: Calib,
+                  cx: float, cy: float, w: int, h: int, px_m: float,
+                  eye: float = EYE_HEIGHT_DEFAULT, tile_r: float = GROUND_TILE_R,
+                  seams: bool = True):
+    """Pavage du sol : chaque pixel (vue de dessus, nord en haut) est pris dans la
+    bulle la plus proche (cellules de Voronoï), projetée à la verticale sur son
+    sol. Là où deux tuiles se touchent, le sol doit se raccorder : un décalage
+    trahit une erreur de position, un pivotement une erreur d'orientation, un
+    changement d'échelle une erreur de hauteur instrument.
+    Retourne (image RGB uint8, propriétaire par pixel : indice de station ou -1)."""
+    import numpy as np
+    import cv2
+    xs = cx + (np.arange(w, dtype=np.float32) - w / 2.0 + 0.5) / px_m
+    ys = cy - (np.arange(h, dtype=np.float32) - h / 2.0 + 0.5) / px_m
+    gx, gy = np.meshgrid(xs, ys)
+    best = np.full((h, w), np.inf, dtype=np.float32)
+    owner = np.full((h, w), -1, dtype=np.int32)
+    for st in stations:
+        if st.idx not in images:
+            continue
+        d2 = (gx - st.x) ** 2 + (gy - st.y) ** 2
+        m = (d2 < best) & (d2 <= tile_r * tile_r)
+        best[m] = d2[m]
+        owner[m] = st.idx
+    out = np.full((h, w, 3), 24, dtype=np.uint8)
+    for st in stations:
+        src = images.get(st.idx)
+        if src is None:
+            continue
+        sel = np.nonzero(owner == st.idx)
+        if not len(sel[0]):
+            continue
+        u, v = ground_sample_maps(st, gx[sel], gy[sel], calib, src.shape[1], src.shape[0], eye)
+        n = u.size                             # cv2.remap : moins de 32767 lignes
+        cols = 1024
+        rows = -(-n // cols)
+        mu = np.zeros(rows * cols, dtype=np.float32)
+        mv = np.zeros(rows * cols, dtype=np.float32)
+        mu[:n] = u
+        mv[:n] = v
+        px = cv2.remap(src, mu.reshape(rows, cols), mv.reshape(rows, cols), cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_WRAP)
+        out[sel] = px.reshape(-1, 3)[:n]
+    if seams:                                  # raccords : un trait sombre, discret
+        edge = np.zeros((h, w), dtype=bool)
+        edge[:, 1:] |= owner[:, 1:] != owner[:, :-1]
+        edge[1:, :] |= owner[1:, :] != owner[:-1, :]
+        out[edge] = (out[edge] * 0.45).astype(np.uint8)
+    return out, owner
+
+
+class GroundView(tk.Toplevel if _TK_OK else object):
+    """Fenêtre « Vue du sol » : pavage nadir autour du point de vue A.
+
+    Les mêmes gestes que dans les bulles, sur la station SURVOLÉE (sa tuile) :
+    Alt / Maj + molette → Δ / H, Espace + glisser → position XY, Ctrl + molette
+    → orientation de son image (la tuile tourne). Molette seule : zoom ; clic
+    droit glissé : déplacer ; clic : aller sur la station.
+    """
+
+    def __init__(self, app: "BubbleNavApp"):
+        super().__init__(app)
+        self.app = app
+        self.title(f"{APP_NAME} — vue du sol (nadir)")
+        self.configure(bg=COLORS['bg_dark'])
+        self.geometry("900x860")
+        self.px_m = GROUND_PX_M
+        st = app.station()
+        self.cx, self.cy = (st.x, st.y) if st else (0.0, 0.0)
+        self._photo = None
+        self._owner = None
+        self._busy = False
+        self._dirty = False
+        self._job = None
+        self._pan = None
+        self._drag = None
+        self.seams = tk.BooleanVar(value=True)
+        bar = tk.Frame(self, bg=COLORS['bg_medium'])
+        bar.pack(fill='x')
+        tk.Label(bar, text="Vue du sol", font=F_TITLE, bg=COLORS['bg_medium'],
+                 fg=COLORS['accent']).pack(side='left', padx=10, pady=4)
+        app._mk_button(bar, "⌖ Centrer sur A", self.center_on_a,
+                       tip="Recentrer sur le point de vue A.").pack(side='left', padx=4)
+        tk.Checkbutton(bar, text="Raccords", variable=self.seams, command=self.request,
+                       font=F_UI, bg=COLORS['bg_medium'], fg=COLORS['text'],
+                       selectcolor=COLORS['bg_light'], bd=0, highlightthickness=0,
+                       activebackground=COLORS['bg_medium'],
+                       activeforeground=COLORS['text']).pack(side='left', padx=8)
+        self.info = tk.Label(bar, text="", font=F_UI, bg=COLORS['bg_medium'],
+                             fg=COLORS['text_muted'])
+        self.info.pack(side='left', padx=8)
+        self.canvas = tk.Canvas(self, bg='#141414', highlightthickness=0, cursor='fleur')
+        self.canvas.pack(fill='both', expand=True)
+        tk.Label(self, font=F_UI, bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
+                 anchor='w', padx=10, pady=3,
+                 text="Chaque bulle projetée à la verticale sur son sol ; le sol doit se "
+                      "raccorder d'une tuile à l'autre. Survol : station active · Alt / Maj "
+                      "+ molette : Δ / H · Espace + glisser : XY · Ctrl + molette : "
+                      "orientation · molette : zoom · clic droit glissé : déplacer"
+                 ).pack(fill='x', side='bottom')
+        c = self.canvas
+        c.bind('<Configure>', lambda e: self.request())
+        c.bind('<Motion>', self._on_motion)
+        c.bind('<ButtonPress-1>', self._on_press)
+        c.bind('<B1-Motion>', self._on_drag)
+        c.bind('<ButtonRelease-1>', self._on_release)
+        c.bind('<MouseWheel>', self._on_wheel)
+        c.bind('<Button-4>', lambda e: self._on_wheel(e, +1))
+        c.bind('<Button-5>', lambda e: self._on_wheel(e, -1))
+        for seq in RIGHT_CLICK:
+            c.bind(seq, self._on_pan_start)
+        c.bind('<B3-Motion>', self._on_pan)
+        self.protocol('WM_DELETE_WINDOW', self.close)
+        self.after(80, self.request)
+
+    # ── coordonnées ──────────────────────────────────────────────────
+    def to_world(self, x: float, y: float) -> Tuple[float, float]:
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        return self.cx + (x - w / 2.0) / self.px_m, self.cy - (y - h / 2.0) / self.px_m
+
+    def to_screen(self, X: float, Y: float) -> Tuple[float, float]:
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        return w / 2.0 + (X - self.cx) * self.px_m, h / 2.0 - (Y - self.cy) * self.px_m
+
+    def stations_shown(self) -> List[Station]:
+        """Stations du plancher de A dans le cadre (plus une marge d'une tuile)."""
+        a = self.app.station()
+        if a is None:
+            return []
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        rx = w / 2.0 / self.px_m + GROUND_TILE_R
+        ry = h / 2.0 / self.px_m + GROUND_TILE_R
+        return [s for s in self.app.stations if s.floor == a.floor
+                and abs(s.x - self.cx) <= rx and abs(s.y - self.cy) <= ry
+                and self.app.store.has(s.photo)][:80]
+
+    def station_at(self, x: float, y: float) -> Optional[int]:
+        """Station dont la tuile est sous le curseur."""
+        if self._owner is None:
+            return None
+        o, sc = self._owner
+        j, i = int(y / sc), int(x / sc)
+        if 0 <= j < o.shape[0] and 0 <= i < o.shape[1] and o[j, i] >= 0:
+            return int(o[j, i])
+        return None
+
+    # ── calcul, en arrière-plan ──────────────────────────────────────
+    def request(self, fast: bool = False) -> None:
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(15 if fast else 60, lambda: self._start(fast))
+
+    def _start(self, fast: bool) -> None:
+        self._job = None
+        if self._busy:
+            self._dirty = True
+            return
+        w, h = max(50, self.canvas.winfo_width()), max(50, self.canvas.winfo_height())
+        sc = 2 if fast else 1                     # pendant un geste : demi-résolution
+        sts = self.stations_shown()
+        snap = [dc_replace(s) for s in sts]       # instantané : le calcul est hors fil
+        app = self.app
+        eye = float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
+        args = (snap, self.cx, self.cy, w // sc, h // sc, self.px_m / sc, eye,
+                bool(self.seams.get()), sc, w, h)
+        self._busy = True
+        self.info.config(text="calcul…")
+        threading.Thread(target=self._work, args=args, daemon=True,
+                         name='bubblenav-sol').start()
+
+    def _work(self, snap, cx, cy, w, h, px_m, eye, seams, sc, full_w, full_h):
+        try:
+            images = {}
+            for s in snap:
+                img = self.app.store.peek(s.photo)
+                if img is None:
+                    img = self.app.store.load(s.photo)
+                if img is not None:
+                    images[s.idx] = img
+            t0 = time.perf_counter()
+            out, owner = ground_mosaic(snap, images, self.app.calib, cx, cy, w, h, px_m,
+                                       eye, seams=seams)
+            dt = (time.perf_counter() - t0) * 1000.0
+            self.app._post(self._show, out, owner, sc, full_w, full_h, len(images), dt)
+        except Exception as exc:
+            msg = str(exc)
+            self.app._post(lambda: (self.info.config(text=f"erreur : {msg}"),
+                                    setattr(self, '_busy', False)))
+
+    def _show(self, out, owner, sc, full_w, full_h, n, dt) -> None:
+        self._busy = False
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        from PIL import Image, ImageTk
+        im = Image.fromarray(out)
+        if sc != 1:
+            im = im.resize((full_w, full_h), Image.BILINEAR)
+        self._photo = ImageTk.PhotoImage(im)
+        self._owner = (owner, sc)
+        self.info.config(text=f"{n} bulle(s) · {1000.0 / self.px_m:.0f} mm/px · {dt:.0f} ms")
+        self.redraw()
+        if self._dirty:
+            self._dirty = False
+            self.request(fast=bool(self._drag))
+
+    def redraw(self) -> None:
+        """Image du pavage, puis les stations : A, B, la station active, l'origine
+        CSV des stations déplacées, et la direction du centre de chaque image."""
+        c = self.canvas
+        c.delete('all')
+        if self._photo is not None:
+            c.create_image(0, 0, anchor='nw', image=self._photo)
+        app = self.app
+        tgt = app.target
+        b = app.compare.idx if app.compare is not None else None
+        for st in self.stations_shown():
+            x, y = self.to_screen(st.x, st.y)
+            if st.moved():
+                ox, oy = self.to_screen(st.ox, st.oy)
+                c.create_line(ox, oy, x, y, fill=COLORS['edit'], dash=(4, 3), arrow='last')
+                c.create_oval(ox - 4, oy - 4, ox + 4, oy + 4, outline='#c8c8c8', dash=(2, 2))
+            # centre de l'image (« nord image ») : direction vers laquelle elle regarde
+            az = math.radians(app.calib.azimuth(st.yaw_fix, st.north_pct))
+            L = 0.6 * self.px_m
+            c.create_line(x, y, x + L * math.sin(az), y - L * math.cos(az), fill='#e8e8e8',
+                          width=1, dash=(3, 2))
+            col = (COLORS['hot'] if st.idx == app.current else COLORS['sel'] if st.idx == b
+                   else local_color(st.parts().local or st.floor))
+            r = 6 if st.idx in (app.current, b, tgt) else 4
+            c.create_oval(x - r, y - r, x + r, y + r, fill=col, outline='black')
+            if st.idx == tgt:
+                c.create_oval(x - 11, y - 11, x + 11, y + 11, outline=COLORS['hot'], width=2)
+            tag = 'A ' if st.idx == app.current else 'B ' if st.idx == b else ''
+            nom = st.key if st.key_explicit and st.key else st.locator
+            c.create_text(x + 9, y - 9, text=tag + nom, anchor='sw', font=F_UI_B,
+                          fill='#000000')
+            c.create_text(x + 8, y - 10, text=tag + nom, anchor='sw', font=F_UI_B,
+                          fill=COLORS['edit'] if st.modified() else 'white')
+        w = self.canvas.winfo_width()
+        c.create_line(w - 30, 44, w - 30, 16, fill='#ff6b6b', width=2, arrow='last')
+        c.create_text(w - 30, 52, text="N", fill='#ff6b6b', font=F_UI_B)
+        c.create_line(14, self.canvas.winfo_height() - 14, 14 + self.px_m,
+                      self.canvas.winfo_height() - 14, fill='white', width=3)
+        c.create_text(14 + self.px_m / 2, self.canvas.winfo_height() - 22, text="1 m",
+                      fill='white', font=F_UI)
+
+    def center_on_a(self) -> None:
+        st = self.app.station()
+        if st is not None:
+            self.cx, self.cy = st.x, st.y
+            self.request()
+
+    # ── gestes ───────────────────────────────────────────────────────
+    def _on_motion(self, event) -> None:
+        idx = self.station_at(event.x, event.y)
+        if self.app.can_edit(idx) and idx != self.app.target and self._drag is None:
+            self.app.set_target(idx)              # la tuile survolée : station active
+            self.redraw()
+
+    def _on_wheel(self, event, direction: int = 0) -> None:
+        step = direction if direction else (1 if getattr(event, 'delta', 0) > 0 else -1)
+        idx = self.station_at(event.x, event.y)
+        ctrl = bool(event.state & 0x0004)
+        if ctrl and not (alt_down(event.state) or event.state & 0x0001):
+            if idx is not None:                   # orientation de l'image de cette tuile
+                self.app.adjust_station(idx, 'yaw_fix', step)
+            return
+        if self.app.wheel_alt(event, (), self.app.current, step, hovered=idx):
+            return
+        X, Y = self.to_world(event.x, event.y)   # zoom autour du curseur
+        k = 1.25 if step > 0 else 0.8
+        self.px_m = clamp(self.px_m * k, 8.0, 400.0)
+        self.cx = X - (X - self.cx) / k
+        self.cy = Y - (Y - self.cy) / k
+        self.request()
+
+    def _on_pan_start(self, event) -> None:
+        self._pan = (event.x, event.y, self.cx, self.cy)
+
+    def _on_pan(self, event) -> None:
+        if self._pan is None:
+            return
+        x0, y0, cx0, cy0 = self._pan
+        self.cx = cx0 - (event.x - x0) / self.px_m
+        self.cy = cy0 + (event.y - y0) / self.px_m
+        self.request(fast=True)
+
+    def _on_press(self, event) -> None:
+        self._press = (event.x, event.y)
+        if not getattr(self.app, '_space_down', False):
+            return
+        self.app._space_used = True
+        idx = self.station_at(event.x, event.y)
+        if not self.app.can_edit(idx):
+            self.app._set_status("Vue du sol : Espace + glisser la tuile d'une station "
+                                 "voisine (pas un point de vue A ou B)", COLORS['warning'])
+            return
+        st = self.app.stations[idx]
+        self.app.target = idx
+        self.app.corrections.apply(st)            # état avant le geste
+        self._drag = (idx, st.x, st.y, event.x, event.y)
+
+    def _on_drag(self, event) -> None:
+        if self._drag is None:
+            return
+        idx, x0, y0, px, py = self._drag
+        st = self.app.stations[idx]
+        dx, dy = (event.x - px) / self.px_m, -(event.y - py) / self.px_m
+        axis = self.app._locked_axis()
+        if axis == 'x':
+            dy = 0.0
+        elif axis == 'y':
+            dx = 0.0
+        self.app.corrections.apply(st, x=st.ox + round(x0 + dx - st.ox, 3),
+                                   y=st.oy + round(y0 + dy - st.oy, 3), record=False)
+        self.app._refresh_links_of(idx)
+        self.request(fast=True)
+
+    def _on_release(self, event) -> None:
+        if self._drag is not None:
+            idx = self._drag[0]
+            self._drag = None
+            st = self.app.stations[idx]
+            if self.app.corrections.drop_if_unchanged(st):
+                if self.app.journal and self.app.journal[-1] == ('edit',):
+                    self.app.journal.pop()
+            else:
+                self.app._after_edit(moved=True)
+            self.request()
+            return
+        p = getattr(self, '_press', None)
+        if p and abs(event.x - p[0]) + abs(event.y - p[1]) <= 3:
+            idx = self.station_at(event.x, event.y)
+            if idx is not None and idx != self.app.current:
+                self.app.goto(idx)
+
+    def close(self) -> None:
+        if self.app.ground is self:
+            self.app.ground = None
+        self.destroy()
+
+
 
 def ensure_deps(interactive: bool = True) -> None:
     """Installe silencieusement Pillow / OpenCV / numpy si absents."""
