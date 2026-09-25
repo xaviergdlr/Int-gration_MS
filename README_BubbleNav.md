@@ -185,11 +185,36 @@ Les gestes sont les mêmes que dans les bulles, sur la tuile survolée :
 | Clic droit glissé | déplacer la vue |
 | Clic | aller sur la station |
 
+### Projection : gnomonique sur le plan du sol
+
+La vue du sol est une **projection gnomonique** (centrale) de chaque bulle sur
+le plan de son sol : le rayon qui part de l'objectif, à la hauteur H, et
+traverse un pixel de l'image est prolongé jusqu'au sol (distance = H /
+tan(site)). C'est exactement la vue « rectilinéaire » que l'on obtiendrait en
+visant droit vers le bas, mise à l'échelle du terrain : **les lignes droites
+du sol restent droites**, et sur des panoramas parfaits les tuiles se
+raccordent à 1,6/255 près (joints, traits continus d'une tuile à l'autre).
+
+Ce qui empêche une jointure de se faire sur des photos réelles :
+* **ce qui n'est pas au sol** (murs, pieds de mobilier, marches) : projeté
+  comme s'il était au sol, il s'étire en rayons ;
+* une bulle **pas de niveau** : l'erreur grandit très vite en rasant — 1° de
+  défaut décale le sol d'environ 5 cm à 1,5 m de la station, mais de 16 cm à
+  3,5 m (H = 1,65 m) ;
+* une **hauteur H fausse** (échelle de la tuile, voir plus bas), une position
+  ou une orientation fausse.
+
+D'où le réglage **« Portée des tuiles (m) »** : plus court, chaque point du sol
+vient d'une bulle qui le voit de plus haut, et les jointures sont plus
+fiables.
+
 ### Couture
 
-* **Sans trépied** : le sol juste sous une bulle (0,6 m : trépied, opérateur)
-  est pris dans une bulle voisine qui le voit ; il ne reste que là où aucune
-  autre bulle ne le voit.
+* **Centre des stations grisé** (par défaut) : sur 0,6 m sous chaque bulle
+  (trépied, opérateur), la photo ne voit pas le sol ; rien n'y est affiché
+  plutôt qu'une texture trompeuse. La case **« Nadir des voisines »** le fait
+  remplir par une bulle voisine qui le voit (ce n'est alors pas la photo de
+  la station).
 * **Coutures** : un trait fin suit exactement la limite entre deux tuiles (la
   médiatrice des deux stations) : une cassure du sol sur ce trait signale
   l'erreur.
@@ -197,6 +222,19 @@ Les gestes sont les mêmes que dans les bulles, sur la tuile survolée :
   mélangées ; un décalage y apparaît **en double**.
 * Une tuile ne s'étend jamais au-delà de ce que sa bulle voit du sol (station
   posée bas : portée réduite).
+
+### Îlots
+
+Un **îlot** est un groupe de stations reliées de proche en proche : deux
+stations plus proches que la **liaison max** (4 m par défaut) sont dans le
+même îlot. Avec **« séparer par local »** (par défaut), seules les stations
+d'un même local (R133, R110b…) sont reliées : un îlot ne passe pas à travers
+les murs, où le sol n'est pas commun. Le sol ne se transmet pas d'un îlot à
+l'autre : **chaque îlot a sa propre référence ★** et se contrôle / s'ajuste
+seul.
+
+Dans la vue du sol (case **Îlots**), chaque îlot a un contour de couleur, son
+numéro et son effectif, et « sans ★ » tant qu'il n'a pas de référence.
 
 ### Réactivité
 
@@ -247,12 +285,20 @@ hauteur qui raccorde le sol, **H probable = H × échelle**.
 
 Bouton **« ⇄ Contrôler / ajuster… »** de la vue du sol.
 
-**★ Référence** — la station qui ne bouge jamais : tout l'ajustement s'aligne
-sur elle ; elle doit donc être juste. Boutons **= A**, **= station active**,
-**= conseillée**. Elle est gardée d'une séance à l'autre pour ce relevé.
+**Îlots** — la liste en tête donne chaque îlot : effectif, référence ★, bilan
+du dernier contrôle / ajustement. Clic sur un îlot : la vue du sol le cadre.
+**Traiter : l'îlot choisi / tous les îlots.** Un îlot sans référence est
+ignoré par l'ajustement (« ignoré : pas de référence ★ ») ; une station
+isolée ne peut pas être contrôlée.
+
+**★ Référence de l'îlot** — la station qui ne bouge jamais : son îlot
+s'aligne sur elle ; elle doit donc être juste. Boutons **= A**, **= station
+active**, **= conseillée** (la plus cohérente de l'îlot après un contrôle).
+Par défaut, l'îlot de A a A pour référence ; les autres sont à choisir. Les
+références sont gardées d'une séance à l'autre pour ce relevé.
 
 **🔍 Contrôler — ne modifie jamais rien.** Chaque photo est confrontée au sol
-de ses voisines, telles qu'elles sont :
+des voisines **de son îlot**, telles qu'elles sont :
 * **rouge** : mal placée ou mal orientée **à elle seule**, avec l'écart (cm,
   degrés) ;
 * **violet** : échelle incohérente, donc **hauteur H douteuse** (« H probable

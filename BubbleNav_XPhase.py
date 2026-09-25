@@ -2754,10 +2754,16 @@ VUE DU SOL  (touche N, bouton « Sol ») — fenêtre séparée
   du sol vient de la bulle la plus proche). Le sol doit se raccorder d'une
   tuile à l'autre : un décalage = position fausse, un pivotement = orientation
   fausse, un changement d'échelle = hauteur instrument fausse.
-  Couture : le trépied et l'opérateur (0,6 m sous chaque bulle) sont pris dans
-  une bulle voisine ; trait fin exactement sur la limite entre deux tuiles et
-  fondu de 20 cm (un décalage s'y voit en double). Cases Coutures / Fondu /
-  Sans trépied.
+  Projection : gnomonique (centrale) sur le plan du sol, vue de dessus — les
+  lignes droites du sol restent droites. Ce qui ne se raccorde pas : ce qui
+  n'est pas au sol (murs, mobilier), une bulle pas de niveau, une hauteur H
+  fausse, le sol vu en rasant (loin de la station) : réduire « Portée ».
+  Centre des stations (0,6 m : trépied, opérateur) grisé : la photo n'y voit
+  pas le sol ; case « Nadir des voisines » pour le remplir par une voisine.
+  Couture : trait fin exactement sur la limite entre deux tuiles, fondu de
+  20 cm (un décalage s'y voit en double). Cases Coutures / Fondu.
+  Îlots : groupes de stations reliées de proche en proche (liaison max, par
+  local : pas à travers les murs) ; contour, numéro, ★ de chacun (case Îlots).
   Survol d'une tuile : sa station devient active ; Alt / Maj + molette : Δ / H ;
   Espace + glisser : XY ; Ctrl + molette : orientation de son image ; molette :
   zoom ; clic droit glissé : déplacer ; clic : y aller. Seule la zone touchée
@@ -2769,8 +2775,11 @@ VUE DU SOL  (touche N, bouton « Sol ») — fenêtre séparée
       l'écart. En violet : échelle de la tuile incohérente, donc hauteur
       d'instrument H douteuse (« H probable 1,65 m (saisie 1,80 m) »).
       Une référence sûre est conseillée.
+    Par îlot : liste des îlots (clic : la vue le cadre), une référence ★ par
+      îlot ; « Traiter : l'îlot choisi / tous les îlots ». Un îlot sans ★ est
+      ignoré par l'ajustement ; une station isolée ne peut être contrôlée.
     ★ Référence (= A, = station active, = conseillée) : elle ne bouge jamais,
-      tout s'aligne sur elle ; gardée pour ce relevé.
+      son îlot s'aligne sur elle ; gardée pour ce relevé.
     Ajuster depuis la référence : la référence est d'abord contrôlée (fausse :
       ajustement suspendu) ; puis chaque bulle est recalée sur ses voisines
       déjà ajustées, la plus proche d'abord, et affinée de tous côtés ;
@@ -2924,7 +2933,7 @@ class BubbleNavApp(_TkBase):
         # de vue A ni B : on corrige ce que l'on voit, sous deux angles)
         self.target: Optional[int] = None
         self.ground: Optional["GroundView"] = None   # fenêtre « vue du sol »
-        self.ground_ref: Optional[int] = None        # référence des ajustements (★)
+        self.ground_refs: Optional[set] = None       # références des îlots (★), relues
         self._axis_lock: Optional[str] = None    # X / Y verrouillé pour ce geste
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
@@ -4610,7 +4619,7 @@ class BubbleNavApp(_TkBase):
         self.f_local_cb.config(values=sorted({s.parts().local for s in stations
                                               if s.parts().local}))
         self.by_photo = {s.photo: s for s in stations}
-        self.ground_ref = None                     # relue de la config pour ce relevé
+        self.ground_refs = None                    # relues de la config pour ce relevé
         # Z = plancher + Δ + H ; les Z lus incohérents sont signalés
         alti = apply_altimetry(stations, float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
         if alti:
@@ -7911,12 +7920,14 @@ def ground_mosaic(stations: Sequence[Station], strips: Dict[int, tuple], calib: 
                   cx: float, cy: float, w: int, h: int, px_m: float,
                   eye: float = EYE_HEIGHT_DEFAULT, win: Optional[Tuple[int, int, int, int]] = None,
                   tile_r: float = GROUND_TILE_R, nadir_r: float = GROUND_NADIR_R,
-                  band: float = GROUND_BAND, seams: bool = True):
+                  band: float = GROUND_BAND, seams: bool = True, nadir_fill: bool = False):
     """Pavage du sol, vu de dessus (nord en haut), cadre w × h centré sur (cx, cy).
 
-    Chaque point du sol est pris dans la bulle la plus proche qui le voit HORS
-    de son nadir (trépied, opérateur : rayon `nadir_r`) — le nadir ne sert qu'à
-    défaut d'autre bulle. Entre deux bulles, la couture est fondue sur `band` m :
+    Chaque point du sol est pris dans la bulle la plus proche. Le nadir de
+    chaque bulle (trépied, opérateur : rayon `nadir_r`) n'est PAS du sol vu par
+    elle : il est grisé (`nadir_fill` False, par défaut — rien de trompeur au
+    centre des stations), ou pris dans une bulle voisine qui le voit
+    (`nadir_fill` True). Entre deux bulles, la couture est fondue sur `band` m :
     un défaut d'alignement s'y voit en double, et le trait fin de la couture
     (option `seams`) suit exactement la médiatrice.
     `win` (i0, j0, i1, j1) : ne calcule que ce rectangle du cadre (mise à jour
@@ -7933,6 +7944,7 @@ def ground_mosaic(stations: Sequence[Station], strips: Dict[int, tuple], calib: 
     o2 = np.full((hh, ww), -1, dtype=np.int32)
     use: List[Tuple[Station, Tuple[int, int, int, int]]] = []
     nad2 = nadir_r * nadir_r
+    nadm = np.zeros((hh, ww), dtype=bool) if (nadir_r > 0 and not nadir_fill) else None
     for st in stations:
         if st.idx not in strips:
             continue
@@ -7949,7 +7961,10 @@ def ground_mosaic(stations: Sequence[Station], strips: Dict[int, tuple], calib: 
         ddx = (xs[a0:a1] - np.float32(st.x)) ** 2
         ddy = (ys[b0:b1] - np.float32(st.y)) ** 2
         d = ddy[:, None] + ddx[None, :]
-        d[d < nad2] += _BIG
+        if nadm is not None:                   # nadir grisé (pas de sol vu ici)
+            nadm[b0:b1, a0:a1] |= d < nad2
+        else:                                  # nadir pris dans une voisine
+            d[d < nad2] += _BIG
         d[d > reach * reach] = np.inf
         D1, D2 = d1[b0:b1, a0:a1], d2[b0:b1, a0:a1]
         O1, O2 = o1[b0:b1, a0:a1], o2[b0:b1, a0:a1]
@@ -7991,6 +8006,8 @@ def ground_mosaic(stations: Sequence[Station], strips: Dict[int, tuple], calib: 
     if seams:
         line = pair & (s < 0.5 / px_m)
         out[line] = out[line] * 0.35 + np.array([255.0, 200.0, 40.0], np.float32) * 0.65
+    if nadm is not None:
+        out[nadm] = np.array([46.0, 46.0, 52.0], np.float32)
     return np.clip(out, 0, 255).astype(np.uint8), idx_of[o1]
 
 
@@ -8239,6 +8256,45 @@ def ground_adjust(stations: Sequence[Station], origin: int, candidates: Iterable
     return out
 
 
+def ground_islands(stations: Sequence[Station], link_r: float = 6.0,
+                   by_local: bool = False) -> List[List[int]]:
+    """ÎLOTS : groupes de stations reliées de proche en proche (voisines à
+    moins de `link_r` m, même plancher ; même local si `by_local`). Le sol ne
+    se transmet pas d'un îlot à l'autre : chacun a sa propre référence.
+    Retourne les listes d'indices, du plus grand îlot au plus petit."""
+    sts = list(stations)
+    parent = {s.idx: s.idx for s in sts}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    cell = max(0.5, float(link_r))
+    grid: Dict[tuple, List[Station]] = {}
+    for s in sts:
+        grid.setdefault((s.floor, int(math.floor(s.x / cell)),
+                         int(math.floor(s.y / cell))), []).append(s)
+    for s in sts:
+        gx, gy = int(math.floor(s.x / cell)), int(math.floor(s.y / cell))
+        loc = s.parts().local if by_local else None
+        for ox in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                for o in grid.get((s.floor, gx + ox, gy + oy), ()):
+                    if o.idx <= s.idx or math.hypot(o.x - s.x, o.y - s.y) > link_r:
+                        continue
+                    if by_local and o.parts().local != loc:
+                        continue
+                    ra, rb = find(s.idx), find(o.idx)
+                    if ra != rb:
+                        parent[rb] = ra
+    groups: Dict[int, List[int]] = {}
+    for s in sts:
+        groups.setdefault(find(s.idx), []).append(s.idx)
+    return sorted(groups.values(), key=lambda g: (-len(g), min(g)))
+
+
 def ground_check(stations: Sequence[Station], ids: Iterable[int], strips_get, calib: Calib,
                  eye: float = EYE_HEIGHT_DEFAULT, link_r: float = 6.0,
                  min_cc: float = 0.6, flag_xy: float = CHECK_FLAG_XY,
@@ -8340,6 +8396,28 @@ def ground_check(stations: Sequence[Station], ids: Iterable[int], strips_get, ca
     return [res[i] for i in ids if i in res]
 
 
+def _convex_hull(pts: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Enveloppe convexe (chaîne monotone d'Andrew), sens trigonométrique."""
+    p = sorted(set((float(x), float(y)) for x, y in pts))
+    if len(p) <= 2:
+        return p
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[Tuple[float, float]] = []
+    for q in p:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], q) <= 0:
+            lower.pop()
+        lower.append(q)
+    upper: List[Tuple[float, float]] = []
+    for q in reversed(p):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], q) <= 0:
+            upper.pop()
+        upper.append(q)
+    return lower[:-1] + upper[:-1]
+
+
 class GroundView(tk.Toplevel if _TK_OK else object):
     """Fenêtre « Vue du sol » : pavage nadir autour du point de vue A.
 
@@ -8381,9 +8459,14 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         self.names = tk.BooleanVar(value=bool(app.cfg.get('ground_names', True)))
         self.seams = tk.BooleanVar(value=bool(app.cfg.get('ground_seams', True)))
         self.feather = tk.BooleanVar(value=bool(app.cfg.get('ground_feather', True)))
-        self.nadir = tk.BooleanVar(value=bool(app.cfg.get('ground_nadir', True)))
+        self.nadir_fill = tk.BooleanVar(value=bool(app.cfg.get('ground_nadir_fill', False)))
+        self.show_islands = tk.BooleanVar(value=bool(app.cfg.get('ground_islands', True)))
+        self.reach_var = tk.DoubleVar(value=float(app.cfg.get('ground_reach', GROUND_TILE_R)))
+        self.sel_island: List[int] = []           # îlot choisi dans « Contrôler / ajuster »
         bar = tk.Frame(self, bg=COLORS['bg_medium'])
         bar.pack(fill='x')
+        bar2 = tk.Frame(self, bg=COLORS['bg_medium'])
+        bar2.pack(fill='x')
         tk.Label(bar, text="Vue du sol", font=F_TITLE, bg=COLORS['bg_medium'],
                  fg=COLORS['accent']).pack(side='left', padx=10, pady=4)
         app._mk_button(bar, "⌖ Centrer sur A", self.center_on_a,
@@ -8398,21 +8481,34 @@ class GroundView(tk.Toplevel if _TK_OK else object):
                        ).pack(side='left', padx=4)
         for var, txt, tip in (
                 (self.names, "Noms", "Nom (Locator) et numéro de scan de chaque station."),
+                (self.show_islands, "Îlots", "Contour de chaque îlot (groupe de stations "
+                                             "reliées de proche en proche) et sa référence ★."),
                 (self.seams, "Coutures", "Trait fin exactement sur la limite entre deux "
                                          "tuiles : un défaut de position ou d'orientation "
                                          "y fait une cassure."),
                 (self.feather, "Fondu", "Fondu de 20 cm de part et d'autre de la couture : "
                                         "un décalage y apparaît en double."),
-                (self.nadir, "Sans trépied", "Le sol sous chaque bulle (trépied, opérateur, "
-                                             f"{GROUND_NADIR_R:g} m) est pris dans une "
-                                             "bulle voisine quand elle le voit.")):
-            cb = tk.Checkbutton(bar, text=txt, variable=var, command=self._opts_changed,
+                (self.nadir_fill, "Nadir des voisines",
+                 f"Décoché (par défaut) : le centre de chaque station ({GROUND_NADIR_R:g} m : "
+                 "trépied, opérateur) est grisé — sa photo n'y voit pas le sol. Coché : il "
+                 "est rempli par une bulle voisine (ce n'est alors PAS sa propre image).")):
+            cb = tk.Checkbutton(bar2, text=txt, variable=var, command=self._opts_changed,
                                 font=F_UI, bg=COLORS['bg_medium'], fg=COLORS['text'],
                                 selectcolor=COLORS['bg_light'], bd=0, highlightthickness=0,
                                 activebackground=COLORS['bg_medium'],
                                 activeforeground=COLORS['text'])
-            cb.pack(side='left', padx=4)
+            cb.pack(side='left', padx=(10 if txt == "Noms" else 4, 4), pady=2)
             Tooltip(cb, tip)
+        tk.Label(bar2, text="Portée des tuiles (m) :", font=F_UI, bg=COLORS['bg_medium'],
+                 fg=COLORS['text']).pack(side='left', padx=(12, 2))
+        sp = tk.Spinbox(bar2, from_=1.5, to=6.0, increment=0.5, width=4, format='%.1f',
+                        textvariable=self.reach_var, font=F_UI, command=self._opts_changed)
+        sp.pack(side='left')
+        sp.bind('<Return>', lambda e: self._opts_changed())
+        Tooltip(sp, "Au-delà de cette distance, une tuile laisse la place à sa voisine. "
+                    "Loin de la station, le sol est vu en rasant : un défaut de niveau de "
+                    "1° y décale le sol de ~5 cm à 1,5 m mais de ~16 cm à 3,5 m (H 1,65 m). "
+                    "Réduire la portée rend les jointures plus fiables.")
         foot = tk.Frame(self, bg=COLORS['bg_medium'])
         foot.pack(fill='x', side='bottom')
         # largeur fixe : un texte d'état plus long ne doit pas replier l'aide
@@ -8469,8 +8565,8 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         if a is None:
             return []
         w, h = self._size()
-        rx = w / 2.0 / self.px_m + GROUND_TILE_R
-        ry = h / 2.0 / self.px_m + GROUND_TILE_R
+        rx = w / 2.0 / self.px_m + self._reach()
+        ry = h / 2.0 / self.px_m + self._reach()
         sts = [s for s in self.app.stations if s.floor == a.floor
                and abs(s.x - self.cx) <= rx and abs(s.y - self.cy) <= ry
                and self.app.store.has(s.photo)]
@@ -8496,13 +8592,21 @@ class GroundView(tk.Toplevel if _TK_OK else object):
     def _eye(self) -> float:
         return float(self.app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
 
+    def _reach(self) -> float:
+        try:
+            return clamp(float(self.reach_var.get()), 1.0, 8.0)
+        except (tk.TclError, ValueError):
+            return GROUND_TILE_R
+
     def _opts(self) -> tuple:
-        return (bool(self.seams.get()), bool(self.feather.get()), bool(self.nadir.get()))
+        return (bool(self.seams.get()), bool(self.feather.get()), bool(self.nadir_fill.get()),
+                self._reach())
 
     def _opts_changed(self) -> None:
-        s, f, n = self._opts()
-        self.app.cfg.update(ground_seams=s, ground_feather=f, ground_nadir=n,
-                            ground_names=bool(self.names.get()))
+        s, f, n, r = self._opts()
+        self.app.cfg.update(ground_seams=s, ground_feather=f, ground_nadir_fill=n,
+                            ground_reach=r, ground_names=bool(self.names.get()),
+                            ground_islands=bool(self.show_islands.get()))
         save_config(self.app.cfg)
         self.redraw()
         self.request()
@@ -8542,7 +8646,7 @@ class GroundView(tk.Toplevel if _TK_OK else object):
             if not changed:
                 self._display()
                 return
-            r = GROUND_TILE_R * self.px_m + 3
+            r = self._reach() * self.px_m + 3
             box = None
             for i in changed:
                 for sg in (sig.get(i), self._sig.get(i)):
@@ -8570,8 +8674,8 @@ class GroundView(tk.Toplevel if _TK_OK else object):
     def _work(self, snap, frame, win, sig, cal) -> None:
         try:
             gs = self.app.ground_strips
-            cx, cy, w, h, px_m, eye, _c, (seams, feather, nadir) = frame
-            kw = dict(nadir_r=GROUND_NADIR_R if nadir else 0.0,
+            cx, cy, w, h, px_m, eye, _c, (seams, feather, nadir_fill, reach) = frame
+            kw = dict(nadir_r=GROUND_NADIR_R, nadir_fill=nadir_fill, tile_r=reach,
                       band=GROUND_BAND if feather else 0.0, seams=seams)
             strips: Dict[int, tuple] = {}
             missing = []
@@ -8683,10 +8787,17 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         app = self.app
         tgt = app.target
         b = app.compare.idx if app.compare is not None else None
-        ref = self.ref_idx()
         names = bool(self.names.get())
         shown = self.stations_shown()
+        islands = self.islands()
+        refs = {r for r in (self.ref_of(g) for g in islands) if r is not None}
+        if self.show_islands.get():
+            self._draw_islands(islands, refs)
         for st in shown:
+            if self.nadir_fill.get() is False:    # centre grisé : pas de sol vu ici
+                x, y = self.to_screen(st.x, st.y)
+                rn = GROUND_NADIR_R * self.px_m
+                c.create_oval(x - rn, y - rn, x + rn, y + rn, outline='#8a8f99', dash=(2, 3))
             x, y = self.to_screen(st.x, st.y)
             if st.moved():
                 ox, oy = self.to_screen(st.ox, st.oy)
@@ -8698,7 +8809,7 @@ class GroundView(tk.Toplevel if _TK_OK else object):
             c.create_line(x, y, x + L * math.sin(az), y - L * math.cos(az), fill='#e8e8e8',
                           width=1, dash=(3, 2))
             mk = self.marks.get(st.idx)
-            if st.idx == ref:                     # référence : étoile dorée
+            if st.idx in refs:                    # référence de son îlot : étoile dorée
                 pts = []
                 for k in range(10):
                     rr = 13 if k % 2 == 0 else 5.5
@@ -8711,11 +8822,11 @@ class GroundView(tk.Toplevel if _TK_OK else object):
             c.create_oval(x - r, y - r, x + r, y + r, fill=col, outline='black')
             if st.idx == tgt:
                 c.create_oval(x - 11, y - 11, x + 11, y + 11, outline=COLORS['hot'], width=2)
-            if not names and st.idx not in (ref, app.current, b, tgt) and mk is None:
+            if not names and st.idx not in refs | {app.current, b, tgt} and mk is None:
                 continue
-            tag = ('★ RÉF ' if st.idx == ref else '') + \
+            tag = ('★ RÉF ' if st.idx in refs else '') + \
                   ('A ' if st.idx == app.current else 'B ' if st.idx == b else '')
-            fg = ('#ffd21f' if st.idx == ref else COLORS['edit'] if st.modified()
+            fg = ('#ffd21f' if st.idx in refs else COLORS['edit'] if st.modified()
                   else 'white')
             dx_l = 22 if mk is not None else 10   # à côté du cercle de surbrillance
             self._label(x + dx_l, y - 8, tag + self.full_name(st), fg, 'sw')
@@ -8770,29 +8881,106 @@ class GroundView(tk.Toplevel if _TK_OK else object):
                                    fill='#161a20', outline='#3a4150')
             c.tag_raise(t, r)
 
-    # ── station de référence ─────────────────────────────────────────
-    def ref_idx(self) -> Optional[int]:
-        """Station de référence des ajustements : celle choisie (gardée d'une
-        séance à l'autre pour ce relevé), sinon le point de vue A."""
+    # ── îlots et références ──────────────────────────────────────────
+    ISLAND_COLORS = ('#4fc3f7', '#81c784', '#ffb74d', '#f06292', '#ba68c8', '#4db6ac',
+                     '#e57373', '#aed581', '#90a4ae', '#fff176')
+
+    def island_params(self) -> Tuple[float, bool]:
+        cfg = self.app.cfg
+        return (float(cfg.get('island_link', 4.0)), bool(cfg.get('island_by_local', True)))
+
+    def islands(self) -> List[List[int]]:
+        """Îlots du plancher de A (stations avec image), du plus grand au plus petit."""
+        a = self.app.station()
+        if a is None:
+            return []
+        link, by_local = self.island_params()
+        sts = [s for s in self.app.stations if s.floor == a.floor
+               and self.app.store.has(s.photo)]
+        return ground_islands(sts, link, by_local)
+
+    def island_of(self, idx: Optional[int]) -> List[int]:
+        return next((g for g in self.islands() if idx in g), [])
+
+    def refs(self) -> set:
+        """Références choisies (une par îlot), gardées pour ce relevé."""
         app = self.app
-        r = getattr(app, 'ground_ref', None)
-        if r is None and app.cfg.get('ground_ref_csv') == app.csv_path:
-            photo = app.cfg.get('ground_ref')
-            st = app.by_photo.get(photo) if photo else None
-            r = st.idx if st is not None else None
-            app.ground_ref = r
-        if r is not None and 0 <= r < len(app.stations):
-            return r
-        return app.current if 0 <= app.current < len(app.stations) else None
+        if getattr(app, 'ground_refs', None) is None:
+            app.ground_refs = set()
+            if app.cfg.get('ground_ref_csv') == app.csv_path:
+                photos = app.cfg.get('ground_refs') or []
+                if not photos and app.cfg.get('ground_ref'):
+                    photos = [app.cfg.get('ground_ref')]       # ancienne config
+                for ph in photos:
+                    st = app.by_photo.get(ph)
+                    if st is not None:
+                        app.ground_refs.add(st.idx)
+        return app.ground_refs
+
+    def ref_of(self, members: Sequence[int]) -> Optional[int]:
+        """Référence d'un îlot : celle choisie, sinon le point de vue A s'il en
+        fait partie, sinon aucune (à choisir)."""
+        chosen = [i for i in members if i in self.refs()]
+        if chosen:
+            return chosen[0]
+        return self.app.current if self.app.current in members else None
 
     def set_ref(self, idx: Optional[int]) -> None:
+        """`idx` devient LA référence de son îlot."""
         app = self.app
         if idx is None or not (0 <= idx < len(app.stations)):
             return
-        app.ground_ref = idx
-        app.cfg.update(ground_ref=app.stations[idx].photo, ground_ref_csv=app.csv_path)
+        refs = self.refs()
+        refs.difference_update(self.island_of(idx))
+        refs.add(idx)
+        app.cfg.update(ground_refs=[app.stations[i].photo for i in sorted(refs)],
+                       ground_ref_csv=app.csv_path)
+        app.cfg.pop('ground_ref', None)
         save_config(app.cfg)
         self.redraw()
+
+    def fit(self, members: Sequence[int]) -> None:
+        """Cadre la vue sur un groupe de stations (un îlot)."""
+        sts = [self.app.stations[i] for i in members if 0 <= i < len(self.app.stations)]
+        if not sts:
+            return
+        x0, x1 = min(s.x for s in sts), max(s.x for s in sts)
+        y0, y1 = min(s.y for s in sts), max(s.y for s in sts)
+        w, h = self._size()
+        m = 2.0 * min(self._reach(), 2.5)
+        self.px_m = clamp(min(w / (x1 - x0 + m), h / (y1 - y0 + m)), 8.0, 200.0)
+        self.cx, self.cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        self._display()
+        self.request()
+
+    def _draw_islands(self, islands: List[List[int]], refs: set) -> None:
+        """Contour arrondi de chaque îlot visible, son numéro et son effectif."""
+        c = self.canvas
+        w, h = self._size()
+        sel = set(self.sel_island)
+        rpad = 0.7
+        for k, g in enumerate(islands):
+            pts = []
+            for i in g:
+                st = self.app.stations[i]
+                for a in range(12):
+                    an = a * math.pi / 6
+                    pts.append(self.to_screen(st.x + rpad * math.cos(an),
+                                              st.y + rpad * math.sin(an)))
+            hull = _convex_hull(pts)
+            if not hull or max(p[0] for p in hull) < 0 or min(p[0] for p in hull) > w \
+                    or max(p[1] for p in hull) < 0 or min(p[1] for p in hull) > h:
+                continue
+            col = self.ISLAND_COLORS[k % len(self.ISLAND_COLORS)]
+            is_sel = bool(sel) and set(g) == sel
+            flat = [v for p in hull for v in p]
+            c.create_polygon(flat, fill='', outline='black', width=4 if is_sel else 3)
+            c.create_polygon(flat, fill='', outline=col, width=3 if is_sel else 1.5,
+                             dash=() if is_sel else (6, 4))
+            top = min(hull, key=lambda p: p[1])
+            ok_ref = any(i in refs for i in g)
+            self._label(top[0], top[1] - 2, f"Îlot {k + 1} · {len(g)}"
+                        + ("" if ok_ref else " · sans ★"), col, 's', F_UI)
 
     def center_on_a(self) -> None:
         st = self.app.station()
@@ -8915,39 +9103,44 @@ class GroundView(tk.Toplevel if _TK_OK else object):
 
 
 class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
-    """« Contrôler / ajuster » les bulles sur le sol de leurs voisines.
+    """« Contrôler / ajuster » les bulles sur le sol de leurs voisines, ÎLOT PAR ÎLOT.
 
-    * CONTRÔLER (rien ne change) : chaque photo est confrontée au sol de ses
-      voisines ; celles qui sont mal placées ou mal orientées à elles seules
-      sont mises en surbrillance dans la vue du sol et dans le tableau ; la
-      meilleure référence possible est proposée.
-    * AJUSTER DEPUIS LA RÉFÉRENCE : la référence (★, fixe) est d'abord
-      contrôlée — une référence fausse fausserait tout —, puis les bulles sont
-      recalées de proche en proche (voir ground_adjust).
-    « Appliquer » : une seule annulation (Ctrl+Z) défait tout."""
+    Un îlot est un groupe de stations reliées de proche en proche (voir
+    ground_islands) : le sol ne se transmet pas d'un îlot à l'autre, chacun a
+    donc sa propre référence (★) et se contrôle / s'ajuste seul.
+    * CONTRÔLER (rien ne change) : chaque photo est confrontée au sol des
+      voisines de son îlot ; les incohérentes sont mises en surbrillance.
+    * AJUSTER : la référence de l'îlot est d'abord contrôlée — une référence
+      fausse fausserait tout l'îlot —, puis les bulles sont recalées de proche
+      en proche (voir ground_adjust).
+    « Appliquer » : position XY (et H si coché), jamais l'orientation ; une
+    seule annulation (Ctrl+Z) défait tout."""
 
-    COLS = (('st', "Station", 150), ('dx', "ΔX cm", 60), ('dy', "ΔY cm", 60),
-            ('dd', "Écart cm", 68), ('dn', "Orient. °", 70), ('dh', "ΔH cm", 60),
-            ('ech', "Échelle", 62), ('cc', "Corrél.", 56), ('nv', "Voisines", 66),
-            ('etat', "État", 300))
+    COLS = (('isl', "Îlot", 44), ('st', "Station", 140), ('dx', "ΔX cm", 58),
+            ('dy', "ΔY cm", 58), ('dd', "Écart cm", 64), ('dn', "Orient. °", 66),
+            ('dh', "ΔH cm", 58), ('ech', "Échelle", 60), ('cc', "Corrél.", 54),
+            ('nv', "Voisines", 62), ('etat', "État", 300))
     MAX_SHIFT, MAX_YAW = 0.8, 5.0
 
     def __init__(self, gv: GroundView):
         super().__init__(gv)
         self.gv = gv
         self.app = app = gv.app
-        self.title(f"{APP_NAME} — contrôler / ajuster sur le sol")
+        self.title(f"{APP_NAME} — contrôler / ajuster sur le sol, par îlot")
         self.configure(bg=COLORS['bg_dark'])
-        self.geometry("1080x660")
+        self.geometry("1100x780")
         self.transient(gv)
         self._cancel: Optional[threading.Event] = None
         self._result: Optional[List[dict]] = None
         self._mode = ''
-        self._base: Dict[int, Tuple[float, float, float]] = {}
-        self._origin: Optional[int] = None
-        self._used = (True, True)
-        self._suggest: Optional[int] = None
-        self._force_ref: Optional[int] = None
+        self._base: Dict[int, Tuple[float, float, float, float]] = {}
+        self._origins: set = set()
+        self._used = (True, False)
+        self._suggest: Dict[int, int] = {}        # îlot → référence conseillée
+        self._status: Dict[int, str] = {}         # îlot → bilan du dernier calcul
+        self._force: set = set()                  # références douteuses acceptées
+        self._islands: List[List[int]] = []
+        self._sel = 0
         bg = COLORS['bg_medium']
         top = tk.Frame(self, bg=bg)
         top.pack(fill='x')
@@ -8955,39 +9148,74 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
         def lab(parent, text, **kw):
             return tk.Label(parent, text=text, font=F_UI, bg=bg, fg=COLORS['text'], **kw)
 
-        def check(parent, text, var, tip):
+        def check(parent, text, var, tip, cmd=None):
             cb = tk.Checkbutton(parent, text=text, variable=var, font=F_UI, bg=bg,
                                 fg=COLORS['text'], selectcolor=COLORS['bg_light'], bd=0,
                                 highlightthickness=0, activebackground=bg,
-                                activeforeground=COLORS['text'])
+                                activeforeground=COLORS['text'], command=cmd)
             Tooltip(cb, tip)
             return cb
 
+        # ── îlots ────────────────────────────────────────────────────
+        r0 = tk.Frame(top, bg=bg)
+        r0.pack(fill='x', padx=10, pady=(8, 2))
+        tk.Label(r0, text="Îlots", font=F_UI_B, bg=bg, fg=COLORS['accent']).pack(side='left')
+        lab(r0, "  liaison max (m) :").pack(side='left')
+        link, by_local = gv.island_params()
+        self.link_var = tk.DoubleVar(value=link)
+        sp = tk.Spinbox(r0, from_=1.5, to=15, increment=0.5, width=5, format='%.1f',
+                        textvariable=self.link_var, font=F_UI, command=self._islands_changed)
+        sp.pack(side='left', padx=4)
+        sp.bind('<Return>', lambda e: self._islands_changed())
+        Tooltip(sp, "Deux stations plus proches que cette distance sont dans le même îlot "
+                    "(de proche en proche).")
+        self.local_var = tk.BooleanVar(value=by_local)
+        check(r0, "séparer par local", self.local_var,
+              "Un îlot ne franchit pas les murs : seules les stations d'un même local "
+              "(R133, R110b…) sont reliées. Décoché : la proximité seule compte.",
+              self._islands_changed).pack(side='left', padx=8)
+        self.isl_info = lab(r0, "")
+        self.isl_info.pack(side='left', padx=8)
+        fr_i = tk.Frame(top, bg=bg)
+        fr_i.pack(fill='x', padx=10, pady=2)
+        self.itree = ttk.Treeview(fr_i, columns=('k', 'n', 'ref', 'etat'), show='headings',
+                                  height=6, selectmode='browse')
+        for key, txt, wd in (('k', "Îlot", 60), ('n', "Stations", 70),
+                             ('ref', "★ Référence", 220), ('etat', "Bilan", 560)):
+            self.itree.heading(key, text=txt)
+            self.itree.column(key, width=wd, anchor='w' if key in ('ref', 'etat') else 'e')
+        isb = ttk.Scrollbar(fr_i, orient='vertical', command=self.itree.yview)
+        self.itree.configure(yscrollcommand=isb.set)
+        self.itree.pack(side='left', fill='x', expand=True)
+        isb.pack(side='right', fill='y')
+        self.itree.tag_configure('noref', foreground='#9a6b00')
+        self.itree.tag_configure('bad', foreground='#d62828')
+        self.itree.tag_configure('ok', foreground='#1e7e34')
+        self.itree.bind('<<TreeviewSelect>>', self._on_island)
+        # ── référence de l'îlot choisi ───────────────────────────────
         r1 = tk.Frame(top, bg=bg)
-        r1.pack(fill='x', padx=10, pady=(8, 2))
-        lab(r1, "★ Référence (fixe) :").pack(side='left')
+        r1.pack(fill='x', padx=10, pady=(6, 2))
+        lab(r1, "★ Référence de l'îlot choisi :").pack(side='left')
         self.ref_lbl = tk.Label(r1, text="", font=F_UI_B, bg=bg, fg='#ffd21f')
         self.ref_lbl.pack(side='left', padx=6)
         app._mk_button(r1, "= A", lambda: self._set_ref(app.current),
-                       tip="Le point de vue A devient la référence.").pack(side='left', padx=2)
+                       tip="Le point de vue A devient la référence de son îlot."
+                       ).pack(side='left', padx=2)
         app._mk_button(r1, "= station active",
                        lambda: self._set_ref(app.target if app.target_station() else None),
-                       tip="La station survolée devient la référence.").pack(side='left',
-                                                                             padx=2)
-        self.sug_btn = app._mk_button(r1, "= conseillée", lambda: self._set_ref(self._suggest),
+                       tip="La station survolée devient la référence de son îlot."
+                       ).pack(side='left', padx=2)
+        self.sug_btn = app._mk_button(r1, "= conseillée", self._set_suggested,
                                       tip="Après un contrôle : la station la plus cohérente "
-                                          "avec le plus de voisines.")
+                                          "de l'îlot, avec le plus de voisines.")
         self.sug_btn.pack(side='left', padx=2)
         self.sug_btn.config(state='disabled')
+        # ── paramètres ───────────────────────────────────────────────
         r2 = tk.Frame(top, bg=bg)
         r2.pack(fill='x', padx=10, pady=2)
-        lab(r2, "Portée autour de la référence (m) :").pack(side='left')
-        self.range_var = tk.DoubleVar(value=float(app.cfg.get('adjust_range', 15.0)))
-        tk.Spinbox(r2, from_=3, to=200, increment=1, width=5, textvariable=self.range_var,
-                   font=F_UI).pack(side='left', padx=6)
         self.xy_var = tk.BooleanVar(value=bool(app.cfg.get('adjust_xy', True)))
         self.h_var = tk.BooleanVar(value=bool(app.cfg.get('adjust_h', False)))
-        lab(r2, "Ajustement, appliquer :").pack(side='left', padx=(12, 0))
+        lab(r2, "Ajustement, appliquer :").pack(side='left')
         check(r2, "Position XY", self.xy_var,
               "Corriger la position des bulles (dans le CSV de sortie).").pack(side='left',
                                                                                 padx=6)
@@ -9003,18 +9231,26 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
         Tooltip(sp, "Ressemblance minimale (0 à 1) entre le sol d'une bulle et celui de "
                     "ses voisines. En dessous, la bulle est jugée douteuse et n'est pas "
                     "corrigée.")
+        lab(r2, "Traiter :").pack(side='left', padx=(16, 0))
+        self.scope_var = tk.StringVar(value='sel')
+        for val, txt in (('sel', "l'îlot choisi"), ('all', "tous les îlots")):
+            tk.Radiobutton(r2, text=txt, variable=self.scope_var, value=val, font=F_UI,
+                           bg=bg, fg=COLORS['text'], selectcolor=COLORS['bg_light'],
+                           activebackground=bg, highlightthickness=0).pack(side='left',
+                                                                           padx=3)
         r3 = tk.Frame(top, bg=bg)
         r3.pack(fill='x', padx=10, pady=(4, 4))
         self.chk_btn = app._mk_button(
             r3, "🔍 Contrôler", self.run_check,
-            tip="Chaque photo confrontée au sol de ses voisines, SANS RIEN MODIFIER : "
-                "en rouge celles mal placées ou mal orientées à elles seules, en violet "
-                "celles dont l'échelle (donc la hauteur H) ne raccorde pas.")
+            tip="Chaque photo confrontée au sol des voisines de son îlot, SANS RIEN "
+                "MODIFIER : en rouge celles mal placées ou mal orientées à elles seules, "
+                "en violet celles dont l'échelle (donc la hauteur H) ne raccorde pas.")
         self.chk_btn.pack(side='left')
         self.run_btn = app._mk_button(
-            r3, "▶ Ajuster depuis la référence", self.run_adjust,
-            tip="Contrôle d'abord la référence, puis recale les bulles de proche en "
-                "proche. Rien ne change avant « Appliquer ».")
+            r3, "▶ Ajuster", self.run_adjust,
+            tip="Pour chaque îlot traité : contrôle d'abord sa référence ★, puis recale "
+                "ses bulles de proche en proche. Un îlot sans référence est ignoré. Rien "
+                "ne change avant « Appliquer ».")
         self.run_btn.pack(side='left', padx=6)
         self.apply_btn = app._mk_button(
             r3, "✔ Appliquer", self.apply,
@@ -9030,23 +9266,23 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
                             anchor='w', padx=10)
         self.msg.pack(fill='x')
         self.ref_msg = tk.Label(top, text="", font=F_UI_B, bg=bg, fg=COLORS['text'],
-                                anchor='w', padx=10, justify='left', wraplength=920)
+                                anchor='w', padx=10, justify='left', wraplength=1060)
         self.ref_msg.pack(fill='x', pady=(0, 6))
         tk.Label(self, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'], anchor='w',
-                 justify='left', padx=10, wraplength=920,
-                 text="Contrôler ne modifie rien. La référence doit être juste : tout "
-                      "l'ajustement s'aligne sur elle. Recalage : translation, rotation et "
-                      "échelle de la tuile autour de sa station jusqu'à ce que son sol se "
-                      "raccorde à celui des voisines ; l'échelle mesure la hauteur H (une "
-                      "tuile trop grande = H trop forte). L'orientation est mesurée, jamais "
-                      "appliquée ; Δ n'est pas visible au sol et n'est jamais modifié. Refus "
-                      "si la corrélation est trop faible ou la correction excessive (0,8 m, "
-                      "5°, H ± 0,5 m). Double-clic : la vue du sol se centre sur la station."
+                 justify='left', padx=10, wraplength=1060,
+                 text="Contrôler ne modifie rien. Chaque îlot a sa référence ★, qui doit "
+                      "être juste : l'îlot s'aligne sur elle. Recalage : translation, "
+                      "rotation et échelle de la tuile autour de sa station, sur les "
+                      "seules voisines du même îlot ; l'échelle mesure la hauteur H. "
+                      "L'orientation est mesurée, jamais appliquée ; Δ n'est pas visible "
+                      "au sol. Refus si la corrélation est trop faible ou la correction "
+                      "excessive (0,8 m, 5°, H ± 0,5 m). Clic sur un îlot : la vue du sol "
+                      "le cadre ; double-clic sur une station : elle s'y centre."
                  ).pack(fill='x', pady=(4, 2))
         fr = tk.Frame(self, bg=COLORS['bg_dark'])
         fr.pack(fill='both', expand=True, padx=10, pady=(2, 10))
         self.tree = ttk.Treeview(fr, columns=[c[0] for c in self.COLS], show='headings',
-                                 height=14)
+                                 height=12)
         for key, txt, wd in self.COLS:
             self.tree.heading(key, text=txt)
             self.tree.column(key, width=wd, anchor='w' if key in ('st', 'etat') else 'e')
@@ -9055,117 +9291,212 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
         self.tree.pack(side='left', fill='both', expand=True)
         sb.pack(side='right', fill='y')
         for tag, col in (('suspect', '#d62828'), ('hauteur', '#8e3fd6'), ('fix', '#c46a00'),
-                         ('doute', '#c46a00'),
-                         ('isole', '#777777'), ('ok', '#1e7e34'), ('ref', '#9a7400')):
+                         ('doute', '#c46a00'), ('isole', '#777777'), ('ok', '#1e7e34'),
+                         ('ref', '#9a7400')):
             self.tree.tag_configure(tag, foreground=col)
         self.tree.bind('<Double-1>', self._on_pick)
         self.protocol('WM_DELETE_WINDOW', self.close)
+        start = app.target if app.target_station() is not None else app.current
+        self._islands_changed(select=start)
+
+    # ── îlots ────────────────────────────────────────────────────────
+    def _islands_changed(self, select: Optional[int] = None) -> None:
+        if self._cancel is not None:
+            return
+        try:
+            link = clamp(float(self.link_var.get()), 1.0, 30.0)
+        except (tk.TclError, ValueError):
+            link = 4.0
+        self.app.cfg.update(island_link=link, island_by_local=bool(self.local_var.get()))
+        save_config(self.app.cfg)
+        keep = select if select is not None else (
+            self._islands[self._sel][0] if self._islands else self.app.current)
+        self._islands = self.gv.islands()
+        self._status, self._suggest = {}, {}
+        self._result = None
+        self.tree.delete(*self.tree.get_children())
+        self.apply_btn.config(state='disabled')
+        self.gv.marks = {}
+        k = next((k for k, g in enumerate(self._islands) if keep in g), 0)
+        self._fill_islands()
+        n1 = sum(1 for g in self._islands if len(g) == 1)
+        self.isl_info.config(text=f"→ {len(self._islands)} îlot(s) sur ce plancher"
+                                  + (f", dont {n1} station(s) isolée(s)" if n1 else ""))
+        self._select(k)
+
+    def _fill_islands(self) -> None:
+        self.itree.delete(*self.itree.get_children())
+        for k, g in enumerate(self._islands):
+            ref = self.gv.ref_of(g)
+            st = self._status.get(k, '')
+            tag = ('noref' if ref is None and len(g) > 1 else
+                   'bad' if st.startswith(('⚠', 'suspendu')) or 'incohérente' in st
+                   else 'ok' if st else '')
+            self.itree.insert('', 'end', iid=str(k), tags=(tag,),
+                              values=(k + 1, len(g), f"★ {self._nm(ref)}" if ref is not None
+                                      else ("— (station isolée)" if len(g) == 1
+                                            else "— à choisir"), st))
+
+    def _select(self, k: int) -> None:
+        if not self._islands:
+            return
+        self._sel = max(0, min(k, len(self._islands) - 1))
+        self.gv.sel_island = list(self._islands[self._sel])
+        try:
+            self.itree.selection_set(str(self._sel))
+            self.itree.see(str(self._sel))
+        except tk.TclError:
+            pass
         self._show_ref()
+
+    def _on_island(self, event=None) -> None:
+        sel = self.itree.selection()
+        if not sel:
+            return
+        if int(sel[0]) == self._sel:              # déjà choisi (sélection par le
+            return                                # programme) : ni recadrage ni effacement
+        self._sel = int(sel[0])
+        g = self._islands[self._sel]
+        self.gv.sel_island = list(g)
+        self.gv.fit(g)
+        self._show_ref()
+
+    def _scope(self) -> List[int]:
+        if self.scope_var.get() == 'all':
+            return list(range(len(self._islands)))
+        return [self._sel] if self._islands else []
 
     # ── référence ────────────────────────────────────────────────────
     def _set_ref(self, idx: Optional[int]) -> None:
         if idx is None or self._cancel is not None:
             return
         self.gv.set_ref(idx)
-        self._force_ref = None
+        self._force.discard(idx)
+        k = next((k for k, g in enumerate(self._islands) if idx in g), None)
+        self._fill_islands()
+        if k is not None:
+            self._select(k)
         self._show_ref()
 
+    def _set_suggested(self) -> None:
+        self._set_ref(self._suggest.get(self._sel))
+
     def _show_ref(self, state: str = '', txt: str = '') -> None:
-        ref = self.gv.ref_idx()
-        self.ref_lbl.config(text=self._nm(ref) if ref is not None else "—")
+        g = self._islands[self._sel] if self._islands else []
+        ref = self.gv.ref_of(g)
+        self.ref_lbl.config(text=(f"{self._nm(ref)}  (îlot {self._sel + 1})" if ref is not None
+                                  else f"aucune — îlot {self._sel + 1} : choisir une station"))
+        sug = self._suggest.get(self._sel)
+        self.sug_btn.config(state='normal' if sug is not None else 'disabled',
+                            text=f"= conseillée ({self._nm(sug)})" if sug is not None
+                            else "= conseillée")
         if txt:
             col = {'ok': '#5ad15a', 'suspect': '#ff4d4d'}.get(state, '#ffa31a')
             self.ref_msg.config(text=txt, fg=col)
         else:
             self.ref_msg.config(text="")
 
-    # ── paramètres, stations concernées ──────────────────────────────
+    # ── préparation ──────────────────────────────────────────────────
     def _params(self):
-        try:
-            rng = clamp(float(self.range_var.get()), 3.0, 200.0)
-        except (tk.TclError, ValueError):
-            rng = 15.0
         try:
             mcc = clamp(float(self.cc_var.get()), 0.3, 0.95)
         except (tk.TclError, ValueError):
             mcc = 0.6
-        return rng, mcc, bool(self.xy_var.get()), bool(self.h_var.get())
+        return mcc, bool(self.xy_var.get()), bool(self.h_var.get())
 
     def _prepare(self, mode: str):
-        """Référence, stations dans la portée, instantané. None si impossible."""
+        """Îlots traités, instantané. None si impossible."""
         if self._cancel is not None:              # « Arrêter »
             self._cancel.set()
             return None
         app = self.app
-        rng, mcc, use_xy, use_h = self._params()
+        mcc, use_xy, use_h = self._params()
         if mode == 'adjust' and not (use_xy or use_h):
             self.msg.config(text="Cocher la position XY et / ou la hauteur H")
             return None
-        app.cfg.update(adjust_range=rng, adjust_min_cc=mcc, adjust_xy=use_xy,
-                       adjust_h=use_h)
-        ref = self.gv.ref_idx()
-        org = app.stations[ref] if ref is not None else None
-        if org is None or not app.store.has(org.photo):
-            self.msg.config(text="Référence sans image : en choisir une autre")
+        app.cfg.update(adjust_min_cc=mcc, adjust_xy=use_xy, adjust_h=use_h)
+        todo = self._scope()
+        if not todo:
+            self.msg.config(text="Aucun îlot")
             return None
-        sts = [s for s in app.stations if s.floor == org.floor and app.store.has(s.photo)
-               and math.hypot(s.x - org.x, s.y - org.y) <= rng]
-        if len(sts) < 2:
-            self.msg.config(text="Aucune autre bulle dans la portée")
-            return None
+        jobs = []
+        for k in todo:
+            g = self._islands[k]
+            ref = self.gv.ref_of(g)
+            snap = [dc_replace(app.stations[i]) for i in g]
+            jobs.append((k, snap, ref, ref in self._force))
         self._mode = mode
-        self._origin = org.idx
         self._used = (use_xy, use_h)
-        self._base = {s.idx: (s.x, s.y, s.yaw_fix, s.dh) for s in sts}
+        self._origins = {j[2] for j in jobs if j[2] is not None}
+        self._base = {s.idx: (s.x, s.y, s.yaw_fix, s.dh) for j in jobs for s in j[1]}
         self._result = None
         self.tree.delete(*self.tree.get_children())
         self.apply_btn.config(state='disabled')
+        for k in todo:
+            self._status.pop(k, None)
         self.gv.marks = {}
         self.gv.redraw()
         self._show_ref()
         busy = self.chk_btn if mode == 'check' else self.run_btn
         busy.config(text="■ Arrêter")
-        self.prog.config(maximum=max(1, len(sts)), value=0)
+        self.prog.config(maximum=max(1, sum(len(j[1]) for j in jobs)), value=0)
         self._cancel = threading.Event()
-        return ([dc_replace(s) for s in sts], org.idx, dc_replace(app.calib),
-                float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)), mcc, use_xy, use_h)
+        return (jobs, dc_replace(app.calib),
+                float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)), mcc)
+
+    def _progress_fn(self, base: List[int], total: int):
+        """Progression cumulée sur les îlots (appelée depuis le fil de calcul)."""
+        def cb(done, _tot, rep):
+            self.app._post(self._progress, base[0] + done, total, rep)
+        return cb
 
     # ── contrôle ─────────────────────────────────────────────────────
     def run_check(self) -> None:
         prep = self._prepare('check')
         if prep is None:
             return
-        snap, org, cal, eye, mcc, _x, _y = prep
-        self.msg.config(text=f"contrôle de {len(snap)} bulle(s)…")
-        threading.Thread(target=self._work_check, args=(snap, cal, eye, mcc, self._cancel),
+        jobs, cal, eye, mcc = prep
+        self.msg.config(text=f"contrôle de {len(jobs)} îlot(s)…")
+        threading.Thread(target=self._work_check, args=(jobs, cal, eye, mcc, self._cancel),
                          daemon=True, name='bubblenav-controle').start()
 
-    def _work_check(self, snap, cal, eye, mcc, cancel) -> None:
+    def _work_check(self, jobs, cal, eye, mcc, cancel) -> None:
         gs = self.app.ground_strips
+        get = lambda s: gs.get(s.photo)
         t0 = time.perf_counter()
+        total = sum(len(j[1]) for j in jobs)
+        base = [0]
+        out = []
         try:
-            res = ground_check(snap, [s.idx for s in snap], lambda s: gs.get(s.photo), cal,
-                               eye, min_cc=mcc, progress=self._progress_cb, cancel=cancel)
-            self.app._post(self._done_check, res, cancel.is_set(), time.perf_counter() - t0)
+            for k, snap, _ref, _f in jobs:
+                if cancel.is_set():
+                    break
+                res = ground_check(snap, [s.idx for s in snap], get, cal, eye, min_cc=mcc,
+                                   progress=self._progress_fn(base, total), cancel=cancel)
+                for r in res:
+                    r['isl'] = k
+                out += res
+                base[0] += len(snap)
+            self.app._post(self._done_check, out, [j[0] for j in jobs], cancel.is_set(),
+                           time.perf_counter() - t0)
         except Exception as exc:
             msg = str(exc)
             self.app._post(self._failed, msg)
 
-    def _done_check(self, res, cancelled, dt) -> None:
+    def _done_check(self, res, isl, cancelled, dt) -> None:
         if not self._alive():
             return
         self._idle()
         self._result = res
-        app = self.app
         order = {'suspect': 0, 'hauteur': 1, 'doute': 2, 'isole': 3, 'ok': 4}
-        for r in sorted(res, key=lambda r: (order[r['state']],
+        for r in sorted(res, key=lambda r: (r['isl'], order[r['state']],
                                             -math.hypot(r['dx'], r['dy']) - abs(r['dyaw'])
                                             - abs(r['dh']))):
             etat = {'suspect': "INCOHÉRENTE : " + r['why'],
                     'hauteur': f"ÉCHELLE : H probable {self._hprob(r)}",
                     'doute': "douteuse : " + r['why'],
                     'isole': "non contrôlée : " + r['why'], 'ok': "cohérente"}[r['state']]
-            if r['idx'] == self._origin:
+            if r['idx'] in self._origins:
                 etat = "★ référence — " + etat
             self._row(r, etat, r['state'])
         marks = {}
@@ -9178,139 +9509,187 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
                 marks[r['idx']] = (r['state'], '?')
         self.gv.marks = marks
         self.gv.redraw()
-        # la référence conseillée : cohérente, le plus de voisines, le plus petit écart
-        oks = [r for r in res if r['state'] == 'ok']
-        self._suggest = (min(oks, key=lambda r: (-r['refs'], math.hypot(r['dx'], r['dy'])
-                                                 + 0.05 * abs(r['dyaw'])))['idx']
-                         if oks else None)
-        self.sug_btn.config(state='normal' if self._suggest is not None else 'disabled',
-                            text=f"= conseillée ({self._nm(self._suggest)})"
-                            if self._suggest is not None else "= conseillée")
-        self._ref_verdict(next((r for r in res if r['idx'] == self._origin), None))
-        n_sus = sum(1 for r in res if r['state'] == 'suspect')
-        n_h = sum(1 for r in res if r['state'] == 'hauteur')
-        n_dou = sum(1 for r in res if r['state'] in ('doute', 'isole'))
+        n_tot = {'suspect': 0, 'hauteur': 0, 'doute': 0, 'ok': 0}
+        for k in isl:
+            rk = [r for r in res if r['isl'] == k]
+            cnt = {s_: sum(1 for r in rk if r['state'] == s_) for s_ in order}
+            for s_ in n_tot:
+                n_tot[s_] += cnt[s_] + (cnt['isole'] if s_ == 'doute' else 0)
+            # référence conseillée de l'îlot : cohérente, le plus de voisines
+            oks = [r for r in rk if r['state'] == 'ok']
+            if oks:
+                self._suggest[k] = min(oks, key=lambda r: (-r['refs'],
+                                                           math.hypot(r['dx'], r['dy'])
+                                                           + 0.05 * abs(r['dyaw'])))['idx']
+            if len(self._islands[k]) == 1:
+                self._status[k] = "station isolée : pas de voisine pour la contrôler"
+                continue
+            parts = []
+            if cnt['suspect']:
+                parts.append(f"{cnt['suspect']} incohérente(s)")
+            if cnt['hauteur']:
+                parts.append(f"{cnt['hauteur']} d'échelle (H) douteuse")
+            if cnt['doute'] + cnt['isole']:
+                parts.append(f"{cnt['doute'] + cnt['isole']} douteuse(s)")
+            ref = self.gv.ref_of(self._islands[k])
+            rr = next((r for r in rk if r['idx'] == ref), None)
+            if rr is not None and rr['state'] in ('suspect', 'hauteur'):
+                parts.insert(0, "⚠ ★ douteuse")
+            self._status[k] = ("contrôle : " + ', '.join(parts) if parts
+                               else f"contrôle : {cnt['ok']} cohérente(s)")
+        self._fill_islands()
+        self._select(self._sel)
+        if self._sel in isl:
+            ref = self.gv.ref_of(self._islands[self._sel])
+            self._ref_verdict(next((r for r in res if r['idx'] == ref), None), ref)
         self.msg.config(text=(("interrompu · " if cancelled else "")
-                              + f"{n_sus} incohérente(s), {n_h} d'échelle (H) douteuse, "
-                                f"{n_dou} douteuse(s), {len(res) - n_sus - n_h - n_dou} "
-                                f"cohérente(s) · {dt:.1f} s · rien n'a été modifié"))
+                              + f"{len(isl)} îlot(s) : {n_tot['suspect']} incohérente(s), "
+                                f"{n_tot['hauteur']} d'échelle (H) douteuse, "
+                                f"{n_tot['doute']} douteuse(s), {n_tot['ok']} cohérente(s) · "
+                                f"{dt:.1f} s · rien n'a été modifié"))
         self.apply_btn.config(state='disabled')      # le contrôle ne modifie jamais rien
 
-    def _ref_verdict(self, r: Optional[dict]) -> None:
-        app = self.app
-        nom = self._nm(self._origin)
+    def _ref_verdict(self, r: Optional[dict], ref: Optional[int]) -> None:
+        k = self._sel + 1
+        if ref is None:
+            self._show_ref('doute', f"Îlot {k} : pas de référence ★ — en choisir une "
+                                    "(= station active, = conseillée) pour l'ajuster.")
+            return
+        nom = self._nm(ref)
         if r is None or r['state'] == 'isole':
-            self._show_ref('doute', f"★ Référence {nom} : non contrôlable (voisines "
-                                    "insuffisantes).")
+            self._show_ref('doute', f"★ Référence {nom} (îlot {k}) : non contrôlable "
+                                    "(voisines insuffisantes).")
         elif r['state'] == 'ok':
-            self._show_ref('ok', f"★ Référence {nom} : cohérente avec ses {r['refs']} "
-                                 f"voisines ({self._amount(r)}).")
+            self._show_ref('ok', f"★ Référence {nom} (îlot {k}) : cohérente avec ses "
+                                 f"{r['refs']} voisines ({self._amount(r)}).")
         elif r['state'] in ('suspect', 'hauteur'):
-            self._show_ref('suspect', f"⚠ Référence {nom} : semble fausse par rapport à ses "
-                                      f"{r['refs']} voisines ({self._amount(r)}). Choisir "
-                                      "une autre référence, ou la corriger d'abord.")
+            self._show_ref('suspect', f"⚠ Référence {nom} (îlot {k}) : semble fausse par "
+                                      f"rapport à ses {r['refs']} voisines "
+                                      f"({self._amount(r)}). Choisir une autre référence, "
+                                      "ou la corriger d'abord.")
         else:
-            self._show_ref('doute', f"★ Référence {nom} : douteuse ({r['why']}).")
+            self._show_ref('doute', f"★ Référence {nom} (îlot {k}) : douteuse ({r['why']}).")
 
     # ── ajustement de proche en proche ───────────────────────────────
     def run_adjust(self) -> None:
         prep = self._prepare('adjust')
         if prep is None:
             return
-        snap, org, cal, eye, mcc, use_xy, use_h = prep
-        self.msg.config(text=f"contrôle de la référence {self._nm(org)}…")
-        force = self._force_ref == org
-        threading.Thread(target=self._work_adjust,
-                         args=(snap, org, cal, eye, mcc, use_xy, use_h, force,
-                               self._cancel),
+        jobs, cal, eye, mcc = prep
+        self.msg.config(text=f"ajustement de {len(jobs)} îlot(s)…")
+        threading.Thread(target=self._work_adjust, args=(jobs, cal, eye, mcc, self._cancel),
                          daemon=True, name='bubblenav-ajust').start()
 
-    def _work_adjust(self, snap, org, cal, eye, mcc, use_xy, use_h, force, cancel) -> None:
+    def _work_adjust(self, jobs, cal, eye, mcc, cancel) -> None:
         gs = self.app.ground_strips
         get = lambda s: gs.get(s.photo)
         t0 = time.perf_counter()
+        total = sum(len(j[1]) for j in jobs)
+        base = [0]
+        out, status, verdicts = [], {}, {}
         try:
-            # 1. la référence elle-même : une référence fausse fausserait tout
-            o = next(s for s in snap if s.idx == org)
-            near = [s for s in snap if math.hypot(s.x - o.x, s.y - o.y) <= 6.0]
-            # (tout le relevé en contexte : les voisines fausses sont écartées)
-            chk = ground_check(snap, [org] + [s.idx for s in near if s.idx != org], get,
-                               cal, eye, min_cc=mcc, cancel=cancel)
-            rref = next((r for r in chk if r['idx'] == org), None)
-            self.app._post(self._ref_verdict, rref)
-            if rref is not None and rref['state'] in ('suspect', 'hauteur') and not force:
-                self.app._post(self._ref_refused, chk)
-                return
-            # 2. de proche en proche
-            # orientation et échelle toujours libres (mesurées) : XY n'est juste
-            # qu'à ce prix ; seul ce qui est coché sera appliqué
-            res = ground_adjust(snap, org, [s.idx for s in snap if s.idx != org], get, cal,
-                                eye, use_xy=True, use_yaw=True, use_scale=True, min_cc=mcc,
-                                max_shift=self.MAX_SHIFT, max_yaw=self.MAX_YAW,
-                                progress=self._progress_cb, cancel=cancel)
-            self.app._post(self._done_adjust, res, cancel.is_set(), time.perf_counter() - t0)
+            for k, snap, org, force in jobs:
+                if cancel.is_set():
+                    break
+                if len(snap) < 2:
+                    status[k] = "station isolée : rien à ajuster"
+                elif org is None:
+                    status[k] = "ignoré : pas de référence ★"
+                else:
+                    # 1. la référence de l'îlot : fausse, elle fausserait tout l'îlot
+                    o = next(s for s in snap if s.idx == org)
+                    near = [s.idx for s in snap if s.idx != org
+                            and math.hypot(s.x - o.x, s.y - o.y) <= 6.0]
+                    chk = ground_check(snap, [org] + near, get, cal, eye, min_cc=mcc,
+                                       cancel=cancel)
+                    rref = next((r for r in chk if r['idx'] == org), None)
+                    verdicts[k] = rref
+                    if rref is not None and rref['state'] in ('suspect', 'hauteur') \
+                            and not force:
+                        status[k] = "suspendu : ★ référence douteuse (« Ajuster » à " \
+                                    "nouveau pour l'utiliser quand même)"
+                        self.app._post(self._force.add, org)
+                    else:
+                        # 2. de proche en proche, sur les seules stations de l'îlot
+                        res = ground_adjust(snap, org, [s.idx for s in snap if s.idx != org],
+                                            get, cal, eye, use_xy=True, use_yaw=True,
+                                            use_scale=True, min_cc=mcc,
+                                            max_shift=self.MAX_SHIFT, max_yaw=self.MAX_YAW,
+                                            progress=self._progress_fn(base, total),
+                                            cancel=cancel)
+                        for r in res:
+                            r['isl'] = k
+                        out += res
+                base[0] += len(snap)
+            self.app._post(self._done_adjust, out, [j[0] for j in jobs], status, verdicts,
+                           cancel.is_set(), time.perf_counter() - t0)
         except Exception as exc:
             msg = str(exc)
             self.app._post(self._failed, msg)
 
-    def _ref_refused(self, chk) -> None:
-        if not self._alive():
-            return
-        self._idle()
-        self._force_ref = self._origin
-        self.gv.marks = {r['idx']: (r['state'], self._amount(r)) for r in chk
-                         if r['state'] in ('suspect', 'hauteur')}
-        self.gv.redraw()
-        self.msg.config(text="Ajustement suspendu : la référence semble fausse. "
-                             "« Ajuster » à nouveau pour l'utiliser quand même.")
-
-    def _done_adjust(self, res, cancelled, dt) -> None:
+    def _done_adjust(self, res, isl, status, verdicts, cancelled, dt) -> None:
         if not self._alive():
             return
         self._idle()
         self._result = res
-        app = self.app
-        self.tree.insert('', 'end', values=(f"★ {self._nm(self._origin)}", '—', '—', '—',
-                                            '—', '—', '—', '—', '—', 'référence (fixe)'),
-                         tags=('ref',))
         marks = {}
         n_fix = n_non = 0
-        for r in sorted(res, key=lambda r: (not r['ok'], -math.hypot(r['dx'], r['dy'])
-                                            - abs(r['dh']))):
-            parts = self._parts(r)
-            if not r['ok']:
-                etat, tag = 'refusée : ' + r['why'], 'suspect'
-                marks[r['idx']] = ('doute', '?')
-                n_non += 1
-            elif parts:
-                etat, tag = 'à corriger : ' + ', '.join(parts), 'fix'
-                marks[r['idx']] = ('fix', self._amount(r))
-                n_fix += 1
-            else:
-                etat, tag = 'en place (inchangée)', 'ok'
-            if r['ok'] and abs(r['dyaw']) >= CHECK_FLAG_YAW:
-                etat += f" · orientation {r['dyaw']:+.2f}° non appliquée"
-            if r['ok'] and not self._used[1] and abs(r['dh']) >= CHECK_FLAG_H:
-                etat += f" · H probable {self._hprob(r)}"
-            self._row(r, etat, tag)
+        for k in isl:
+            ref = self.gv.ref_of(self._islands[k])
+            rk = [r for r in res if r['isl'] == k]
+            if ref is not None and (rk or k not in status):
+                self.tree.insert('', 'end', values=(k + 1, f"★ {self._nm(ref)}", '—', '—',
+                                                    '—', '—', '—', '—', '—', '—',
+                                                    'référence (fixe)'), tags=('ref',))
+            nk_fix = nk_non = 0
+            for r in sorted(rk, key=lambda r: (not r['ok'], -math.hypot(r['dx'], r['dy'])
+                                               - abs(r['dh']))):
+                parts = self._parts(r)
+                if not r['ok']:
+                    etat, tag = 'refusée : ' + r['why'], 'suspect'
+                    marks[r['idx']] = ('doute', '?')
+                    nk_non += 1
+                elif parts:
+                    etat, tag = 'à corriger : ' + ', '.join(parts), 'fix'
+                    marks[r['idx']] = ('fix', self._amount(r))
+                    nk_fix += 1
+                else:
+                    etat, tag = 'en place (inchangée)', 'ok'
+                if r['ok'] and abs(r['dyaw']) >= CHECK_FLAG_YAW:
+                    etat += f" · orientation {r['dyaw']:+.2f}° non appliquée"
+                if r['ok'] and not self._used[1] and abs(r['dh']) >= CHECK_FLAG_H:
+                    etat += f" · H probable {self._hprob(r)}"
+                self._row(r, etat, tag)
+            n_fix += nk_fix
+            n_non += nk_non
+            if k not in status:
+                status[k] = (f"ajustement : {nk_fix} à corriger, "
+                             f"{len(rk) - nk_fix - nk_non} en place"
+                             + (f", {nk_non} refusée(s)" if nk_non else ""))
+            self._status[k] = status[k]
+        for k, r in verdicts.items():             # une ★ douteuse : repérée sur la vue
+            if r is not None and r['state'] in ('suspect', 'hauteur'):
+                marks[r['idx']] = (r['state'], self._amount(r))
         self.gv.marks = marks
         self.gv.redraw()
+        self._fill_islands()
+        self._select(self._sel)
+        if self._sel in verdicts:
+            self._ref_verdict(verdicts[self._sel], self.gv.ref_of(self._islands[self._sel]))
+        skipped = sum(1 for k in isl if status.get(k, '').startswith(('ignoré', 'suspendu')))
         ok = [r for r in res if r['ok']]
         dmax = max((math.hypot(r['dx'], r['dy']) for r in ok), default=0.0)
-        amax = max((abs(r['dyaw']) for r in ok), default=0.0)
         self.msg.config(text=(("interrompu · " if cancelled else "")
-                              + f"{n_fix} à corriger, {len(res) - n_fix - n_non} en place, "
-                                f"{n_non} refusée(s) · max {dmax * 100:.1f} cm, "
-                                f"{amax:.2f}° · {dt:.1f} s"))
+                              + f"{len(isl)} îlot(s) : {n_fix} à corriger, {n_non} "
+                                f"refusée(s)" + (f", {skipped} îlot(s) non ajusté(s)"
+                                                 if skipped else "")
+                              + f" · max {dmax * 100:.1f} cm · {dt:.1f} s"))
         self.apply_btn.config(state='normal' if self._appliable() else 'disabled')
 
     # ── commun ───────────────────────────────────────────────────────
-    def _progress_cb(self, done, total, rep) -> None:
-        self.app._post(self._progress, done, total, rep)
-
     def _progress(self, done, total, rep) -> None:
         try:
-            self.prog.config(maximum=max(1, total), value=done)
+            self.prog.config(maximum=max(1, total), value=min(done, total))
             self.msg.config(text=f"{done} / {total} · {self._nm(rep['idx'])}")
         except Exception:
             pass
@@ -9324,7 +9703,7 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
 
     def _idle(self) -> None:
         self.chk_btn.config(text="🔍 Contrôler")
-        self.run_btn.config(text="▶ Ajuster depuis la référence")
+        self.run_btn.config(text="▶ Ajuster")
 
     def _failed(self, msg: str) -> None:
         if self._alive():
@@ -9361,11 +9740,11 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
 
     def _row(self, r: dict, etat: str, tag: str) -> None:
         d = math.hypot(r['dx'], r['dy'])
-        nom = ('★ ' if r['idx'] == self._origin else '') + self._nm(r['idx'])
+        nom = ('★ ' if r['idx'] in self._origins else '') + self._nm(r['idx'])
         self.tree.insert('', 'end', iid=str(r['idx']),
-                         values=(nom, f"{r['dx'] * 100:+.1f}", f"{r['dy'] * 100:+.1f}",
-                                 f"{d * 100:.1f}", f"{r['dyaw']:+.2f}",
-                                 f"{r.get('dh', 0.0) * 100:+.1f}",
+                         values=(r.get('isl', 0) + 1, nom, f"{r['dx'] * 100:+.1f}",
+                                 f"{r['dy'] * 100:+.1f}", f"{d * 100:.1f}",
+                                 f"{r['dyaw']:+.2f}", f"{r.get('dh', 0.0) * 100:+.1f}",
                                  f"×{r.get('scale', 1.0):.3f}", f"{r['cc']:.2f}",
                                  r['refs'], etat), tags=(tag,))
 
@@ -9380,10 +9759,10 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
 
     def _todo(self) -> List[dict]:
         """Corrections à appliquer : après un ajustement seulement, les bulles
-        acceptées (jamais la référence). Le contrôle ne modifie rien."""
+        acceptées (jamais une référence). Le contrôle ne modifie rien."""
         if not self._result or self._mode != 'adjust':
             return []                             # le contrôle ne modifie jamais rien
-        return [r for r in self._result if r['ok'] and r['idx'] != self._origin]
+        return [r for r in self._result if r['ok'] and r['idx'] not in self._origins]
 
     def _appliable(self) -> bool:
         return any(self._parts(r) for r in self._todo())
@@ -9442,6 +9821,7 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
             self.gv.adjust_dlg = None
         try:
             self.gv.marks = {}
+            self.gv.sel_island = []
             self.gv.redraw()
         except Exception:
             pass
@@ -10270,7 +10650,8 @@ def selftest(csv_path: str = '') -> int:
         img_[dist_ < 0.45] = (225, 120, 150)            # trépied au nadir
         gstrips[s_.idx] = (np.ascontiguousarray(img_), row0, heq)
     gw, gh, gpx = 300, 200, 30.0
-    out_, own_ = ground_mosaic(gst, gstrips, gcal, 2.5, 0.15, gw, gh, gpx, 1.65, seams=False)
+    out_, own_ = ground_mosaic(gst, gstrips, gcal, 2.5, 0.15, gw, gh, gpx, 1.65, seams=False,
+                               nadir_fill=True)
     gx_, gy_ = np.meshgrid(2.5 + (np.arange(gw) - gw / 2 + 0.5) / gpx,
                            0.15 - (np.arange(gh) - gh / 2 + 0.5) / gpx)
     e_ = np.abs(out_.astype(int) - world(gx_, gy_).astype(int)).mean(axis=2)[own_ >= 0].mean()
@@ -10285,6 +10666,12 @@ def selftest(csv_path: str = '') -> int:
           and abs(r_['dyaw'] + 1.5) < 0.2,
           (f"({r_['dx']:+.3f}, {r_['dy']:+.3f}) m, {r_['dyaw']:+.2f}°, cc {r_['cc']:.2f}, "
            f"{dt_:.0f} ms") if r_ else "échec")
+    ci_, cj_ = int(gw / 2 + (gst[1].x - 2.5) * gpx), int(gh / 2 - (gst[1].y - 0.15) * gpx)
+    grey = ground_mosaic(gst, gstrips, gcal, 2.5, 0.15, gw, gh, gpx, 1.65)[0][cj_, ci_]
+    check("par défaut, centre des stations grisé (le trépied n'est pas du sol vu)",
+          tuple(int(v) for v in grey) == (46, 46, 52), str(tuple(int(v) for v in grey)))
+    check("îlots de proche en proche (liaison 3 m : 1 îlot ; 2 m : 3 îlots)",
+          len(ground_islands(gst, 3.0)) == 1 and len(ground_islands(gst, 2.0)) == 3)
     hwrong = dc_replace(gst[1], dh=0.15)          # hauteur d'instrument fausse de +15 cm
     r_ = ground_register(hwrong, [gst[0], gst[2]], gstrips, gcal, 1.65, use_scale=True)
     check("facteur d'échelle : hauteur fausse de +15 cm retrouvée, position juste",
