@@ -185,13 +185,63 @@ Les gestes sont les mêmes que dans les bulles, sur la tuile survolée :
 | Clic droit glissé | déplacer la vue |
 | Clic | aller sur la station |
 
-Les tuiles se recalculent en direct.
+### Couture
 
-Vérifié sur des panoramas de synthèse d'un même sol en damier :
-* le pavage reconstitue le damier, avec un écart de 4,6/255 ;
+* **Sans trépied** : le sol juste sous une bulle (0,6 m : trépied, opérateur)
+  est pris dans une bulle voisine qui le voit ; il ne reste que là où aucune
+  autre bulle ne le voit.
+* **Coutures** : un trait fin suit exactement la limite entre deux tuiles (la
+  médiatrice des deux stations) : une cassure du sol sur ce trait signale
+  l'erreur.
+* **Fondu** : 20 cm de part et d'autre de la couture, les deux bulles sont
+  mélangées ; un décalage y apparaît **en double**.
+* Une tuile ne s'étend jamais au-delà de ce que sa bulle voit du sol (station
+  posée bas : portée réduite).
+
+### Réactivité
+
+Le sol de chaque bulle est gardé en mémoire (bande réduite à 2048 px), sans
+chasser les bulles du cache de la visite. Après une correction (molette,
+Espace + glisser), **seule la zone de la tuile touchée** est recalculée
+(≈ 60 ms) : la tuile suit le geste. Déplacement et zoom montrent aussitôt
+l'image existante, recadrée ; le calcul complet suit en arrière-plan
+(≈ 0,2 s). À la première ouverture, le pavage apparaît au fur et à mesure du
+chargement.
+
+### Ajuster de proche en proche
+
+Bouton **« ⇄ Ajuster de proche en proche… »** de la vue du sol :
+
+1. choisir la **référence** : le point de vue A ou la station active ; elle ne
+   bouge pas, choisir une station sûre ;
+2. choisir la **portée** (m), ce qui est corrigé (**position XY**,
+   **orientation de l'image**) et la **corrélation mini** ;
+3. **Calculer** : la bulle la plus proche des stations déjà ajustées est
+   recalée sur le sol vu par ses voisines, puis sert à son tour de référence ;
+   deux passes d'affinage répartissent ensuite l'erreur de tous côtés au lieu
+   de la laisser s'accumuler le long de la chaîne ;
+4. le **tableau** montre, pour chaque bulle, ΔX, ΔY, l'orientation, la
+   corrélation et l'état (ajustée, en place, refusée et pourquoi) ;
+   double-clic : la vue du sol se centre dessus ;
+5. **Appliquer** : les corrections passent dans le CSV de sortie (XY) et dans
+   l'orientation des images ; **un seul Ctrl+Z annule tout**.
+
+Garde-fous : rien ne change avant « Appliquer » ; une bulle est refusée si la
+corrélation est faible ou la correction excessive (plus de 0,8 m ou 5°) ;
+sous 5 mm et 0,05°, elle est jugée en place et n'est pas retouchée ; Δ et H ne
+sont jamais modifiés ; les bornes habituelles (5 m du CSV) s'appliquent.
+
+### Vérifications
+
+Sur des panoramas de synthèse d'un même sol :
+* le pavage reconstitue le sol, avec un écart de 1,6/255, trépieds effacés ;
 * une erreur de 3° d'orientation, de 30 cm de position ou de 25 cm de hauteur
   casse nettement les raccords ;
-* une image réellement tournée de 4° se raccorde avec une correction de +4°.
+* une image réellement tournée de 4° se raccorde avec une correction de +4° ;
+* recalage d'une bulle faussée de (+18, −12) cm ou de 2° : retrouvé au
+  millimètre et au centième de degré ;
+* de proche en proche sur 29 bulles faussées jusqu'à 27 cm et 2,3° : erreur
+  résiduelle 4 mm et 0,06° ; les stations justes ne bougent pas.
 
 La **vue B** peut aussi se détacher dans sa propre fenêtre (bouton ⧉ de son
 en-tête), par exemple sur un second écran.

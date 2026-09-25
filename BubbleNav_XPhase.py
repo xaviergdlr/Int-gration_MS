@@ -2337,8 +2337,9 @@ class PanoRenderer:
                 return rays
         f = lens_focal(fov, w)
         d = lens_mix(fov)
-        xs = np.linspace(-w / 2.0, w / 2.0, w, dtype=np.float32)
-        ys = np.linspace(-h / 2.0, h / 2.0, h, dtype=np.float32)
+        # pixel écran j = [j, j+1[ sur le canevas : son rayon passe par son centre
+        xs = np.arange(w, dtype=np.float32) - np.float32(w / 2.0 - 0.5)
+        ys = np.arange(h, dtype=np.float32) - np.float32(h / 2.0 - 0.5)
         gx, gy = np.meshgrid(xs, ys)
         rays = np.empty((3, w * h), dtype=np.float32)
         if d == 0.0:
@@ -2403,11 +2404,13 @@ class PanoRenderer:
         mx = np.arctan2(world[1], world[0])
         mx += math.pi
         mx *= (sw / (2.0 * math.pi))
+        mx -= 0.5                       # centre du pixel i en i + 0,5 ; cv2 l'attend en i
         mz = np.clip(world[2], -1.0, 1.0)
         my = np.arcsin(mz)
         my *= (-1.0 / math.pi)
         my += 0.5
         my *= sh
+        my -= 0.5
         maps = (mx.reshape(view.height, view.width),
                 my.reshape(view.height, view.width))
         with self._lock:
@@ -2751,9 +2754,20 @@ VUE DU SOL  (touche N, bouton « Sol ») — fenêtre séparée
   du sol vient de la bulle la plus proche). Le sol doit se raccorder d'une
   tuile à l'autre : un décalage = position fausse, un pivotement = orientation
   fausse, un changement d'échelle = hauteur instrument fausse.
+  Couture : le trépied et l'opérateur (0,6 m sous chaque bulle) sont pris dans
+  une bulle voisine ; trait fin exactement sur la limite entre deux tuiles et
+  fondu de 20 cm (un décalage s'y voit en double). Cases Coutures / Fondu /
+  Sans trépied.
   Survol d'une tuile : sa station devient active ; Alt / Maj + molette : Δ / H ;
   Espace + glisser : XY ; Ctrl + molette : orientation de son image ; molette :
-  zoom ; clic droit glissé : déplacer ; clic : y aller.
+  zoom ; clic droit glissé : déplacer ; clic : y aller. Seule la zone touchée
+  est recalculée : la tuile suit le geste.
+  « ⇄ Ajuster de proche en proche… » : depuis une station de référence (A ou la
+  station active, qui ne bouge pas), chaque bulle est recalée en XY et / ou en
+  orientation sur le sol de ses voisines déjà ajustées, la plus proche d'abord,
+  puis affinée de tous côtés. Tableau des corrections avant application ;
+  refus si corrélation faible ou correction > 0,8 m / 5° ; « Appliquer » :
+  Ctrl+Z annule tout d'un coup. Δ et H ne sont jamais modifiés.
 
 AFFICHAGE
   Liste « Voir » ............. Local, Locaux voisins, De proche en proche (défaut),
@@ -2839,6 +2853,7 @@ class BubbleNavApp(_TkBase):
         self.history: List[int] = []
         # Journal commun des opérations annulables par Ctrl+Z, de la plus
         # ancienne à la plus récente : ('edit',) une correction ;
+        # ('edit_batch', n) n corrections d'un coup (ajustement automatique) ;
         # ('nav', idx, yaw, pitch, fov) un passage d'une bulle à l'autre dans A ;
         # ('nav_b', idx, yaw, pitch, fov) la même chose dans la vue B.
         self.journal: List[tuple] = []
@@ -2857,6 +2872,7 @@ class BubbleNavApp(_TkBase):
         )
         self.store = ImageStore(int(cfg.get('src_width', SRC_WIDTH_DEFAULT)),
                                 int(cfg.get('cache_size', IMG_CACHE_DEFAULT)))
+        self.ground_strips = GroundStrips(self.store)   # sol des bulles (vue du sol)
         self.renderer = PanoRenderer()
         set_wide_mode(str(cfg.get('wide_mode', 'pannini')))
 
@@ -4305,7 +4321,8 @@ class BubbleNavApp(_TkBase):
         self._mk_button(bar, "Sol  (N)", self.toggle_ground,
                         tip="Vue du sol : chaque bulle projetée à la verticale sur son sol, en "
                             "pavage ; les raccords entre tuiles vérifient position, "
-                            "orientation et hauteur. Fenêtre séparée.").pack(side='left', padx=3,
+                            "orientation et hauteur. Ajustement automatique de proche en "
+                            "proche depuis une station de référence. Fenêtre séparée.").pack(side='left', padx=3,
                                                                              pady=4)
         self.edit_lbl = tk.Label(bar, text="", bg=COLORS['bg_medium'],
                                  fg=COLORS['edit'], font=F_UI_B)
@@ -4649,6 +4666,7 @@ class BubbleNavApp(_TkBase):
 
     def _images_indexed(self, paths: Dict[str, str]) -> None:
         self.store.set_paths(paths)
+        self.ground_strips.clear()
         alias = self.store.bind_stations(self.stations)   # num scan / nom projeté
         found = sum(1 for s in self.stations if self.store.has(s.photo))
         total = len(self.stations)
@@ -4775,6 +4793,19 @@ class BubbleNavApp(_TkBase):
                     continue
                 self._after_edit(moved=True, turned=True)
                 self._set_status(f"Annulé : correction sur {st.locator}", COLORS['edit'])
+                return
+            if kind == 'edit_batch':              # ajustement de proche en proche
+                done = [self.corrections.undo(self.by_photo) for _ in range(entry[1])]
+                done = [st for st in done if st is not None]
+                if not done:
+                    continue
+                n = len(done)
+                for st in done:
+                    self._refresh_links_of(st.idx)
+                self._after_edit(moved=True, turned=True)
+                if self.compare is not None:
+                    self.compare.request_render(force=True)
+                self._set_status(f"Annulé : ajustement de {n} bulle(s)", COLORS['edit'])
                 return
             _, idx, yaw, pitch, fov = entry
             if not (0 <= idx < len(self.stations)):
@@ -7730,17 +7761,97 @@ class CompareView(tk.Frame if _TK_OK else object):
 # VUE DU SOL : projection nadir des bulles, en pavage
 # ─────────────────────────────────────────────────────────────────────────────
 
-GROUND_TILE_R = 4.0            # m : rayon maximal d'une tuile autour de sa station
+GROUND_TILE_R = 3.5            # m : portée maximale d'une tuile autour de sa station
+GROUND_NADIR_R = 0.6           # m : nadir (trépied, opérateur) exclu si une autre bulle voit
+GROUND_BAND = 0.20             # m : largeur du fondu de couture
 GROUND_PX_M = 60.0             # px par mètre à l'ouverture
+GROUND_STRIP_W = 2048          # px : largeur des bandes de sol gardées en mémoire
+GROUND_EL_MAX = -12.0          # deg : on ne garde que le sol (sous -12°)
+_BIG = 1.0e6
+ADJUST_TOL_XY = 0.005          # m : correction automatique plus petite = station en place
+ADJUST_TOL_YAW = 0.05          # deg : idem pour l'orientation
 
 
-def ground_sample_maps(st: Station, xs, ys, calib: Calib, width: int, height: int,
-                       eye: float = EYE_HEIGHT_DEFAULT):
-    """Pixels du panorama de `st` qui voient les points du sol (xs, ys) (tableaux
-    numpy, en m) : projection nadir sur le sol local de la station (caméra à H
-    au-dessus). Même convention que le rendu : cap image 0 = centre, correction
-    d'orientation comprise. Retourne (u, v) en float32."""
+class GroundStrips:
+    """Bandes de sol des panoramas, réduites (2048 px, sous -12°), gardées en
+    mémoire indépendamment du cache des bulles : la vue du sol en montre des
+    dizaines, qu'il serait trop lent de redécoder à chaque geste. Thread-safe."""
+
+    def __init__(self, store: "ImageStore", limit: int = 96):
+        self.store = store
+        self.limit = limit
+        self._c: "OrderedDict[str, tuple]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def peek(self, photo: str):
+        with self._lock:
+            hit = self._c.get(photo)
+            if hit is not None:
+                self._c.move_to_end(photo)
+            return hit
+
+    def get(self, photo: str):
+        """(bande RGB, première ligne, hauteur équirectangulaire) ou None."""
+        import numpy as np
+        hit = self.peek(photo)
+        if hit is not None:
+            return hit
+        img = self.store.peek(photo)              # bulle déjà décodée : on s'en sert
+        if img is None:
+            img = self._decode(photo)             # sinon décodage réduit, sans
+        if img is None:                           # chasser les bulles du cache
+            return None
+        import cv2
+        w = min(GROUND_STRIP_W, img.shape[1])
+        h = w // 2
+        small = img if img.shape[1] == w else cv2.resize(img, (w, h),
+                                                          interpolation=cv2.INTER_AREA)
+        row0 = int((0.5 - GROUND_EL_MAX / 180.0) * h)
+        entry = (np.ascontiguousarray(small[row0:]), row0, h)
+        with self._lock:
+            self._c[photo] = entry
+            while len(self._c) > self.limit:
+                self._c.popitem(last=False)
+        return entry
+
+    def _decode(self, photo: str):
+        """JPEG réduit à la volée (draft : sous-échantillonnage DCT, très rapide)."""
+        import numpy as np
+        from PIL import Image
+        path = self.store.path_of(photo)
+        if not path:
+            return None
+        try:
+            Image.MAX_IMAGE_PIXELS = None
+            with Image.open(path) as im:
+                try:
+                    im.draft('RGB', (GROUND_STRIP_W, GROUND_STRIP_W // 2))
+                except Exception:
+                    pass
+                return np.asarray(im.convert('RGB'))
+        except Exception:
+            return None
+
+    def clear(self) -> None:
+        with self._lock:
+            self._c.clear()
+
+
+def ground_reach(st: Station, eye: float, r: float) -> float:
+    """Portée utile (m) de la tuile de `st` : au plus `r`, et jamais au-delà de
+    ce que montre la bande de sol gardée (sous GROUND_EL_MAX) — une bulle posée
+    bas (H = 0,40 m) ne voit le sol sous -12° que jusqu'à 1,9 m."""
+    return min(r, 0.97 * st.height(eye) / math.tan(math.radians(-GROUND_EL_MAX)))
+
+
+def ground_uv(st: Station, xs, ys, calib: Calib, strip, eye: float = EYE_HEIGHT_DEFAULT):
+    """Pixels de la bande de sol de `st` qui voient les points du sol (xs, ys)
+    (m, tableaux numpy) : projection à la verticale sur le sol local de la
+    station, caméra H au-dessus. Même convention que le rendu, correction
+    d'orientation comprise."""
     import numpy as np
+    arr, row0, heq = strip
+    width = arr.shape[1]
     dx = xs - st.x
     dy = ys - st.y
     dist = np.hypot(dx, dy)
@@ -7752,60 +7863,310 @@ def ground_sample_maps(st: Station, xs, ys, calib: Calib, width: int, height: in
     else:
         psi = calib.sense * az + (p - 0.5) * 360.0 + calib.offset
     psi = psi - st.yaw_fix                     # l'image est tournée de Δ nord
-    u = (np.mod(psi + 180.0, 360.0) / 360.0 * width).astype(np.float32)
-    v = ((0.5 - el / 180.0) * height).astype(np.float32)
+    # centre du pixel i en i + 0,5 (équirectangulaire) ; cv2.remap l'attend en i
+    u = (np.mod(psi + 180.0, 360.0) / 360.0 * width - 0.5).astype(np.float32)
+    v = ((0.5 - el / 180.0) * heq - row0 - 0.5)
+    v = np.clip(v, 0.0, arr.shape[0] - 1.0).astype(np.float32)   # jamais de bouclage vertical
     return u, v
 
 
-def ground_mosaic(stations: Sequence[Station], images: Dict[int, object], calib: Calib,
-                  cx: float, cy: float, w: int, h: int, px_m: float,
-                  eye: float = EYE_HEIGHT_DEFAULT, tile_r: float = GROUND_TILE_R,
-                  seams: bool = True):
-    """Pavage du sol : chaque pixel (vue de dessus, nord en haut) est pris dans la
-    bulle la plus proche (cellules de Voronoï), projetée à la verticale sur son
-    sol. Là où deux tuiles se touchent, le sol doit se raccorder : un décalage
-    trahit une erreur de position, un pivotement une erreur d'orientation, un
-    changement d'échelle une erreur de hauteur instrument.
-    Retourne (image RGB uint8, propriétaire par pixel : indice de station ou -1)."""
+def _sample(src, u, v):
+    """cv2.remap sur une liste de points, découpée (moins de 32767 lignes)."""
     import numpy as np
     import cv2
-    xs = cx + (np.arange(w, dtype=np.float32) - w / 2.0 + 0.5) / px_m
-    ys = cy - (np.arange(h, dtype=np.float32) - h / 2.0 + 0.5) / px_m
+    n = u.size
+    cols = 1024
+    rows = max(1, -(-n // cols))
+    mu = np.zeros(rows * cols, dtype=np.float32)
+    mv = np.zeros(rows * cols, dtype=np.float32)
+    mu[:n] = u
+    mv[:n] = v
+    px = cv2.remap(src, mu.reshape(rows, cols), mv.reshape(rows, cols), cv2.INTER_LINEAR,
+                   borderMode=cv2.BORDER_WRAP)
+    return px.reshape(-1, src.shape[2] if src.ndim == 3 else 1)[:n]
+
+
+def ground_mosaic(stations: Sequence[Station], strips: Dict[int, tuple], calib: Calib,
+                  cx: float, cy: float, w: int, h: int, px_m: float,
+                  eye: float = EYE_HEIGHT_DEFAULT, win: Optional[Tuple[int, int, int, int]] = None,
+                  tile_r: float = GROUND_TILE_R, nadir_r: float = GROUND_NADIR_R,
+                  band: float = GROUND_BAND, seams: bool = True):
+    """Pavage du sol, vu de dessus (nord en haut), cadre w × h centré sur (cx, cy).
+
+    Chaque point du sol est pris dans la bulle la plus proche qui le voit HORS
+    de son nadir (trépied, opérateur : rayon `nadir_r`) — le nadir ne sert qu'à
+    défaut d'autre bulle. Entre deux bulles, la couture est fondue sur `band` m :
+    un défaut d'alignement s'y voit en double, et le trait fin de la couture
+    (option `seams`) suit exactement la médiatrice.
+    `win` (i0, j0, i1, j1) : ne calcule que ce rectangle du cadre (mise à jour
+    partielle après un geste). Retourne (image RGB uint8, bulle propriétaire).
+    """
+    import numpy as np
+    i0, j0, i1, j1 = win if win is not None else (0, 0, w, h)
+    ww, hh = i1 - i0, j1 - j0
+    xs = cx + (np.arange(i0, i1, dtype=np.float32) - w / 2.0 + 0.5) / px_m
+    ys = cy - (np.arange(j0, j1, dtype=np.float32) - h / 2.0 + 0.5) / px_m
+    d1 = np.full((hh, ww), np.inf, dtype=np.float32)
+    d2 = np.full((hh, ww), np.inf, dtype=np.float32)
+    o1 = np.full((hh, ww), -1, dtype=np.int32)        # rang dans `use` (pas l'indice)
+    o2 = np.full((hh, ww), -1, dtype=np.int32)
+    use: List[Tuple[Station, Tuple[int, int, int, int]]] = []
+    nad2 = nadir_r * nadir_r
+    for st in stations:
+        if st.idx not in strips:
+            continue
+        reach = ground_reach(st, eye, tile_r)
+        r_px = reach * px_m
+        ci = (st.x - cx) * px_m + w / 2.0 - i0
+        cj = (cy - st.y) * px_m + h / 2.0 - j0
+        a0, a1 = max(0, int(ci - r_px) - 1), min(ww, int(ci + r_px) + 2)
+        b0, b1 = max(0, int(cj - r_px) - 1), min(hh, int(cj + r_px) + 2)
+        if a0 >= a1 or b0 >= b1:
+            continue
+        k = len(use)
+        use.append((st, (a0, b0, a1, b1)))
+        ddx = (xs[a0:a1] - np.float32(st.x)) ** 2
+        ddy = (ys[b0:b1] - np.float32(st.y)) ** 2
+        d = ddy[:, None] + ddx[None, :]
+        d[d < nad2] += _BIG
+        d[d > reach * reach] = np.inf
+        D1, D2 = d1[b0:b1, a0:a1], d2[b0:b1, a0:a1]
+        O1, O2 = o1[b0:b1, a0:a1], o2[b0:b1, a0:a1]
+        first = d < D1
+        # deux plus proches, sans indexation booléenne (bien plus rapide)
+        o2[b0:b1, a0:a1] = np.where(first, O1, np.where(d < D2, np.int32(k), O2))
+        d2[b0:b1, a0:a1] = np.where(first, D1, np.minimum(D2, d))
+        o1[b0:b1, a0:a1] = np.where(first, np.int32(k), O1)
+        d1[b0:b1, a0:a1] = np.minimum(D1, d)
+    idx_of = np.array([st.idx for st, _ in use] + [-1], dtype=np.int32)
+    out = np.full((hh, ww, 3), 24, dtype=np.float32)
+    if not use:
+        return out.astype(np.uint8), np.full((hh, ww), -1, dtype=np.int32)
+    SX = np.array([st.x for st, _ in use] + [0.0], dtype=np.float32)
+    SY = np.array([st.y for st, _ in use] + [0.0], dtype=np.float32)
+    # distance signée à la médiatrice (m) : où fondre, où tracer la couture
+    pair = (o2 >= 0) & (d2 < _BIG * 0.5) & (d1 < _BIG * 0.5)
+    sep = np.hypot(SX[o1] - SX[o2], SY[o1] - SY[o2])
+    with np.errstate(invalid='ignore', divide='ignore'):
+        s = np.where(pair, (d2 - d1) / np.maximum(2.0 * sep, 1e-6), np.inf)
+    blend = pair & (s < band / 2.0)
+    c2 = np.zeros((hh, ww, 3), dtype=np.float32) if band > 0 else None
+    for k, (st, (a0, b0, a1, b1)) in enumerate(use):
+        strip = strips[st.idx]
+        for owner, target, extra in ((o1, out, None), (o2, c2, blend)):
+            if target is None:
+                continue
+            sub = owner[b0:b1, a0:a1] == k
+            if extra is not None:
+                sub &= extra[b0:b1, a0:a1]
+            jj, ii = np.nonzero(sub)
+            if not len(jj):
+                continue
+            u, v = ground_uv(st, xs[a0 + ii], ys[b0 + jj], calib, strip, eye)
+            target[b0 + jj, a0 + ii] = _sample(strip[0], u, v)
+    if band > 0 and blend.any():
+        wgt = np.clip(0.5 + s / band, 0.5, 1.0)[..., None]
+        out = np.where(blend[..., None], wgt * out + (1.0 - wgt) * c2, out)
+    if seams:
+        line = pair & (s < 0.5 / px_m)
+        out[line] = out[line] * 0.35 + np.array([255.0, 200.0, 40.0], np.float32) * 0.65
+    return np.clip(out, 0, 255).astype(np.uint8), idx_of[o1]
+
+
+def _ground_gray(stations: Sequence[Station], strips: Dict[int, tuple], calib: Calib,
+                 cx: float, cy: float, n: int, px_m: float, eye: float,
+                 r_max: float, nadir_r: float):
+    """Image en gris (float32) et masque de validité : pour chaque point, la
+    bulle la plus proche parmi `stations`, hors nadir, à moins de `r_max`."""
+    import numpy as np
+    xs = cx + (np.arange(n, dtype=np.float32) - n / 2.0 + 0.5) / px_m
+    ys = cy - (np.arange(n, dtype=np.float32) - n / 2.0 + 0.5) / px_m
     gx, gy = np.meshgrid(xs, ys)
-    best = np.full((h, w), np.inf, dtype=np.float32)
-    owner = np.full((h, w), -1, dtype=np.int32)
-    for st in stations:
-        if st.idx not in images:
-            continue
-        d2 = (gx - st.x) ** 2 + (gy - st.y) ** 2
-        m = (d2 < best) & (d2 <= tile_r * tile_r)
-        best[m] = d2[m]
-        owner[m] = st.idx
-    out = np.full((h, w, 3), 24, dtype=np.uint8)
-    for st in stations:
-        src = images.get(st.idx)
-        if src is None:
-            continue
-        sel = np.nonzero(owner == st.idx)
+    best = np.full((n, n), np.inf, dtype=np.float32)
+    own = np.full((n, n), -1, dtype=np.int32)
+    for k, st in enumerate(stations):
+        d = (gx - st.x) ** 2 + (gy - st.y) ** 2
+        r = ground_reach(st, eye, r_max)
+        ok = (d >= nadir_r * nadir_r) & (d <= r * r) & (d < best)
+        best[ok] = d[ok]
+        own[ok] = k
+    img = np.zeros((n, n), dtype=np.float32)
+    for k, st in enumerate(stations):
+        sel = np.nonzero(own == k)
         if not len(sel[0]):
             continue
-        u, v = ground_sample_maps(st, gx[sel], gy[sel], calib, src.shape[1], src.shape[0], eye)
-        n = u.size                             # cv2.remap : moins de 32767 lignes
-        cols = 1024
-        rows = -(-n // cols)
-        mu = np.zeros(rows * cols, dtype=np.float32)
-        mv = np.zeros(rows * cols, dtype=np.float32)
-        mu[:n] = u
-        mv[:n] = v
-        px = cv2.remap(src, mu.reshape(rows, cols), mv.reshape(rows, cols), cv2.INTER_LINEAR,
-                       borderMode=cv2.BORDER_WRAP)
-        out[sel] = px.reshape(-1, 3)[:n]
-    if seams:                                  # raccords : un trait sombre, discret
-        edge = np.zeros((h, w), dtype=bool)
-        edge[:, 1:] |= owner[:, 1:] != owner[:, :-1]
-        edge[1:, :] |= owner[1:, :] != owner[:-1, :]
-        out[edge] = (out[edge] * 0.45).astype(np.uint8)
-    return out, owner
+        u, v = ground_uv(st, gx[sel], gy[sel], calib, strips[st.idx], eye)
+        img[sel] = _sample(strips[st.idx][0], u, v).mean(axis=1)
+    return img, own >= 0
+
+
+def ground_register(st: Station, refs: Sequence[Station], strips: Dict[int, tuple],
+                    calib: Calib, eye: float = EYE_HEIGHT_DEFAULT, radius: float = 3.0,
+                    nadir_r: float = GROUND_NADIR_R, use_yaw: bool = True,
+                    use_xy: bool = True) -> Optional[Dict[str, float]]:
+    """Recalage de la bulle `st` sur le sol vu par ses voisines déjà fixées
+    (`refs`) : la tuile de `st` est déplacée / tournée autour de la station
+    jusqu'à se superposer au sol des voisines (corrélation ECC, du grossier au
+    fin). Retourne {'dx', 'dy' (m), 'dyaw' (deg), 'cc' (0..1), 'n' (px)} ou None."""
+    import numpy as np
+    import cv2
+    ecc_mode = (cv2.MOTION_EUCLIDEAN if use_yaw else cv2.MOTION_TRANSLATION)
+    cur = dc_replace(st)
+    total = {'dx': 0.0, 'dy': 0.0, 'dyaw': 0.0}
+    cc = 0.0
+    npx = 0
+    for px_m in (15.0, 30.0, 60.0):          # du grossier (portée) au fin (précision)
+        n = int(2 * radius * px_m)
+        ref, mref = _ground_gray(refs, strips, calib, cur.x, cur.y, n, px_m, eye,
+                                 radius + 2.0, nadir_r)
+        mov, mmov = _ground_gray([cur], strips, calib, cur.x, cur.y, n, px_m, eye,
+                                 radius, nadir_r)
+        mask = mref & mmov
+        npx = int(mask.sum())
+        if npx < 0.08 * n * n:
+            return None
+        blur = max(1, int(round(0.04 * px_m))) * 2 + 1
+        ref = cv2.GaussianBlur(ref, (blur, blur), 0)
+        mov = cv2.GaussianBlur(mov, (blur, blur), 0)
+        warp = np.eye(2, 3, dtype=np.float32)
+        try:
+            cc, warp = cv2.findTransformECC(
+                ref, mov, warp, ecc_mode,
+                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6),
+                (mask * 255).astype(np.uint8), 5)
+        except cv2.error:
+            return None
+        # mov(W·p) ≈ ref(p) : la tuile doit subir W⁻¹, rotation autour de la
+        # station (centre de l'image) puis translation
+        R = warp[:, :2].astype(np.float64)
+        t = warp[:, 2].astype(np.float64)
+        c = np.array([n / 2.0, n / 2.0])
+        Rt = R.T
+        d_px = Rt @ (c - t) - c
+        ang = math.degrees(math.atan2(R[1, 0], R[0, 0]))    # rotation de W (image, y en bas)
+        dxm, dym = d_px[0] / px_m, -d_px[1] / px_m
+        if not use_xy:
+            dxm = dym = 0.0
+        cur.x += dxm
+        cur.y += dym
+        # W⁻¹ tourne la tuile de −ang (image, y en bas) = +ang vu de dessus (y en haut) ;
+        # la tuile tourne dans le sens opposé à Δ nord
+        dyaw = -ang * calib.sense if use_yaw else 0.0
+        cur.yaw_fix += dyaw
+        total['dx'] += dxm
+        total['dy'] += dym
+        total['dyaw'] += dyaw
+    total['cc'] = float(cc)
+    total['n'] = npx
+    return total
+
+
+def ground_adjust(stations: Sequence[Station], origin: int, candidates: Iterable[int],
+                  strips_get, calib: Calib, eye: float = EYE_HEIGHT_DEFAULT,
+                  link_r: float = 6.0, use_xy: bool = True, use_yaw: bool = True,
+                  min_cc: float = 0.6, max_shift: float = 0.8, max_yaw: float = 5.0,
+                  sweeps: int = 2, progress=None,
+                  cancel: Optional[threading.Event] = None) -> List[dict]:
+    """Ajustement DE PROCHE EN PROCHE depuis la station `origin` (référence, fixe).
+
+    1. Propagation : la station non traitée la plus proche des stations fixées
+       est recalée (XY et / ou orientation) sur le sol vu par ses voisines
+       fixées, puis fixée à son tour. Un recalage douteux (corrélation < min_cc,
+       correction > max_shift m ou > max_yaw°) est refusé : la station garde
+       ses valeurs et ne sert pas de référence.
+    2. Affinage (`sweeps` passes) : chaque station ajustée est recalée sur
+       TOUTES ses voisines ajustées, de tous côtés, l'origine restant fixe :
+       l'erreur se répartit au lieu de s'accumuler le long de la chaîne.
+    Travaille sur des COPIES (rien n'est modifié). Retourne, par station, la
+    correction totale {'idx', 'dx', 'dy', 'dyaw', 'cc', 'refs', 'ok', 'why'}."""
+    st = {s.idx: dc_replace(s) for s in stations}
+    start = {i: (s.x, s.y, s.yaw_fix) for i, s in st.items()}
+    fixed = [origin]
+    pending = set(candidates) - {origin}
+    reps: Dict[int, dict] = {}
+    total = len(pending) * (1 + sweeps)
+    done = 0
+
+    def stopped() -> bool:
+        return cancel is not None and cancel.is_set()
+
+    def register(s, ref_ids):
+        refs = [st[f] for f in ref_ids if f != s.idx
+                and math.hypot(s.x - st[f].x, s.y - st[f].y) <= link_r]
+        strips = {}
+        for r in refs + [s]:
+            e = strips_get(r)
+            if e is not None:
+                strips[r.idx] = e
+        refs = [r for r in refs if r.idx in strips]
+        if s.idx not in strips or not refs:
+            return None, len(refs), 'image absente'
+        r = ground_register(s, refs, strips, calib, eye, use_yaw=use_yaw, use_xy=use_xy)
+        if r is None:
+            return None, len(refs), 'recouvrement insuffisant'
+        return r, len(refs), ''
+
+    # 1. propagation
+    while pending and not stopped():
+        best = None
+        for i in pending:
+            s = st[i]
+            dmin = min(math.hypot(s.x - st[f].x, s.y - st[f].y) for f in fixed)
+            if dmin <= link_r and (best is None or dmin < best[0]):
+                best = (dmin, i)
+        if best is None:
+            break
+        i = best[1]
+        pending.discard(i)
+        s = st[i]
+        rep = {'idx': i, 'cc': 0.0, 'refs': 0, 'ok': False, 'why': ''}
+        r, rep['refs'], why = register(s, fixed)
+        if r is None:
+            rep['why'] = why
+        else:
+            rep['cc'] = r['cc']
+            if r['cc'] < min_cc:
+                rep['why'] = f"corrélation faible ({r['cc']:.2f})"
+            elif math.hypot(r['dx'], r['dy']) > max_shift:
+                rep['why'] = f"déplacement trop grand ({math.hypot(r['dx'], r['dy']):.2f} m)"
+            elif abs(r['dyaw']) > max_yaw:
+                rep['why'] = f"rotation trop grande ({r['dyaw']:+.1f}°)"
+            else:
+                rep['ok'] = True
+                s.x += r['dx']
+                s.y += r['dy']
+                s.yaw_fix = wrap180(s.yaw_fix + r['dyaw'])
+                fixed.append(i)
+        reps[i] = rep
+        done += 1
+        if progress is not None:
+            progress(done, total, rep)
+    # 2. affinage : de tous côtés, l'origine fixe
+    ok_ids = [i for i in fixed if i != origin]
+    for _ in range(sweeps):
+        for i in ok_ids:
+            if stopped():
+                break
+            s = st[i]
+            r, n, _why = register(s, fixed)
+            if r is not None and r['cc'] >= min_cc and math.hypot(r['dx'], r['dy']) <= 0.15 \
+                    and abs(r['dyaw']) <= 1.5:
+                s.x += r['dx']
+                s.y += r['dy']
+                s.yaw_fix = wrap180(s.yaw_fix + r['dyaw'])
+                reps[i]['cc'] = r['cc']
+                reps[i]['refs'] = n
+            done += 1
+            if progress is not None:
+                progress(done, total, reps[i])
+    out = []
+    for i, rep in reps.items():
+        x0, y0, w0 = start[i]
+        rep.update(dx=st[i].x - x0, dy=st[i].y - y0, dyaw=wrap180(st[i].yaw_fix - w0))
+        if not rep['ok']:
+            rep.update(dx=0.0, dy=0.0, dyaw=0.0)
+        out.append(rep)
+    return out
 
 
 class GroundView(tk.Toplevel if _TK_OK else object):
@@ -7815,6 +8176,11 @@ class GroundView(tk.Toplevel if _TK_OK else object):
     Alt / Maj + molette → Δ / H, Espace + glisser → position XY, Ctrl + molette
     → orientation de son image (la tuile tourne). Molette seule : zoom ; clic
     droit glissé : déplacer ; clic : aller sur la station.
+
+    Réactivité : les bandes de sol réduites sont gardées en mémoire
+    (GroundStrips) ; après une correction, seul le rectangle couvert par les
+    tuiles touchées (avant et après) est recalculé ; déplacement et zoom
+    montrent aussitôt l'image existante recadrée, le calcul suit en arrière-plan.
     """
 
     def __init__(self, app: "BubbleNavApp"):
@@ -7826,37 +8192,72 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         self.px_m = GROUND_PX_M
         st = app.station()
         self.cx, self.cy = (st.x, st.y) if st else (0.0, 0.0)
+        self._img = None          # pavage calculé (RGB uint8)
+        self._own = None          # station propriétaire de chaque pixel (-1 : aucune)
+        self._frame = None        # cadre du pavage calculé
+        self._sig: Dict[int, tuple] = {}    # état des stations qui l'ont produit
         self._photo = None
-        self._owner = None
+        self._photo_key = None
         self._busy = False
         self._dirty = False
         self._job = None
         self._pan = None
         self._drag = None
-        self.seams = tk.BooleanVar(value=True)
+        self._press = None
+        self.adjust_dlg = None
+        self.seams = tk.BooleanVar(value=bool(app.cfg.get('ground_seams', True)))
+        self.feather = tk.BooleanVar(value=bool(app.cfg.get('ground_feather', True)))
+        self.nadir = tk.BooleanVar(value=bool(app.cfg.get('ground_nadir', True)))
         bar = tk.Frame(self, bg=COLORS['bg_medium'])
         bar.pack(fill='x')
         tk.Label(bar, text="Vue du sol", font=F_TITLE, bg=COLORS['bg_medium'],
                  fg=COLORS['accent']).pack(side='left', padx=10, pady=4)
         app._mk_button(bar, "⌖ Centrer sur A", self.center_on_a,
                        tip="Recentrer sur le point de vue A.").pack(side='left', padx=4)
-        tk.Checkbutton(bar, text="Raccords", variable=self.seams, command=self.request,
-                       font=F_UI, bg=COLORS['bg_medium'], fg=COLORS['text'],
-                       selectcolor=COLORS['bg_light'], bd=0, highlightthickness=0,
-                       activebackground=COLORS['bg_medium'],
-                       activeforeground=COLORS['text']).pack(side='left', padx=8)
-        self.info = tk.Label(bar, text="", font=F_UI, bg=COLORS['bg_medium'],
-                             fg=COLORS['text_muted'])
-        self.info.pack(side='left', padx=8)
+        app._mk_button(bar, "⇄ Ajuster de proche en proche…", self.open_adjust,
+                       tip="Recalage automatique XY et orientation des bulles sur le sol "
+                           "de leurs voisines, en partant d'une station de référence "
+                           "(A ou la station active), de proche en proche. Aperçu du "
+                           "résultat avant application ; Ctrl+Z annule tout d'un coup."
+                       ).pack(side='left', padx=4)
+        for var, txt, tip in (
+                (self.seams, "Coutures", "Trait fin exactement sur la limite entre deux "
+                                         "tuiles : un défaut de position ou d'orientation "
+                                         "y fait une cassure."),
+                (self.feather, "Fondu", "Fondu de 20 cm de part et d'autre de la couture : "
+                                        "un décalage y apparaît en double."),
+                (self.nadir, "Sans trépied", "Le sol sous chaque bulle (trépied, opérateur, "
+                                             f"{GROUND_NADIR_R:g} m) est pris dans une "
+                                             "bulle voisine quand elle le voit.")):
+            cb = tk.Checkbutton(bar, text=txt, variable=var, command=self._opts_changed,
+                                font=F_UI, bg=COLORS['bg_medium'], fg=COLORS['text'],
+                                selectcolor=COLORS['bg_light'], bd=0, highlightthickness=0,
+                                activebackground=COLORS['bg_medium'],
+                                activeforeground=COLORS['text'])
+            cb.pack(side='left', padx=4)
+            Tooltip(cb, tip)
+        foot = tk.Frame(self, bg=COLORS['bg_medium'])
+        foot.pack(fill='x', side='bottom')
+        # largeur fixe : un texte d'état plus long ne doit pas replier l'aide
+        # (le canevas changerait de taille et relancerait le calcul)
+        self.info = tk.Label(foot, text="", font=F_UI_B, bg=COLORS['bg_medium'],
+                             fg=COLORS['accent'], padx=10, width=40, anchor='e')
+        self.info.pack(side='right')
+        hint = tk.Label(foot, font=F_UI, bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
+                        anchor='w', justify='left', padx=10, pady=3, wraplength=400,
+                        text="Chaque bulle projetée à la verticale sur son sol : le sol doit "
+                             "se raccorder d'une tuile à l'autre. Survol : station active · "
+                             "Alt / Maj + molette : Δ / H · Espace + glisser : XY · Ctrl + "
+                             "molette : orientation · molette : zoom · clic droit glissé : "
+                             "déplacer")
+        hint.pack(side='left', fill='x', expand=True)
+        def _wrap(e, lab=hint):
+            wl = max(200, e.width - 24)
+            if abs(int(str(lab.cget('wraplength')) or 0) - wl) > 8:
+                lab.config(wraplength=wl)
+        hint.bind('<Configure>', _wrap)
         self.canvas = tk.Canvas(self, bg='#141414', highlightthickness=0, cursor='fleur')
         self.canvas.pack(fill='both', expand=True)
-        tk.Label(self, font=F_UI, bg=COLORS['bg_medium'], fg=COLORS['text_muted'],
-                 anchor='w', padx=10, pady=3,
-                 text="Chaque bulle projetée à la verticale sur son sol ; le sol doit se "
-                      "raccorder d'une tuile à l'autre. Survol : station active · Alt / Maj "
-                      "+ molette : Δ / H · Espace + glisser : XY · Ctrl + molette : "
-                      "orientation · molette : zoom · clic droit glissé : déplacer"
-                 ).pack(fill='x', side='bottom')
         c = self.canvas
         c.bind('<Configure>', lambda e: self.request())
         c.bind('<Motion>', self._on_motion)
@@ -7869,16 +8270,20 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         for seq in RIGHT_CLICK:
             c.bind(seq, self._on_pan_start)
         c.bind('<B3-Motion>', self._on_pan)
+        c.bind('<ButtonRelease-3>', lambda e: setattr(self, '_pan', None))
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.after(80, self.request)
 
     # ── coordonnées ──────────────────────────────────────────────────
+    def _size(self) -> Tuple[int, int]:
+        return max(50, self.canvas.winfo_width()), max(50, self.canvas.winfo_height())
+
     def to_world(self, x: float, y: float) -> Tuple[float, float]:
-        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        w, h = self._size()
         return self.cx + (x - w / 2.0) / self.px_m, self.cy - (y - h / 2.0) / self.px_m
 
     def to_screen(self, X: float, Y: float) -> Tuple[float, float]:
-        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        w, h = self._size()
         return w / 2.0 + (X - self.cx) * self.px_m, h / 2.0 - (Y - self.cy) * self.px_m
 
     def stations_shown(self) -> List[Station]:
@@ -7886,84 +8291,206 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         a = self.app.station()
         if a is None:
             return []
-        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        w, h = self._size()
         rx = w / 2.0 / self.px_m + GROUND_TILE_R
         ry = h / 2.0 / self.px_m + GROUND_TILE_R
-        return [s for s in self.app.stations if s.floor == a.floor
-                and abs(s.x - self.cx) <= rx and abs(s.y - self.cy) <= ry
-                and self.app.store.has(s.photo)][:80]
+        sts = [s for s in self.app.stations if s.floor == a.floor
+               and abs(s.x - self.cx) <= rx and abs(s.y - self.cy) <= ry
+               and self.app.store.has(s.photo)]
+        if len(sts) > 120:                        # vue très large : les plus proches
+            sts.sort(key=lambda s: (s.x - self.cx) ** 2 + (s.y - self.cy) ** 2)
+            sts = sts[:120]
+        return sts
 
     def station_at(self, x: float, y: float) -> Optional[int]:
-        """Station dont la tuile est sous le curseur."""
-        if self._owner is None:
+        """Station dont la tuile est sous le curseur (dans le pavage calculé)."""
+        if self._own is None or self._frame is None:
             return None
-        o, sc = self._owner
-        j, i = int(y / sc), int(x / sc)
+        fcx, fcy, fw, fh, fpx = self._frame[:5]
+        X, Y = self.to_world(x, y)
+        i = int(math.floor((X - fcx) * fpx + fw / 2.0))
+        j = int(math.floor((fcy - Y) * fpx + fh / 2.0))
+        o = self._own
         if 0 <= j < o.shape[0] and 0 <= i < o.shape[1] and o[j, i] >= 0:
             return int(o[j, i])
         return None
 
     # ── calcul, en arrière-plan ──────────────────────────────────────
-    def request(self, fast: bool = False) -> None:
-        if self._job:
-            self.after_cancel(self._job)
-        self._job = self.after(15 if fast else 60, lambda: self._start(fast))
+    def _eye(self) -> float:
+        return float(self.app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
 
-    def _start(self, fast: bool) -> None:
-        self._job = None
-        if self._busy:
-            self._dirty = True
-            return
-        w, h = max(50, self.canvas.winfo_width()), max(50, self.canvas.winfo_height())
-        sc = 2 if fast else 1                     # pendant un geste : demi-résolution
-        sts = self.stations_shown()
-        snap = [dc_replace(s) for s in sts]       # instantané : le calcul est hors fil
-        app = self.app
-        eye = float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT))
-        args = (snap, self.cx, self.cy, w // sc, h // sc, self.px_m / sc, eye,
-                bool(self.seams.get()), sc, w, h)
-        self._busy = True
-        self.info.config(text="calcul…")
-        threading.Thread(target=self._work, args=args, daemon=True,
-                         name='bubblenav-sol').start()
+    def _opts(self) -> tuple:
+        return (bool(self.seams.get()), bool(self.feather.get()), bool(self.nadir.get()))
 
-    def _work(self, snap, cx, cy, w, h, px_m, eye, seams, sc, full_w, full_h):
-        try:
-            images = {}
-            for s in snap:
-                img = self.app.store.peek(s.photo)
-                if img is None:
-                    img = self.app.store.load(s.photo)
-                if img is not None:
-                    images[s.idx] = img
-            t0 = time.perf_counter()
-            out, owner = ground_mosaic(snap, images, self.app.calib, cx, cy, w, h, px_m,
-                                       eye, seams=seams)
-            dt = (time.perf_counter() - t0) * 1000.0
-            self.app._post(self._show, out, owner, sc, full_w, full_h, len(images), dt)
-        except Exception as exc:
-            msg = str(exc)
-            self.app._post(lambda: (self.info.config(text=f"erreur : {msg}"),
-                                    setattr(self, '_busy', False)))
+    def _opts_changed(self) -> None:
+        s, f, n = self._opts()
+        self.app.cfg.update(ground_seams=s, ground_feather=f, ground_nadir=n)
+        self.request()
 
-    def _show(self, out, owner, sc, full_w, full_h, n, dt) -> None:
-        self._busy = False
+    def _sig_of(self, st: Station, eye: float) -> tuple:
+        return (round(st.x, 4), round(st.y, 4), round(st.yaw_fix, 3),
+                round(st.height(eye), 4), round(st.north_pct, 5), st.photo)
+
+    def request(self, delay: int = 20) -> None:
+        """Mise à jour du pavage : partielle si seules des stations ont changé,
+        complète si le cadre, le zoom ou les options ont changé."""
         try:
             if not self.winfo_exists():
                 return
         except Exception:
             return
-        from PIL import Image, ImageTk
-        im = Image.fromarray(out)
-        if sc != 1:
-            im = im.resize((full_w, full_h), Image.BILINEAR)
-        self._photo = ImageTk.PhotoImage(im)
-        self._owner = (owner, sc)
-        self.info.config(text=f"{n} bulle(s) · {1000.0 / self.px_m:.0f} mm/px · {dt:.0f} ms")
-        self.redraw()
-        if self._dirty:
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(delay, self._start)
+
+    def _start(self) -> None:
+        self._job = None
+        if self._busy:
+            self._dirty = True
+            return
+        w, h = self._size()
+        eye = self._eye()
+        cal = self.app.calib
+        frame = (self.cx, self.cy, w, h, self.px_m, eye,
+                 (cal.mode, cal.sense, cal.offset), self._opts())
+        sts = self.stations_shown()
+        sig = {s.idx: self._sig_of(s, eye) for s in sts}
+        win = None
+        if self._img is not None and frame == self._frame:
+            changed = [i for i in set(sig) | set(self._sig)
+                       if sig.get(i) != self._sig.get(i)]
+            if not changed:
+                self._display()
+                return
+            r = GROUND_TILE_R * self.px_m + 3
+            box = None
+            for i in changed:
+                for sg in (sig.get(i), self._sig.get(i)):
+                    if sg is None:
+                        continue
+                    x, y = self.to_screen(sg[0], sg[1])
+                    b = (int(x - r), int(y - r), int(x + r) + 1, int(y + r) + 1)
+                    box = b if box is None else (min(box[0], b[0]), min(box[1], b[1]),
+                                                 max(box[2], b[2]), max(box[3], b[3]))
+            i0, j0 = max(0, box[0]), max(0, box[1])
+            i1, j1 = min(w, box[2]), min(h, box[3])
+            if i0 >= i1 or j0 >= j1:              # hors cadre : rien à recalculer
+                self._sig = sig
+                self._display()
+                return
+            if (i1 - i0) * (j1 - j0) < 0.7 * w * h:
+                win = (i0, j0, i1, j1)
+        snap = [dc_replace(s) for s in sts]       # instantané : le calcul est hors fil
+        self._busy = True
+        if win is None:
+            self.info.config(text="calcul…")
+        threading.Thread(target=self._work, args=(snap, frame, win, sig, dc_replace(cal)),
+                         daemon=True, name='bubblenav-sol').start()
+
+    def _work(self, snap, frame, win, sig, cal) -> None:
+        try:
+            gs = self.app.ground_strips
+            cx, cy, w, h, px_m, eye, _c, (seams, feather, nadir) = frame
+            kw = dict(nadir_r=GROUND_NADIR_R if nadir else 0.0,
+                      band=GROUND_BAND if feather else 0.0, seams=seams)
+            strips: Dict[int, tuple] = {}
+            missing = []
+            for s in snap:
+                e = gs.peek(s.photo)
+                if e is not None:
+                    strips[s.idx] = e
+                else:
+                    missing.append(s)
+            if missing:                           # première ouverture : chargement
+                win = None                        # progressif, en parallèle
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                t_show = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    futs = {ex.submit(gs.get, s.photo): s for s in missing}
+                    left = len(futs)
+                    for f in as_completed(futs):
+                        left -= 1
+                        e = f.result()
+                        if e is not None:
+                            strips[futs[f].idx] = e
+                        if left and time.perf_counter() - t_show > 0.8:
+                            out, own = ground_mosaic(snap, strips, cal, cx, cy, w, h, px_m,
+                                                     eye, **kw)
+                            self.app._post(self._show, out, own, frame, None, None,
+                                           f"chargement {len(strips)}/{len(snap)}…", False)
+                            t_show = time.perf_counter()
+            t0 = time.perf_counter()
+            out, own = ground_mosaic(snap, strips, cal, cx, cy, w, h, px_m, eye, win=win, **kw)
+            dt = (time.perf_counter() - t0) * 1000.0
+            what = "partiel" if win is not None else "complet"
+            self.app._post(self._show, out, own, frame, win, sig,
+                           f"{len(strips)} bulle(s) · {1000.0 / px_m:.0f} mm/px · "
+                           f"{what} {dt:.0f} ms", True)
+        except Exception as exc:
+            msg = str(exc)
+            self.app._post(self._failed, msg)
+
+    def _failed(self, msg: str) -> None:
+        self._busy = False
+        try:
+            self.info.config(text=f"erreur : {msg}")
+        except Exception:
+            pass
+
+    def _show(self, out, own, frame, win, sig, txt, final) -> None:
+        if final:
+            self._busy = False
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        if win is None:
+            self._img, self._own, self._frame = out, own, frame
+        elif self._img is not None and self._frame == frame:
+            i0, j0, i1, j1 = win
+            self._img[j0:j1, i0:i1] = out
+            self._own[j0:j1, i0:i1] = own
+        if final:
+            self._sig = sig if sig is not None else {}
+        else:
+            self._sig = {}                        # affichage provisoire
+        self._photo_key = None
+        self.info.config(text=txt)
+        self._display()
+        if final and self._dirty:
             self._dirty = False
-            self.request(fast=bool(self._drag))
+            self.request(delay=1)
+
+    def _display(self) -> None:
+        """Le pavage calculé, recadré sur le cadre actuel s'il en diffère
+        (déplacement, zoom en cours) : l'affichage suit le geste sans attendre."""
+        if self._img is None:
+            self.redraw()
+            return
+        from PIL import Image, ImageTk
+        w, h = self._size()
+        fcx, fcy, fw, fh, fpx = self._frame[:5]
+        s = self.px_m / fpx
+        tx = w / 2.0 + (fcx - self.cx) * self.px_m - fw / 2.0 * s
+        ty = h / 2.0 - (fcy - self.cy) * self.px_m - fh / 2.0 * s
+        if abs(s - 1.0) < 1e-9:
+            key = ('id', id(self._img))           # même échelle : simple décalage
+            if self._photo_key != key:
+                self._photo = ImageTk.PhotoImage(Image.fromarray(self._img))
+                self._photo_key = key
+            self._photo_at = (tx, ty)
+        else:
+            import numpy as np
+            import cv2
+            M = np.array([[s, 0.0, tx + 0.5 * s - 0.5], [0.0, s, ty + 0.5 * s - 0.5]],
+                         dtype=np.float64)
+            img = cv2.warpAffine(self._img, M, (w, h), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=(20, 20, 20))
+            self._photo = ImageTk.PhotoImage(Image.fromarray(img))
+            self._photo_key = ('warp', id(self._img), s, tx, ty)
+            self._photo_at = (0, 0)
+        self.redraw()
 
     def redraw(self) -> None:
         """Image du pavage, puis les stations : A, B, la station active, l'origine
@@ -7971,7 +8498,8 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         c = self.canvas
         c.delete('all')
         if self._photo is not None:
-            c.create_image(0, 0, anchor='nw', image=self._photo)
+            x0, y0 = getattr(self, '_photo_at', (0, 0))
+            c.create_image(int(round(x0)), int(round(y0)), anchor='nw', image=self._photo)
         app = self.app
         tgt = app.target
         b = app.compare.idx if app.compare is not None else None
@@ -7998,18 +8526,17 @@ class GroundView(tk.Toplevel if _TK_OK else object):
                           fill='#000000')
             c.create_text(x + 8, y - 10, text=tag + nom, anchor='sw', font=F_UI_B,
                           fill=COLORS['edit'] if st.modified() else 'white')
-        w = self.canvas.winfo_width()
+        w, h = self._size()
         c.create_line(w - 30, 44, w - 30, 16, fill='#ff6b6b', width=2, arrow='last')
         c.create_text(w - 30, 52, text="N", fill='#ff6b6b', font=F_UI_B)
-        c.create_line(14, self.canvas.winfo_height() - 14, 14 + self.px_m,
-                      self.canvas.winfo_height() - 14, fill='white', width=3)
-        c.create_text(14 + self.px_m / 2, self.canvas.winfo_height() - 22, text="1 m",
-                      fill='white', font=F_UI)
+        c.create_line(14, h - 14, 14 + self.px_m, h - 14, fill='white', width=3)
+        c.create_text(14 + self.px_m / 2, h - 22, text="1 m", fill='white', font=F_UI)
 
     def center_on_a(self) -> None:
         st = self.app.station()
         if st is not None:
             self.cx, self.cy = st.x, st.y
+            self._display()
             self.request()
 
     # ── gestes ───────────────────────────────────────────────────────
@@ -8024,17 +8551,24 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         idx = self.station_at(event.x, event.y)
         ctrl = bool(event.state & 0x0004)
         if ctrl and not (alt_down(event.state) or event.state & 0x0001):
-            if idx is not None:                   # orientation de l'image de cette tuile
+            if self.app.can_edit(idx):            # orientation de l'image de cette tuile
                 self.app.adjust_station(idx, 'yaw_fix', step)
+            elif idx is not None:
+                self.app._set_status("Vue du sol : Ctrl + molette sur la tuile d'une "
+                                     "station voisine (pas un point de vue A ou B)",
+                                     COLORS['warning'])
             return
         if self.app.wheel_alt(event, (), self.app.current, step, hovered=idx):
             return
         X, Y = self.to_world(event.x, event.y)   # zoom autour du curseur
         k = 1.25 if step > 0 else 0.8
-        self.px_m = clamp(self.px_m * k, 8.0, 400.0)
+        px = clamp(self.px_m * k, 8.0, 400.0)
+        k = px / self.px_m
+        self.px_m = px
         self.cx = X - (X - self.cx) / k
         self.cy = Y - (Y - self.cy) / k
-        self.request()
+        self._display()
+        self.request(delay=120)
 
     def _on_pan_start(self, event) -> None:
         self._pan = (event.x, event.y, self.cx, self.cy)
@@ -8045,7 +8579,8 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         x0, y0, cx0, cy0 = self._pan
         self.cx = cx0 - (event.x - x0) / self.px_m
         self.cy = cy0 + (event.y - y0) / self.px_m
-        self.request(fast=True)
+        self._display()
+        self.request(delay=120)
 
     def _on_press(self, event) -> None:
         self._press = (event.x, event.y)
@@ -8076,7 +8611,8 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         self.app.corrections.apply(st, x=st.ox + round(x0 + dx - st.ox, 3),
                                    y=st.oy + round(y0 + dy - st.oy, 3), record=False)
         self.app._refresh_links_of(idx)
-        self.request(fast=True)
+        self.redraw()                             # le repère suit aussitôt
+        self.request(delay=1)                     # la tuile suit (mise à jour partielle)
 
     def _on_release(self, event) -> None:
         if self._drag is not None:
@@ -8090,17 +8626,330 @@ class GroundView(tk.Toplevel if _TK_OK else object):
                 self.app._after_edit(moved=True)
             self.request()
             return
-        p = getattr(self, '_press', None)
+        p = self._press
         if p and abs(event.x - p[0]) + abs(event.y - p[1]) <= 3:
             idx = self.station_at(event.x, event.y)
             if idx is not None and idx != self.app.current:
                 self.app.goto(idx)
 
+    def open_adjust(self) -> None:
+        if self.adjust_dlg is not None:
+            try:
+                self.adjust_dlg.lift()
+                return
+            except Exception:
+                self.adjust_dlg = None
+        self.adjust_dlg = GroundAdjustDialog(self)
+
     def close(self) -> None:
+        if self.adjust_dlg is not None:
+            try:
+                self.adjust_dlg.close()
+            except Exception:
+                pass
         if self.app.ground is self:
             self.app.ground = None
         self.destroy()
 
+
+class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
+    """« Ajuster de proche en proche » : recalage automatique des bulles sur le
+    sol de leurs voisines (voir ground_adjust), depuis une station de référence
+    qui ne bouge pas. Calcul en arrière-plan, tableau des corrections proposées,
+    puis « Appliquer » : une seule annulation (Ctrl+Z) défait tout."""
+
+    COLS = (('st', "Station", 150), ('dx', "ΔX cm", 70), ('dy', "ΔY cm", 70),
+            ('dd', "Écart cm", 70), ('dn', "Orient. °", 75), ('cc', "Corrél.", 60),
+            ('nv', "Voisines", 75), ('etat', "État", 250))
+
+    def __init__(self, gv: GroundView):
+        super().__init__(gv)
+        self.gv = gv
+        self.app = app = gv.app
+        self.title(f"{APP_NAME} — ajustement de proche en proche")
+        self.configure(bg=COLORS['bg_dark'])
+        self.geometry("920x600")
+        self.transient(gv)
+        self._cancel: Optional[threading.Event] = None
+        self._result: Optional[List[dict]] = None
+        self._base: Dict[int, Tuple[float, float, float]] = {}
+        self._origin: Optional[int] = None
+        self._used = (True, True)
+        bg = COLORS['bg_medium']
+        top = tk.Frame(self, bg=bg)
+        top.pack(fill='x')
+
+        def lab(parent, text, **kw):
+            return tk.Label(parent, text=text, font=F_UI, bg=bg, fg=COLORS['text'], **kw)
+
+        def check(parent, text, var, tip):
+            cb = tk.Checkbutton(parent, text=text, variable=var, font=F_UI, bg=bg,
+                                fg=COLORS['text'], selectcolor=COLORS['bg_light'], bd=0,
+                                highlightthickness=0, activebackground=bg,
+                                activeforeground=COLORS['text'])
+            Tooltip(cb, tip)
+            return cb
+
+        r1 = tk.Frame(top, bg=bg)
+        r1.pack(fill='x', padx=10, pady=(8, 2))
+        lab(r1, "Référence (fixe) :").pack(side='left')
+        self.origin_var = tk.StringVar(value='A')
+        a = app.station()
+        t = app.target_station()
+        rb = tk.Radiobutton(r1, text=f"point de vue A ({app._nom(a.idx) if a else '—'})",
+                            variable=self.origin_var, value='A', font=F_UI, bg=bg,
+                            fg=COLORS['text'], selectcolor=COLORS['bg_light'],
+                            activebackground=bg, highlightthickness=0)
+        rb.pack(side='left', padx=6)
+        rb2 = tk.Radiobutton(r1, text=f"station active ({app._nom(t.idx) if t else '—'})",
+                             variable=self.origin_var, value='T', font=F_UI, bg=bg,
+                             fg=COLORS['text'], selectcolor=COLORS['bg_light'],
+                             activebackground=bg, highlightthickness=0,
+                             state='normal' if t is not None else 'disabled')
+        rb2.pack(side='left', padx=6)
+        Tooltip(rb, "La station de départ ne bouge pas : elle sert de référence. "
+                    "Choisir une station dont la position et l'orientation sont sûres.")
+        r2 = tk.Frame(top, bg=bg)
+        r2.pack(fill='x', padx=10, pady=2)
+        lab(r2, "Portée autour de la référence (m) :").pack(side='left')
+        self.range_var = tk.DoubleVar(value=float(app.cfg.get('adjust_range', 15.0)))
+        tk.Spinbox(r2, from_=3, to=200, increment=1, width=5, textvariable=self.range_var,
+                   font=F_UI).pack(side='left', padx=6)
+        self.xy_var = tk.BooleanVar(value=bool(app.cfg.get('adjust_xy', True)))
+        self.yaw_var = tk.BooleanVar(value=bool(app.cfg.get('adjust_yaw', True)))
+        check(r2, "Position XY", self.xy_var,
+              "Corriger la position des bulles (dans le CSV de sortie).").pack(side='left',
+                                                                                padx=8)
+        check(r2, "Orientation de l'image", self.yaw_var,
+              "Corriger l'orientation des images (jamais dans le CSV).").pack(side='left',
+                                                                               padx=8)
+        lab(r2, "Corrélation mini :").pack(side='left', padx=(12, 0))
+        self.cc_var = tk.DoubleVar(value=float(app.cfg.get('adjust_min_cc', 0.6)))
+        sp = tk.Spinbox(r2, from_=0.3, to=0.95, increment=0.05, width=5, format='%.2f',
+                        textvariable=self.cc_var, font=F_UI)
+        sp.pack(side='left', padx=6)
+        Tooltip(sp, "Ressemblance minimale (0 à 1) entre le sol d'une bulle et celui de "
+                    "ses voisines déjà ajustées. En dessous, la bulle n'est pas corrigée.")
+        r3 = tk.Frame(top, bg=bg)
+        r3.pack(fill='x', padx=10, pady=(2, 8))
+        self.run_btn = app._mk_button(r3, "▶ Calculer", self.run,
+                                      tip="Calcule les corrections, sans rien modifier.")
+        self.run_btn.pack(side='left')
+        self.apply_btn = app._mk_button(r3, "✔ Appliquer", self.apply,
+                                        tip="Applique les corrections acceptées. "
+                                            "Ctrl+Z les annule toutes d'un coup.")
+        self.apply_btn.pack(side='left', padx=6)
+        self.apply_btn.config(state='disabled')
+        app._mk_button(r3, "Fermer", self.close).pack(side='right')
+        self.prog = ttk.Progressbar(r3, length=260, mode='determinate')
+        self.prog.pack(side='left', padx=12)
+        self.msg = tk.Label(top, text="", font=F_UI_B, bg=bg, fg=COLORS['accent'],
+                            anchor='w', padx=10)
+        self.msg.pack(fill='x', pady=(0, 6))
+        tk.Label(self, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'], anchor='w',
+                 justify='left', padx=10, wraplength=820,
+                 text="Chaque bulle est recalée (translation et / ou rotation autour de la "
+                      "station) sur le sol vu par ses voisines déjà ajustées, la plus proche "
+                      "d'abord ; puis deux passes d'affinage de tous côtés. Refus si la "
+                      "corrélation est trop faible ou la correction excessive (plus de 0,8 m "
+                      "ou 5°) : la bulle reste telle quelle. Sous 5 mm et 0,05°, la bulle est jugée en "
+                      "place et n'est pas retouchée. Δ et H ne sont pas modifiés."
+                 ).pack(fill='x', pady=(4, 2))
+        fr = tk.Frame(self, bg=COLORS['bg_dark'])
+        fr.pack(fill='both', expand=True, padx=10, pady=(2, 10))
+        self.tree = ttk.Treeview(fr, columns=[c[0] for c in self.COLS], show='headings',
+                                 height=14)
+        for key, txt, wd in self.COLS:
+            self.tree.heading(key, text=txt)
+            self.tree.column(key, width=wd, anchor='w' if key in ('st', 'etat') else 'e')
+        sb = ttk.Scrollbar(fr, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        self.tree.tag_configure('refus', foreground='#c0392b')
+        self.tree.tag_configure('ok', foreground='#1e7e34')
+        self.tree.bind('<Double-1>', self._on_pick)
+        self.protocol('WM_DELETE_WINDOW', self.close)
+
+    # ── calcul ───────────────────────────────────────────────────────
+    def _params(self):
+        try:
+            rng = clamp(float(self.range_var.get()), 3.0, 200.0)
+        except (tk.TclError, ValueError):
+            rng = 15.0
+        try:
+            mcc = clamp(float(self.cc_var.get()), 0.3, 0.95)
+        except (tk.TclError, ValueError):
+            mcc = 0.6
+        return rng, mcc, bool(self.xy_var.get()), bool(self.yaw_var.get())
+
+    def run(self) -> None:
+        if self._cancel is not None:              # « Arrêter »
+            self._cancel.set()
+            return
+        app = self.app
+        rng, mcc, use_xy, use_yaw = self._params()
+        if not (use_xy or use_yaw):
+            self.msg.config(text="Cocher la position et / ou l'orientation")
+            return
+        app.cfg.update(adjust_range=rng, adjust_min_cc=mcc, adjust_xy=use_xy,
+                       adjust_yaw=use_yaw)
+        if self.origin_var.get() == 'T' and app.target_station() is not None:
+            org = app.target_station()
+        else:
+            org = app.station()
+        if org is None or not app.store.has(org.photo):
+            self.msg.config(text="Référence sans image")
+            return
+        sts = [s for s in app.stations if s.floor == org.floor and app.store.has(s.photo)
+               and math.hypot(s.x - org.x, s.y - org.y) <= rng]
+        cands = [s.idx for s in sts if s.idx != org.idx]
+        if not cands:
+            self.msg.config(text="Aucune bulle dans la portée")
+            return
+        self._origin = org.idx
+        self._used = (use_xy, use_yaw)
+        self._base = {s.idx: (s.x, s.y, s.yaw_fix) for s in sts}
+        snap = [dc_replace(s) for s in sts]
+        self._result = None
+        self.tree.delete(*self.tree.get_children())
+        self.apply_btn.config(state='disabled')
+        self.run_btn.config(text="■ Arrêter")
+        self.prog.config(maximum=max(1, len(cands) * 3), value=0)
+        self.msg.config(text=f"référence {app._nom(org.idx)} · {len(cands)} bulle(s)…")
+        self._cancel = threading.Event()
+        args = (snap, org.idx, cands, dc_replace(app.calib),
+                float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
+                use_xy, use_yaw, mcc, self._cancel)
+        threading.Thread(target=self._work, args=args, daemon=True,
+                         name='bubblenav-ajust').start()
+
+    def _work(self, snap, origin, cands, cal, eye, use_xy, use_yaw, mcc, cancel) -> None:
+        gs = self.app.ground_strips
+        t0 = time.perf_counter()
+
+        def progress(done, total, rep):
+            self.app._post(self._progress, done, total, rep)
+
+        try:
+            res = ground_adjust(snap, origin, cands, lambda s: gs.get(s.photo), cal, eye,
+                                use_xy=use_xy, use_yaw=use_yaw, min_cc=mcc,
+                                progress=progress, cancel=cancel)
+            self.app._post(self._done, res, cancel.is_set(), time.perf_counter() - t0)
+        except Exception as exc:
+            msg = str(exc)
+            self.app._post(self._done, None, False, 0.0, msg)
+
+    def _progress(self, done, total, rep) -> None:
+        try:
+            self.prog.config(maximum=max(1, total), value=done)
+            self.msg.config(text=f"{done} / {total} · {self.app._nom(rep['idx'])}")
+        except Exception:
+            pass
+
+    def _done(self, res, cancelled, dt, err: str = '') -> None:
+        self._cancel = None
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        self.run_btn.config(text="▶ Calculer")
+        if res is None:
+            self.msg.config(text=f"Erreur : {err}")
+            return
+        self._result = res
+        self.tree.delete(*self.tree.get_children())
+        app = self.app
+        self.tree.insert('', 'end', values=(app._nom(self._origin), '—', '—', '—', '—', '—',
+                                            '—', 'référence (fixe)'), tags=('ok',))
+        res_sorted = sorted(res, key=lambda r: (not r['ok'], -math.hypot(r['dx'], r['dy'])))
+        for r in res_sorted:
+            d = math.hypot(r['dx'], r['dy'])
+            if not r['ok']:
+                etat = 'refusée : ' + r['why']
+            elif d < ADJUST_TOL_XY and abs(r['dyaw']) < ADJUST_TOL_YAW:
+                etat = 'en place (inchangée)'
+            else:
+                etat = 'ajustée'
+            self.tree.insert('', 'end', iid=str(r['idx']),
+                             values=(app._nom(r['idx']), f"{r['dx'] * 100:+.1f}",
+                                     f"{r['dy'] * 100:+.1f}", f"{d * 100:.1f}",
+                                     f"{r['dyaw']:+.2f}", f"{r['cc']:.2f}", r['refs'], etat),
+                             tags=('ok' if r['ok'] else 'refus',))
+        ok = [r for r in res if r['ok'] and (math.hypot(r['dx'], r['dy']) >= ADJUST_TOL_XY
+                                             or abs(r['dyaw']) >= ADJUST_TOL_YAW)]
+        non = sum(1 for r in res if not r['ok'])
+        keep = len(res) - len(ok) - non
+        dmax = max((math.hypot(r['dx'], r['dy']) for r in ok), default=0.0)
+        amax = max((abs(r['dyaw']) for r in ok), default=0.0)
+        self.msg.config(text=(("interrompu · " if cancelled else "")
+                              + f"{len(ok)} à corriger, {keep} en place, {non} refusée(s) · max "
+                                f"{dmax * 100:.1f} cm, {amax:.2f}° · {dt:.1f} s"))
+        self.apply_btn.config(state='normal' if ok else 'disabled')
+
+    def _on_pick(self, event) -> None:
+        """Double-clic sur une ligne : la vue du sol se centre sur la station."""
+        sel = self.tree.focus()
+        if sel and sel.isdigit():
+            st = self.app.stations[int(sel)]
+            self.gv.cx, self.gv.cy = st.x, st.y
+            self.gv._display()
+            self.gv.request()
+
+    # ── application : une seule annulation ───────────────────────────
+    def apply(self) -> None:
+        app = self.app
+        if not self._result:
+            return
+        n = skipped = 0
+        n_journal = len(app.journal)
+        use_xy, use_yaw = self._used
+        for r in self._result:
+            if not r['ok']:
+                continue
+            st = app.stations[r['idx']]
+            base = self._base.get(r['idx'])
+            if base is None or (abs(st.x - base[0]) > 1e-6 or abs(st.y - base[1]) > 1e-6
+                                or abs(st.yaw_fix - base[2]) > 1e-6):
+                skipped += 1                      # corrigée à la main entre-temps
+                continue
+            # sous la tolérance : bruit de mesure, la composante reste telle quelle
+            kw = {}
+            if use_xy and math.hypot(r['dx'], r['dy']) >= ADJUST_TOL_XY:
+                kw.update(x=st.ox + round(base[0] + r['dx'] - st.ox, 3),
+                          y=st.oy + round(base[1] + r['dy'] - st.oy, 3))
+            if use_yaw and abs(r['dyaw']) >= ADJUST_TOL_YAW:
+                kw['yaw_fix'] = base[2] + r['dyaw']
+            if not kw:
+                continue
+            app.corrections.apply(st, **kw)
+            app._refresh_links_of(st.idx)
+            n += 1
+        # les n étapes du journal commun deviennent une seule annulation
+        del app.journal[n_journal:]
+        if n:
+            app._journal_push(('edit_batch', n))
+            app._after_edit(moved=True, turned=True)
+            if app.compare is not None:
+                app.compare.request_render(force=True)
+        self._result = None
+        self.apply_btn.config(state='disabled')
+        txt = f"{n} bulle(s) ajustée(s) — Ctrl+Z annule l'ensemble"
+        if skipped:
+            txt += f" · {skipped} ignorée(s) (modifiée(s) entre-temps)"
+        self.msg.config(text=txt)
+        app._set_status("Ajustement de proche en proche : " + txt, COLORS['edit'])
+
+    def close(self) -> None:
+        if self._cancel is not None:
+            self._cancel.set()
+        if self.gv.adjust_dlg is self:
+            self.gv.adjust_dlg = None
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 def ensure_deps(interactive: bool = True) -> None:
@@ -8205,8 +9054,8 @@ def selftest(csv_path: str = '') -> int:
             (0, -10, 150, 60.0, -20.0), (40, -30, 190, 125.0, -40.0),
             (-60, 10, 200, -150.0, 5.0)):
         src = np.zeros((sh, sw, 3), dtype=np.uint8)
-        u = (psi + 180.0) / 360.0 * sw
-        v = (0.5 - elev / 180.0) * sh
+        u = (psi + 180.0) / 360.0 * sw - 0.5          # centre du pixel i en i + 0,5
+        v = (0.5 - elev / 180.0) * sh - 0.5
         yy, xx = np.mgrid[0:sh, 0:sw]
         dx = np.minimum(np.abs(xx - u), sw - np.abs(xx - u))
         blob = np.exp(-((dx ** 2 + (yy - v) ** 2) / 8.0)) * 255.0
@@ -8215,15 +9064,22 @@ def selftest(csv_path: str = '') -> int:
         view = View(yaw, pitch, fov, 640, 400)
         out = renderer.render(src, view)
         pred = project(view, psi, elev)
-        found = np.unravel_index(int(np.argmax(out[..., 0])), out.shape[:2])
+        # centre de la tache au sous-pixel (barycentre autour du maximum), pixel j → j + 0,5
+        jm, im = np.unravel_index(int(np.argmax(out[..., 0])), out.shape[:2])
+        j0_, j1_ = max(0, jm - 25), min(out.shape[0], jm + 26)
+        i0_, i1_ = max(0, im - 25), min(out.shape[1], im + 26)
+        wgt = out[j0_:j1_, i0_:i1_, 0].astype(np.float64)
+        wgt = np.maximum(wgt - 0.3 * wgt.max(), 0.0)
+        jj_, ii_ = np.mgrid[j0_:j1_, i0_:i1_]
+        found = ((wgt * jj_).sum() / wgt.sum() + 0.5, (wgt * ii_).sum() / wgt.sum() + 0.5)
         if pred is None:
             check(f"projection (yaw={yaw}, pitch={pitch})", False, "direction jugée hors champ")
             continue
         err = math.hypot(pred[0] - found[1], pred[1] - found[0])
         worst = max(worst, err)
-        check(f"pastille yaw={yaw:>4} pitch={pitch:>3} fov={fov:>3}", err < 2.0,
+        check(f"pastille yaw={yaw:>4} pitch={pitch:>3} fov={fov:>3}", err < 0.25,
               f"écart {err:.2f} px")
-    check("écart maximal projection/rendu < 2 px", worst < 2.0, f"{worst:.2f} px")
+    check("écart maximal projection/rendu < 0,25 px", worst < 0.25, f"{worst:.2f} px")
 
     behind = project(View(0, 0, 90, 640, 400), 179.0, 0.0)
     check("direction opposée rejetée", behind is None)
@@ -8877,6 +9733,59 @@ def selftest(csv_path: str = '') -> int:
     check("regarder d'où l'on vient : pastille au centre",
           pr is not None and abs(pr[0] - 400) < 1e-6 and abs(pr[1] - 300) < 1e-6,
           f"{pr[0]:.3f}, {pr[1]:.3f}" if pr else "hors champ")
+
+    print("\n16) Vue du sol : pavage, couture, recalage")
+    import cv2
+    rng = np.random.default_rng(3)
+    RES, X0, Y1 = 0.02, -6.0, 6.0                  # sol de synthèse, non périodique
+    nx, ny = int(17.0 / RES), int(12.0 / RES)
+    base = np.zeros((ny, nx), np.float32)
+    for sc_, amp in ((40, 60), (12, 35), (4, 20)):
+        n_ = rng.random((ny // sc_ + 2, nx // sc_ + 2)).astype(np.float32)
+        base += amp * cv2.resize(n_, (nx, ny), interpolation=cv2.INTER_CUBIC)
+    tex = np.stack([base + 50, base * 0.9 + 55, base * 0.7 + 50], -1)
+    for _ in range(250):
+        x_, y_ = int(rng.integers(0, nx)), int(rng.integers(0, ny))
+        a_, L_ = rng.uniform(0, math.pi), int(rng.integers(30, 250))
+        cv2.line(tex, (x_, y_), (int(x_ + L_ * math.cos(a_)), int(y_ + L_ * math.sin(a_))),
+                 [int(c) for c in rng.integers(20, 240, 3)], int(rng.integers(1, 4)))
+    tex = np.clip(tex, 0, 255).astype(np.uint8)
+
+    def world(X, Y):
+        return cv2.remap(tex, ((X - X0) / RES).astype(np.float32),
+                         ((Y1 - Y) / RES).astype(np.float32), cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REFLECT)
+
+    gcal = Calib('colonne', 1, 0.0)
+    gst = [Station(idx=k, photo=f'g{k}', locator=f'G{k}', x=2.5 * k, y=0.3 * (k % 2), z=1.65,
+                   north_pct=(37.0, 62.0, 80.0)[k], floor='P', h0=1.65) for k in range(3)]
+    heq = 512
+    row0 = int((0.5 - GROUND_EL_MAX / 180.0) * heq)
+    PSI, EL = np.meshgrid((np.arange(1024) + 0.5) / 1024 * 360.0 - 180.0,
+                          90.0 - (np.arange(row0, heq) + 0.5) / heq * 180.0)
+    gstrips = {}
+    for s_ in gst:
+        az_ = np.radians(PSI - (s_.north_pct / 100.0 - 0.5) * 360.0)
+        dist_ = s_.height(1.65) / np.tan(np.radians(-EL))
+        img_ = world(s_.x + dist_ * np.sin(az_), s_.y + dist_ * np.cos(az_))
+        img_[dist_ < 0.45] = (225, 120, 150)            # trépied au nadir
+        gstrips[s_.idx] = (np.ascontiguousarray(img_), row0, heq)
+    gw, gh, gpx = 300, 200, 30.0
+    out_, own_ = ground_mosaic(gst, gstrips, gcal, 2.5, 0.15, gw, gh, gpx, 1.65, seams=False)
+    gx_, gy_ = np.meshgrid(2.5 + (np.arange(gw) - gw / 2 + 0.5) / gpx,
+                           0.15 - (np.arange(gh) - gh / 2 + 0.5) / gpx)
+    e_ = np.abs(out_.astype(int) - world(gx_, gy_).astype(int)).mean(axis=2)[own_ >= 0].mean()
+    check("pavage du sol : le sol du monde est reconstitué, trépieds effacés", e_ < 8.0,
+          f"écart moyen {e_:.1f}/255")
+    wrong = dc_replace(gst[1], x=gst[1].x + 0.12, y=gst[1].y - 0.08, yaw_fix=1.5)
+    t0 = time.perf_counter()
+    r_ = ground_register(wrong, [gst[0], gst[2]], gstrips, gcal, 1.65)
+    dt_ = (time.perf_counter() - t0) * 1000.0
+    check("recalage sur les voisines : décalage de (+12, −8) cm et +1,5° retrouvé",
+          r_ is not None and abs(r_['dx'] + 0.12) < 0.02 and abs(r_['dy'] - 0.08) < 0.02
+          and abs(r_['dyaw'] + 1.5) < 0.2,
+          (f"({r_['dx']:+.3f}, {r_['dy']:+.3f}) m, {r_['dyaw']:+.2f}°, cc {r_['cc']:.2f}, "
+           f"{dt_:.0f} ms") if r_ else "échec")
 
     print("\n" + ("Toutes les vérifications passent." if not failures
                   else f"{len(failures)} échec(s) : " + ', '.join(failures)))
