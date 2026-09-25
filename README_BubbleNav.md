@@ -211,18 +211,37 @@ chargement.
 ### Ce que corrige le pavage
 
 La vue du sol **ne corrige rien d'elle-même** : elle montre. Ce qui corrige :
-* les **gestes** sur une tuile (Espace + glisser, Ctrl / Alt / Maj + molette) ;
-* le **contrôle / ajustement** ci-dessous.
+* les **gestes** sur une tuile (Espace + glisser, Alt / Maj + molette ;
+  Ctrl + molette pour l'orientation, à la main seulement) ;
+* l'**ajustement** ci-dessous, et seulement après « Appliquer ».
 
-Les corrections portent sur la **position XY** de la station (écrite dans le
-CSV de sortie) et sur l'**orientation de son image** (appliquée à l'image,
-jamais au CSV). Les **pastilles** des bulles sont calculées à partir de ces
-deux valeurs : corriger la station corrige donc la place des pastilles, dans
-sa bulle (orientation) et dans celles des voisines (position). Δ et H ne sont
-jamais modifiés par le contrôle / ajustement.
+L'ajustement ne corrige que la **position XY** de la station et, sur demande,
+sa **hauteur d'instrument H** (les deux écrites dans le CSV de sortie).
+**L'orientation des images est mesurée et affichée, jamais modifiée.** Les
+**pastilles** des bulles voisines sont calculées à partir de la position et
+de la hauteur : les corriger remet donc les pastilles à leur place. Δ ne se
+voit pas au sol (il décale plancher et sol ensemble) : il n'est jamais
+modifié.
 
 Sur le pavage, chaque station porte son **nom** (Locator) et son numéro de
 scan, sur fond sombre (case **Noms**). La référence porte une **★ dorée**.
+
+### Facteur d'échelle : valider la hauteur H
+
+Une bulle se projette au sol à la distance H / tan(site) : si sa hauteur
+d'instrument est fausse, **toute sa tuile est trop grande ou trop petite**,
+autour de la station (H trop forte de 10 % : tuile 10 % trop grande). Le
+recalage laisse donc aussi l'**échelle** libre : le facteur trouvé donne la
+hauteur qui raccorde le sol, **H probable = H × échelle**.
+
+* L'échelle n'est mesurée que si le sol commun **entoure** la station : d'un
+  seul côté, grossir la tuile ressemble à la décaler, elle n'est pas
+  mesurable.
+* Sans ce degré de liberté, une hauteur fausse se déguiserait en faux
+  décalage XY et ferait chuter la corrélation.
+* En ajustement de proche en proche, l'échelle n'est libérée que si le
+  raccord sans elle est médiocre et qu'elle l'améliore nettement : libre à
+  chaque maillon, son léger bruit s'accumulerait le long de la chaîne.
 
 ### Contrôler / ajuster
 
@@ -232,16 +251,18 @@ Bouton **« ⇄ Contrôler / ajuster… »** de la vue du sol.
 sur elle ; elle doit donc être juste. Boutons **= A**, **= station active**,
 **= conseillée**. Elle est gardée d'une séance à l'autre pour ce relevé.
 
-**🔍 Contrôler** (rien ne change) — chaque photo est confrontée au sol de ses
-voisines, telles qu'elles sont. Une photo **mal placée ou mal orientée à elle
-seule** est entourée de **rouge** dans la vue du sol, avec l'écart (cm et °),
-et passe en tête du tableau. Une photo fausse fait paraître ses voisines
-justes légèrement décalées vers elle : les suspectes sont donc écartées et
-leurs voisines recontrôlées, pour ne garder que les vraies fautives. Le
-contrôle dit aussi si la **référence est cohérente** avec ses voisines et
-**conseille** la station la plus sûre (cohérente, le plus de voisines).
-*Appliquer* après un contrôle corrige **les seules photos incohérentes**, en
-les recalant sur leurs voisines cohérentes.
+**🔍 Contrôler — ne modifie jamais rien.** Chaque photo est confrontée au sol
+de ses voisines, telles qu'elles sont :
+* **rouge** : mal placée ou mal orientée **à elle seule**, avec l'écart (cm,
+  degrés) ;
+* **violet** : échelle incohérente, donc **hauteur H douteuse** (« H probable
+  1,65 m (saisie 1,80 m) », échelle ×0,917) ;
+* orange pointillé : douteuse (sol peu lisible).
+
+Une photo fausse fait paraître ses voisines justes légèrement décalées vers
+elle : les suspectes sont donc écartées et leurs voisines recontrôlées, pour
+ne garder que les vraies fautives. Le contrôle dit aussi si la **référence
+est cohérente** et **conseille** la station la plus sûre.
 
 **▶ Ajuster depuis la référence** — la référence est d'abord contrôlée : si
 elle semble fausse, l'ajustement est **suspendu** avec un avertissement (un
@@ -250,17 +271,19 @@ stations déjà ajustées est recalée sur le sol de ses voisines, puis sert à 
 tour de référence ; deux passes d'affinage répartissent l'erreur de tous
 côtés. Les corrections proposées sont entourées d'**orange**.
 
-Le **tableau** donne, pour chaque bulle : ΔX, ΔY, écart, orientation,
-corrélation, nombre de voisines et état. Double-clic : la vue du sol se
-centre dessus.
+Le **tableau** donne, pour chaque bulle : ΔX, ΔY, écart, orientation
+(mesurée), ΔH et échelle, corrélation, nombre de voisines et état.
+Double-clic : la vue du sol se centre dessus.
 
-**✔ Appliquer** — **un seul Ctrl+Z annule tout**.
+**✔ Appliquer** (après un ajustement seulement) — position XY, et H si
+**« Hauteur H (échelle) »** est cochée (décochée par défaut : H est alors
+seulement signalée). **Un seul Ctrl+Z annule tout.**
 
 Garde-fous : rien ne change avant « Appliquer » ; une bulle est refusée si la
-corrélation est faible ou la correction excessive (plus de 0,8 m ou 5°) ;
-sous 5 mm et 0,05°, elle est jugée en place et n'est pas retouchée ; Δ et H ne
-sont jamais modifiés ; les bornes habituelles (5 m du CSV) s'appliquent. Une
-photo est dite incohérente au-delà de 2 cm ou 0,2°.
+corrélation est faible ou la correction excessive (0,8 m, 5°, H ± 0,5 m) ;
+sous 5 mm (XY) et 1 cm (H), elle est jugée en place et n'est pas retouchée ;
+les bornes habituelles (5 m du CSV, H entre 0,10 et 3 m) s'appliquent. Seuils
+du contrôle : 2 cm, 0,2°, 3 cm de hauteur.
 
 ### Vérifications
 
@@ -274,7 +297,10 @@ Sur des panoramas de synthèse d'un même sol :
 * de proche en proche sur 29 bulles faussées jusqu'à 27 cm et 2,3° : erreur
   résiduelle 4 mm et 0,06° ; les stations justes ne bougent pas ;
 * contrôle de 28 bulles dont 4 faussées (jusqu'à 20 cm et 3°) : exactement
-  les 4 repérées, aucune fausse alerte ; une référence faussée est refusée.
+  les 4 repérées, aucune fausse alerte ; une référence faussée est refusée ;
+* hauteur d'instrument faussée de +15 cm / −20 cm : échelle ×0,916 / ×1,137,
+  H retrouvée à 2 mm près, position de la station juste à 3 mm ; en
+  ajustement avec hauteurs fausses, XY et H justes à 5 mm près.
 
 La **vue B** peut aussi se détacher dans sa propre fenêtre (bouton ⧉ de son
 en-tête), par exemple sur un second écran.
