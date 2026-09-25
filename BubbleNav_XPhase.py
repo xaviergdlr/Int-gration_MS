@@ -2762,12 +2762,21 @@ VUE DU SOL  (touche N, bouton « Sol ») — fenêtre séparée
   Espace + glisser : XY ; Ctrl + molette : orientation de son image ; molette :
   zoom ; clic droit glissé : déplacer ; clic : y aller. Seule la zone touchée
   est recalculée : la tuile suit le geste.
-  « ⇄ Ajuster de proche en proche… » : depuis une station de référence (A ou la
-  station active, qui ne bouge pas), chaque bulle est recalée en XY et / ou en
-  orientation sur le sol de ses voisines déjà ajustées, la plus proche d'abord,
-  puis affinée de tous côtés. Tableau des corrections avant application ;
-  refus si corrélation faible ou correction > 0,8 m / 5° ; « Appliquer » :
-  Ctrl+Z annule tout d'un coup. Δ et H ne sont jamais modifiés.
+  Noms : Locator et numéro de scan de chaque station ; ★ : la référence.
+  « ⇄ Contrôler / ajuster… » :
+    Contrôler : chaque photo confrontée au sol de ses voisines, sans rien
+      changer ; celles mal placées ou mal orientées À ELLES SEULES sont
+      entourées de rouge, avec l'écart ; une référence sûre est conseillée.
+    ★ Référence (= A, = station active, = conseillée) : elle ne bouge jamais,
+      tout s'aligne sur elle ; gardée pour ce relevé.
+    Ajuster depuis la référence : la référence est d'abord contrôlée (fausse :
+      ajustement suspendu) ; puis chaque bulle est recalée en XY et / ou en
+      orientation sur ses voisines déjà ajustées, la plus proche d'abord, et
+      affinée de tous côtés ; corrections proposées en orange.
+    Appliquer : après un contrôle, les seules photos incohérentes ; après un
+      ajustement, toutes les corrections acceptées. Ctrl+Z annule tout d'un
+      coup. Refus si corrélation faible ou correction > 0,8 m / 5° ; Δ et H ne
+      sont jamais modifiés.
 
 AFFICHAGE
   Liste « Voir » ............. Local, Locaux voisins, De proche en proche (défaut),
@@ -2912,6 +2921,7 @@ class BubbleNavApp(_TkBase):
         # de vue A ni B : on corrige ce que l'on voit, sous deux angles)
         self.target: Optional[int] = None
         self.ground: Optional["GroundView"] = None   # fenêtre « vue du sol »
+        self.ground_ref: Optional[int] = None        # référence des ajustements (★)
         self._axis_lock: Optional[str] = None    # X / Y verrouillé pour ce geste
         self._sync_ui = False                    # garde anti-boucle des widgets
         self._hover_xy = None
@@ -4597,6 +4607,7 @@ class BubbleNavApp(_TkBase):
         self.f_local_cb.config(values=sorted({s.parts().local for s in stations
                                               if s.parts().local}))
         self.by_photo = {s.photo: s for s in stations}
+        self.ground_ref = None                     # relue de la config pour ce relevé
         # Z = plancher + Δ + H ; les Z lus incohérents sont signalés
         alti = apply_altimetry(stations, float(self.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)))
         if alti:
@@ -7770,6 +7781,8 @@ GROUND_EL_MAX = -12.0          # deg : on ne garde que le sol (sous -12°)
 _BIG = 1.0e6
 ADJUST_TOL_XY = 0.005          # m : correction automatique plus petite = station en place
 ADJUST_TOL_YAW = 0.05          # deg : idem pour l'orientation
+CHECK_FLAG_XY = 0.02           # m : au-delà, photo incohérente avec ses voisines
+CHECK_FLAG_YAW = 0.2           # deg : idem pour l'orientation
 
 
 class GroundStrips:
@@ -8169,6 +8182,94 @@ def ground_adjust(stations: Sequence[Station], origin: int, candidates: Iterable
     return out
 
 
+def ground_check(stations: Sequence[Station], ids: Iterable[int], strips_get, calib: Calib,
+                 eye: float = EYE_HEIGHT_DEFAULT, link_r: float = 6.0,
+                 min_cc: float = 0.6, flag_xy: float = CHECK_FLAG_XY,
+                 flag_yaw: float = CHECK_FLAG_YAW, progress=None,
+                 cancel: Optional[threading.Event] = None) -> List[dict]:
+    """CONTRÔLE, sans rien modifier : chaque station de `ids` est confrontée au
+    sol de ses voisines (toutes les `stations` à moins de `link_r`), telles
+    qu'elles sont. Une photo mal placée ou mal orientée À ELLE SEULE ressort :
+    il faudrait la déplacer / tourner pour qu'elle se raccorde.
+
+    Une voisine fausse « contamine » ses voisines justes (elles semblent
+    décalées vers elle) : les stations suspectes sont donc écartées des
+    références et les stations concernées recontrôlées, jusqu'à stabilité.
+    Retourne par station {'idx', 'dx', 'dy', 'dyaw', 'cc', 'refs', 'state', 'why'},
+    state : 'ok' (cohérente), 'suspect' (incohérente), 'doute' (corrélation
+    faible), 'isole' (pas assez de voisines)."""
+    by = {s.idx: s for s in stations}
+    ids = [i for i in ids if i in by]
+    cache: Dict[int, object] = {}
+
+    def strip(i):
+        if i not in cache:
+            cache[i] = strips_get(by[i])
+        return cache[i]
+
+    def neigh(i):
+        s = by[i]
+        return [j for j in by if j != i and math.hypot(by[j].x - s.x, by[j].y - s.y) <= link_r]
+
+    def check_one(i, excl) -> dict:
+        s = by[i]
+        rep = {'idx': i, 'dx': 0.0, 'dy': 0.0, 'dyaw': 0.0, 'cc': 0.0, 'refs': 0,
+               'state': 'isole', 'why': 'aucune voisine avec image'}
+        refs = [by[j] for j in neigh(i) if j not in excl and strip(j) is not None]
+        rep['refs'] = len(refs)
+        if strip(i) is None:
+            rep['why'] = 'image absente'
+            return rep
+        if not refs:
+            return rep
+        strips = {r.idx: strip(r.idx) for r in refs}
+        strips[i] = strip(i)
+        r = ground_register(s, refs, strips, calib, eye)
+        if r is None:
+            rep['why'] = 'recouvrement insuffisant'
+            return rep
+        rep.update(dx=r['dx'], dy=r['dy'], dyaw=r['dyaw'], cc=r['cc'])
+        if r['cc'] < min_cc:
+            rep.update(state='doute', why=f"corrélation faible ({r['cc']:.2f})")
+        elif math.hypot(r['dx'], r['dy']) >= flag_xy or abs(r['dyaw']) >= flag_yaw:
+            rep.update(state='suspect', why='incohérente avec ses voisines')
+        else:
+            rep.update(state='ok', why='cohérente')
+        return rep
+
+    total = len(ids)
+    done = 0
+    res: Dict[int, dict] = {}
+    for i in ids:
+        if cancel is not None and cancel.is_set():
+            break
+        res[i] = check_one(i, ())
+        done += 1
+        if progress is not None:
+            progress(done, total, res[i])
+    for _ in range(3):                         # sans les suspectes, jusqu'à stabilité
+        sus = {i for i, r in res.items() if r['state'] == 'suspect'}
+        todo = [i for i in res if i in sus or sus & set(neigh(i))]
+        if not todo or (cancel is not None and cancel.is_set()):
+            break
+        total += len(todo)
+        changed = False
+        for i in todo:
+            if cancel is not None and cancel.is_set():
+                break
+            r = check_one(i, sus - {i})
+            if r['refs'] == 0:                 # plus de voisine sûre : on garde le 1er avis
+                r = res[i]
+            changed |= r['state'] != res[i]['state']
+            res[i] = r
+            done += 1
+            if progress is not None:
+                progress(done, total, r)
+        if not changed:
+            break
+    return [res[i] for i in ids if i in res]
+
+
 class GroundView(tk.Toplevel if _TK_OK else object):
     """Fenêtre « Vue du sol » : pavage nadir autour du point de vue A.
 
@@ -8205,6 +8306,9 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         self._drag = None
         self._press = None
         self.adjust_dlg = None
+        # repères du contrôle / de l'ajustement : {station: (nature, texte)}
+        self.marks: Dict[int, Tuple[str, str]] = {}
+        self.names = tk.BooleanVar(value=bool(app.cfg.get('ground_names', True)))
         self.seams = tk.BooleanVar(value=bool(app.cfg.get('ground_seams', True)))
         self.feather = tk.BooleanVar(value=bool(app.cfg.get('ground_feather', True)))
         self.nadir = tk.BooleanVar(value=bool(app.cfg.get('ground_nadir', True)))
@@ -8214,13 +8318,15 @@ class GroundView(tk.Toplevel if _TK_OK else object):
                  fg=COLORS['accent']).pack(side='left', padx=10, pady=4)
         app._mk_button(bar, "⌖ Centrer sur A", self.center_on_a,
                        tip="Recentrer sur le point de vue A.").pack(side='left', padx=4)
-        app._mk_button(bar, "⇄ Ajuster de proche en proche…", self.open_adjust,
-                       tip="Recalage automatique XY et orientation des bulles sur le sol "
-                           "de leurs voisines, en partant d'une station de référence "
-                           "(A ou la station active), de proche en proche. Aperçu du "
-                           "résultat avant application ; Ctrl+Z annule tout d'un coup."
+        app._mk_button(bar, "⇄ Contrôler / ajuster…", self.open_adjust,
+                       tip="Contrôle : repère en surbrillance les photos mal placées ou mal "
+                           "orientées par rapport à leurs voisines. Ajustement : recalage "
+                           "XY et orientation de proche en proche depuis la station de "
+                           "référence (★). Rien ne change avant « Appliquer » ; Ctrl+Z "
+                           "annule tout d'un coup."
                        ).pack(side='left', padx=4)
         for var, txt, tip in (
+                (self.names, "Noms", "Nom (Locator) et numéro de scan de chaque station."),
                 (self.seams, "Coutures", "Trait fin exactement sur la limite entre deux "
                                          "tuiles : un défaut de position ou d'orientation "
                                          "y fait une cassure."),
@@ -8324,7 +8430,10 @@ class GroundView(tk.Toplevel if _TK_OK else object):
 
     def _opts_changed(self) -> None:
         s, f, n = self._opts()
-        self.app.cfg.update(ground_seams=s, ground_feather=f, ground_nadir=n)
+        self.app.cfg.update(ground_seams=s, ground_feather=f, ground_nadir=n,
+                            ground_names=bool(self.names.get()))
+        save_config(self.app.cfg)
+        self.redraw()
         self.request()
 
     def _sig_of(self, st: Station, eye: float) -> tuple:
@@ -8503,7 +8612,10 @@ class GroundView(tk.Toplevel if _TK_OK else object):
         app = self.app
         tgt = app.target
         b = app.compare.idx if app.compare is not None else None
-        for st in self.stations_shown():
+        ref = self.ref_idx()
+        names = bool(self.names.get())
+        shown = self.stations_shown()
+        for st in shown:
             x, y = self.to_screen(st.x, st.y)
             if st.moved():
                 ox, oy = self.to_screen(st.ox, st.oy)
@@ -8514,23 +8626,100 @@ class GroundView(tk.Toplevel if _TK_OK else object):
             L = 0.6 * self.px_m
             c.create_line(x, y, x + L * math.sin(az), y - L * math.cos(az), fill='#e8e8e8',
                           width=1, dash=(3, 2))
+            mk = self.marks.get(st.idx)
+            if st.idx == ref:                     # référence : étoile dorée
+                pts = []
+                for k in range(10):
+                    rr = 13 if k % 2 == 0 else 5.5
+                    an = math.pi / 2 + k * math.pi / 5
+                    pts += [x + rr * math.cos(an), y - rr * math.sin(an)]
+                c.create_polygon(pts, fill='#ffd21f', outline='black', width=1.5)
             col = (COLORS['hot'] if st.idx == app.current else COLORS['sel'] if st.idx == b
                    else local_color(st.parts().local or st.floor))
             r = 6 if st.idx in (app.current, b, tgt) else 4
             c.create_oval(x - r, y - r, x + r, y + r, fill=col, outline='black')
             if st.idx == tgt:
                 c.create_oval(x - 11, y - 11, x + 11, y + 11, outline=COLORS['hot'], width=2)
-            tag = 'A ' if st.idx == app.current else 'B ' if st.idx == b else ''
-            nom = st.key if st.key_explicit and st.key else st.locator
-            c.create_text(x + 9, y - 9, text=tag + nom, anchor='sw', font=F_UI_B,
-                          fill='#000000')
-            c.create_text(x + 8, y - 10, text=tag + nom, anchor='sw', font=F_UI_B,
-                          fill=COLORS['edit'] if st.modified() else 'white')
+            if not names and st.idx not in (ref, app.current, b, tgt) and mk is None:
+                continue
+            tag = ('★ RÉF ' if st.idx == ref else '') + \
+                  ('A ' if st.idx == app.current else 'B ' if st.idx == b else '')
+            fg = ('#ffd21f' if st.idx == ref else COLORS['edit'] if st.modified()
+                  else 'white')
+            dx_l = 22 if mk is not None else 10   # à côté du cercle de surbrillance
+            self._label(x + dx_l, y - 8, tag + self.full_name(st), fg, 'sw')
+            if mk is not None and mk[1]:
+                self._label(x + dx_l, y + 8, mk[1],
+                            self.MARK_STYLE.get(mk[0], ('white',))[0], 'nw', F_UI)
+        for st in shown:                          # surbrillance, par-dessus tout
+            mk = self.marks.get(st.idx)
+            if mk is None:
+                continue
+            x, y = self.to_screen(st.x, st.y)
+            col_m, dash = self.MARK_STYLE.get(mk[0], ('#c8c8c8', (3, 3)))
+            c.create_oval(x - 17, y - 17, x + 17, y + 17, outline='black', width=5)
+            c.create_oval(x - 17, y - 17, x + 17, y + 17, outline=col_m, width=3, dash=dash)
         w, h = self._size()
         c.create_line(w - 30, 44, w - 30, 16, fill='#ff6b6b', width=2, arrow='last')
         c.create_text(w - 30, 52, text="N", fill='#ff6b6b', font=F_UI_B)
         c.create_line(14, h - 14, 14 + self.px_m, h - 14, fill='white', width=3)
         c.create_text(14 + self.px_m / 2, h - 22, text="1 m", fill='white', font=F_UI)
+        if self.marks:                            # légende de la surbrillance
+            y = 12
+            for kind, txt in (('ref', "★ référence (fixe)"),
+                              ('suspect', "photo incohérente avec ses voisines"),
+                              ('fix', "correction proposée"),
+                              ('doute', "douteuse (sol peu lisible)")):
+                if kind != 'ref' and not any(m[0] == kind for m in self.marks.values()):
+                    continue
+                col_m = '#ffd21f' if kind == 'ref' else self.MARK_STYLE[kind][0]
+                self._label(12, y, txt, col_m, 'nw', F_UI)
+                y += 20
+
+    MARK_STYLE = {'suspect': ('#ff4d4d', None), 'fix': ('#ffa31a', None),
+                  'doute': ('#ffa31a', (4, 3)), 'isole': ('#b0b0b0', (2, 3)),
+                  'ok': ('#5ad15a', (2, 4))}
+
+    @staticmethod
+    def full_name(st: Station) -> str:
+        """Nom de la station (Locator) et, s'il diffère, son numéro de scan."""
+        if st.key_explicit and st.key and st.key != st.locator:
+            return f"{st.locator}  {st.key}"
+        return st.locator
+
+    def _label(self, x: float, y: float, text: str, fg: str, anchor: str, font=None) -> None:
+        """Texte lisible sur le pavage : fond sombre, bord fin."""
+        c = self.canvas
+        t = c.create_text(x, y, text=text, anchor=anchor, font=font or F_UI_B, fill=fg)
+        bb = c.bbox(t)
+        if bb:
+            r = c.create_rectangle(bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1,
+                                   fill='#161a20', outline='#3a4150')
+            c.tag_raise(t, r)
+
+    # ── station de référence ─────────────────────────────────────────
+    def ref_idx(self) -> Optional[int]:
+        """Station de référence des ajustements : celle choisie (gardée d'une
+        séance à l'autre pour ce relevé), sinon le point de vue A."""
+        app = self.app
+        r = getattr(app, 'ground_ref', None)
+        if r is None and app.cfg.get('ground_ref_csv') == app.csv_path:
+            photo = app.cfg.get('ground_ref')
+            st = app.by_photo.get(photo) if photo else None
+            r = st.idx if st is not None else None
+            app.ground_ref = r
+        if r is not None and 0 <= r < len(app.stations):
+            return r
+        return app.current if 0 <= app.current < len(app.stations) else None
+
+    def set_ref(self, idx: Optional[int]) -> None:
+        app = self.app
+        if idx is None or not (0 <= idx < len(app.stations)):
+            return
+        app.ground_ref = idx
+        app.cfg.update(ground_ref=app.stations[idx].photo, ground_ref_csv=app.csv_path)
+        save_config(app.cfg)
+        self.redraw()
 
     def center_on_a(self) -> None:
         st = self.app.station()
@@ -8653,28 +8842,38 @@ class GroundView(tk.Toplevel if _TK_OK else object):
 
 
 class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
-    """« Ajuster de proche en proche » : recalage automatique des bulles sur le
-    sol de leurs voisines (voir ground_adjust), depuis une station de référence
-    qui ne bouge pas. Calcul en arrière-plan, tableau des corrections proposées,
-    puis « Appliquer » : une seule annulation (Ctrl+Z) défait tout."""
+    """« Contrôler / ajuster » les bulles sur le sol de leurs voisines.
 
-    COLS = (('st', "Station", 150), ('dx', "ΔX cm", 70), ('dy', "ΔY cm", 70),
+    * CONTRÔLER (rien ne change) : chaque photo est confrontée au sol de ses
+      voisines ; celles qui sont mal placées ou mal orientées à elles seules
+      sont mises en surbrillance dans la vue du sol et dans le tableau ; la
+      meilleure référence possible est proposée.
+    * AJUSTER DEPUIS LA RÉFÉRENCE : la référence (★, fixe) est d'abord
+      contrôlée — une référence fausse fausserait tout —, puis les bulles sont
+      recalées de proche en proche (voir ground_adjust).
+    « Appliquer » : une seule annulation (Ctrl+Z) défait tout."""
+
+    COLS = (('st', "Station", 170), ('dx', "ΔX cm", 65), ('dy', "ΔY cm", 65),
             ('dd', "Écart cm", 70), ('dn', "Orient. °", 75), ('cc', "Corrél.", 60),
-            ('nv', "Voisines", 75), ('etat', "État", 250))
+            ('nv', "Voisines", 70), ('etat', "État", 260))
+    MAX_SHIFT, MAX_YAW = 0.8, 5.0
 
     def __init__(self, gv: GroundView):
         super().__init__(gv)
         self.gv = gv
         self.app = app = gv.app
-        self.title(f"{APP_NAME} — ajustement de proche en proche")
+        self.title(f"{APP_NAME} — contrôler / ajuster sur le sol")
         self.configure(bg=COLORS['bg_dark'])
-        self.geometry("920x600")
+        self.geometry("960x640")
         self.transient(gv)
         self._cancel: Optional[threading.Event] = None
         self._result: Optional[List[dict]] = None
+        self._mode = ''
         self._base: Dict[int, Tuple[float, float, float]] = {}
         self._origin: Optional[int] = None
         self._used = (True, True)
+        self._suggest: Optional[int] = None
+        self._force_ref: Optional[int] = None
         bg = COLORS['bg_medium']
         top = tk.Frame(self, bg=bg)
         top.pack(fill='x')
@@ -8692,23 +8891,20 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
 
         r1 = tk.Frame(top, bg=bg)
         r1.pack(fill='x', padx=10, pady=(8, 2))
-        lab(r1, "Référence (fixe) :").pack(side='left')
-        self.origin_var = tk.StringVar(value='A')
-        a = app.station()
-        t = app.target_station()
-        rb = tk.Radiobutton(r1, text=f"point de vue A ({app._nom(a.idx) if a else '—'})",
-                            variable=self.origin_var, value='A', font=F_UI, bg=bg,
-                            fg=COLORS['text'], selectcolor=COLORS['bg_light'],
-                            activebackground=bg, highlightthickness=0)
-        rb.pack(side='left', padx=6)
-        rb2 = tk.Radiobutton(r1, text=f"station active ({app._nom(t.idx) if t else '—'})",
-                             variable=self.origin_var, value='T', font=F_UI, bg=bg,
-                             fg=COLORS['text'], selectcolor=COLORS['bg_light'],
-                             activebackground=bg, highlightthickness=0,
-                             state='normal' if t is not None else 'disabled')
-        rb2.pack(side='left', padx=6)
-        Tooltip(rb, "La station de départ ne bouge pas : elle sert de référence. "
-                    "Choisir une station dont la position et l'orientation sont sûres.")
+        lab(r1, "★ Référence (fixe) :").pack(side='left')
+        self.ref_lbl = tk.Label(r1, text="", font=F_UI_B, bg=bg, fg='#ffd21f')
+        self.ref_lbl.pack(side='left', padx=6)
+        app._mk_button(r1, "= A", lambda: self._set_ref(app.current),
+                       tip="Le point de vue A devient la référence.").pack(side='left', padx=2)
+        app._mk_button(r1, "= station active",
+                       lambda: self._set_ref(app.target if app.target_station() else None),
+                       tip="La station survolée devient la référence.").pack(side='left',
+                                                                             padx=2)
+        self.sug_btn = app._mk_button(r1, "= conseillée", lambda: self._set_ref(self._suggest),
+                                      tip="Après un contrôle : la station la plus cohérente "
+                                          "avec le plus de voisines.")
+        self.sug_btn.pack(side='left', padx=2)
+        self.sug_btn.config(state='disabled')
         r2 = tk.Frame(top, bg=bg)
         r2.pack(fill='x', padx=10, pady=2)
         lab(r2, "Portée autour de la référence (m) :").pack(side='left')
@@ -8729,31 +8925,44 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
                         textvariable=self.cc_var, font=F_UI)
         sp.pack(side='left', padx=6)
         Tooltip(sp, "Ressemblance minimale (0 à 1) entre le sol d'une bulle et celui de "
-                    "ses voisines déjà ajustées. En dessous, la bulle n'est pas corrigée.")
+                    "ses voisines. En dessous, la bulle est jugée douteuse et n'est pas "
+                    "corrigée.")
         r3 = tk.Frame(top, bg=bg)
-        r3.pack(fill='x', padx=10, pady=(2, 8))
-        self.run_btn = app._mk_button(r3, "▶ Calculer", self.run,
-                                      tip="Calcule les corrections, sans rien modifier.")
-        self.run_btn.pack(side='left')
-        self.apply_btn = app._mk_button(r3, "✔ Appliquer", self.apply,
-                                        tip="Applique les corrections acceptées. "
-                                            "Ctrl+Z les annule toutes d'un coup.")
-        self.apply_btn.pack(side='left', padx=6)
+        r3.pack(fill='x', padx=10, pady=(4, 4))
+        self.chk_btn = app._mk_button(
+            r3, "🔍 Contrôler", self.run_check,
+            tip="Chaque photo confrontée au sol de ses voisines, sans rien modifier : "
+                "celles mal placées ou mal orientées à elles seules passent en rouge.")
+        self.chk_btn.pack(side='left')
+        self.run_btn = app._mk_button(
+            r3, "▶ Ajuster depuis la référence", self.run_adjust,
+            tip="Contrôle d'abord la référence, puis recale les bulles de proche en "
+                "proche. Rien ne change avant « Appliquer ».")
+        self.run_btn.pack(side='left', padx=6)
+        self.apply_btn = app._mk_button(
+            r3, "✔ Appliquer", self.apply,
+            tip="Applique les corrections proposées (après un contrôle : aux seules "
+                "photos incohérentes). Ctrl+Z les annule toutes d'un coup.")
+        self.apply_btn.pack(side='left')
         self.apply_btn.config(state='disabled')
         app._mk_button(r3, "Fermer", self.close).pack(side='right')
-        self.prog = ttk.Progressbar(r3, length=260, mode='determinate')
+        self.prog = ttk.Progressbar(r3, length=220, mode='determinate')
         self.prog.pack(side='left', padx=12)
         self.msg = tk.Label(top, text="", font=F_UI_B, bg=bg, fg=COLORS['accent'],
                             anchor='w', padx=10)
-        self.msg.pack(fill='x', pady=(0, 6))
+        self.msg.pack(fill='x')
+        self.ref_msg = tk.Label(top, text="", font=F_UI_B, bg=bg, fg=COLORS['text'],
+                                anchor='w', padx=10, justify='left', wraplength=920)
+        self.ref_msg.pack(fill='x', pady=(0, 6))
         tk.Label(self, font=F_UI, bg=COLORS['bg_dark'], fg=COLORS['text_muted'], anchor='w',
-                 justify='left', padx=10, wraplength=820,
-                 text="Chaque bulle est recalée (translation et / ou rotation autour de la "
-                      "station) sur le sol vu par ses voisines déjà ajustées, la plus proche "
-                      "d'abord ; puis deux passes d'affinage de tous côtés. Refus si la "
-                      "corrélation est trop faible ou la correction excessive (plus de 0,8 m "
-                      "ou 5°) : la bulle reste telle quelle. Sous 5 mm et 0,05°, la bulle est jugée en "
-                      "place et n'est pas retouchée. Δ et H ne sont pas modifiés."
+                 justify='left', padx=10, wraplength=920,
+                 text="La référence doit être juste : tout l'ajustement s'aligne sur elle. "
+                      "Recalage : translation et / ou rotation de la bulle autour de sa "
+                      "station jusqu'à ce que son sol se raccorde à celui des voisines. "
+                      "Refus si la corrélation est trop faible ou la correction excessive "
+                      "(plus de 0,8 m ou 5°). Sous 5 mm et 0,05°, la bulle est en place. "
+                      "Δ et H ne sont jamais modifiés. Double-clic sur une ligne : la vue du "
+                      "sol se centre sur la station."
                  ).pack(fill='x', pady=(4, 2))
         fr = tk.Frame(self, bg=COLORS['bg_dark'])
         fr.pack(fill='both', expand=True, padx=10, pady=(2, 10))
@@ -8766,12 +8975,31 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side='left', fill='both', expand=True)
         sb.pack(side='right', fill='y')
-        self.tree.tag_configure('refus', foreground='#c0392b')
-        self.tree.tag_configure('ok', foreground='#1e7e34')
+        for tag, col in (('suspect', '#d62828'), ('fix', '#c46a00'), ('doute', '#c46a00'),
+                         ('isole', '#777777'), ('ok', '#1e7e34'), ('ref', '#9a7400')):
+            self.tree.tag_configure(tag, foreground=col)
         self.tree.bind('<Double-1>', self._on_pick)
         self.protocol('WM_DELETE_WINDOW', self.close)
+        self._show_ref()
 
-    # ── calcul ───────────────────────────────────────────────────────
+    # ── référence ────────────────────────────────────────────────────
+    def _set_ref(self, idx: Optional[int]) -> None:
+        if idx is None or self._cancel is not None:
+            return
+        self.gv.set_ref(idx)
+        self._force_ref = None
+        self._show_ref()
+
+    def _show_ref(self, state: str = '', txt: str = '') -> None:
+        ref = self.gv.ref_idx()
+        self.ref_lbl.config(text=self._nm(ref) if ref is not None else "—")
+        if txt:
+            col = {'ok': '#5ad15a', 'suspect': '#ff4d4d'}.get(state, '#ffa31a')
+            self.ref_msg.config(text=txt, fg=col)
+        else:
+            self.ref_msg.config(text="")
+
+    # ── paramètres, stations concernées ──────────────────────────────
     def _params(self):
         try:
             rng = clamp(float(self.range_var.get()), 3.0, 200.0)
@@ -8783,110 +9011,245 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
             mcc = 0.6
         return rng, mcc, bool(self.xy_var.get()), bool(self.yaw_var.get())
 
-    def run(self) -> None:
+    def _prepare(self, mode: str):
+        """Référence, stations dans la portée, instantané. None si impossible."""
         if self._cancel is not None:              # « Arrêter »
             self._cancel.set()
-            return
+            return None
         app = self.app
         rng, mcc, use_xy, use_yaw = self._params()
-        if not (use_xy or use_yaw):
+        if mode == 'adjust' and not (use_xy or use_yaw):
             self.msg.config(text="Cocher la position et / ou l'orientation")
-            return
+            return None
         app.cfg.update(adjust_range=rng, adjust_min_cc=mcc, adjust_xy=use_xy,
                        adjust_yaw=use_yaw)
-        if self.origin_var.get() == 'T' and app.target_station() is not None:
-            org = app.target_station()
-        else:
-            org = app.station()
+        ref = self.gv.ref_idx()
+        org = app.stations[ref] if ref is not None else None
         if org is None or not app.store.has(org.photo):
-            self.msg.config(text="Référence sans image")
-            return
+            self.msg.config(text="Référence sans image : en choisir une autre")
+            return None
         sts = [s for s in app.stations if s.floor == org.floor and app.store.has(s.photo)
                and math.hypot(s.x - org.x, s.y - org.y) <= rng]
-        cands = [s.idx for s in sts if s.idx != org.idx]
-        if not cands:
-            self.msg.config(text="Aucune bulle dans la portée")
-            return
+        if len(sts) < 2:
+            self.msg.config(text="Aucune autre bulle dans la portée")
+            return None
+        self._mode = mode
         self._origin = org.idx
         self._used = (use_xy, use_yaw)
         self._base = {s.idx: (s.x, s.y, s.yaw_fix) for s in sts}
-        snap = [dc_replace(s) for s in sts]
         self._result = None
         self.tree.delete(*self.tree.get_children())
         self.apply_btn.config(state='disabled')
-        self.run_btn.config(text="■ Arrêter")
-        self.prog.config(maximum=max(1, len(cands) * 3), value=0)
-        self.msg.config(text=f"référence {app._nom(org.idx)} · {len(cands)} bulle(s)…")
+        self.gv.marks = {}
+        self.gv.redraw()
+        self._show_ref()
+        busy = self.chk_btn if mode == 'check' else self.run_btn
+        busy.config(text="■ Arrêter")
+        self.prog.config(maximum=max(1, len(sts)), value=0)
         self._cancel = threading.Event()
-        args = (snap, org.idx, cands, dc_replace(app.calib),
-                float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)),
-                use_xy, use_yaw, mcc, self._cancel)
-        threading.Thread(target=self._work, args=args, daemon=True,
-                         name='bubblenav-ajust').start()
+        return ([dc_replace(s) for s in sts], org.idx, dc_replace(app.calib),
+                float(app.cfg.get('eye_height', EYE_HEIGHT_DEFAULT)), mcc, use_xy, use_yaw)
 
-    def _work(self, snap, origin, cands, cal, eye, use_xy, use_yaw, mcc, cancel) -> None:
+    # ── contrôle ─────────────────────────────────────────────────────
+    def run_check(self) -> None:
+        prep = self._prepare('check')
+        if prep is None:
+            return
+        snap, org, cal, eye, mcc, _x, _y = prep
+        self.msg.config(text=f"contrôle de {len(snap)} bulle(s)…")
+        threading.Thread(target=self._work_check, args=(snap, cal, eye, mcc, self._cancel),
+                         daemon=True, name='bubblenav-controle').start()
+
+    def _work_check(self, snap, cal, eye, mcc, cancel) -> None:
         gs = self.app.ground_strips
         t0 = time.perf_counter()
-
-        def progress(done, total, rep):
-            self.app._post(self._progress, done, total, rep)
-
         try:
-            res = ground_adjust(snap, origin, cands, lambda s: gs.get(s.photo), cal, eye,
-                                use_xy=use_xy, use_yaw=use_yaw, min_cc=mcc,
-                                progress=progress, cancel=cancel)
-            self.app._post(self._done, res, cancel.is_set(), time.perf_counter() - t0)
+            res = ground_check(snap, [s.idx for s in snap], lambda s: gs.get(s.photo), cal,
+                               eye, min_cc=mcc, progress=self._progress_cb, cancel=cancel)
+            self.app._post(self._done_check, res, cancel.is_set(), time.perf_counter() - t0)
         except Exception as exc:
             msg = str(exc)
-            self.app._post(self._done, None, False, 0.0, msg)
+            self.app._post(self._failed, msg)
+
+    def _done_check(self, res, cancelled, dt) -> None:
+        if not self._alive():
+            return
+        self._idle()
+        self._result = res
+        app = self.app
+        order = {'suspect': 0, 'doute': 1, 'isole': 2, 'ok': 3}
+        for r in sorted(res, key=lambda r: (order[r['state']],
+                                            -math.hypot(r['dx'], r['dy']) - abs(r['dyaw']))):
+            etat = {'suspect': "INCOHÉRENTE : à corriger", 'doute': "douteuse : " + r['why'],
+                    'isole': "non contrôlée : " + r['why'], 'ok': "cohérente"}[r['state']]
+            if r['idx'] == self._origin:
+                etat = "★ référence — " + etat
+            self._row(r, etat, r['state'])
+        marks = {}
+        for r in res:
+            if r['state'] == 'suspect':
+                marks[r['idx']] = ('suspect', self._amount(r))
+            elif r['state'] in ('doute', 'isole'):
+                marks[r['idx']] = (r['state'], '?')
+        self.gv.marks = marks
+        self.gv.redraw()
+        # la référence conseillée : cohérente, le plus de voisines, le plus petit écart
+        oks = [r for r in res if r['state'] == 'ok']
+        self._suggest = (min(oks, key=lambda r: (-r['refs'], math.hypot(r['dx'], r['dy'])
+                                                 + 0.05 * abs(r['dyaw'])))['idx']
+                         if oks else None)
+        self.sug_btn.config(state='normal' if self._suggest is not None else 'disabled',
+                            text=f"= conseillée ({self._nm(self._suggest)})"
+                            if self._suggest is not None else "= conseillée")
+        self._ref_verdict(next((r for r in res if r['idx'] == self._origin), None))
+        n_sus = sum(1 for r in res if r['state'] == 'suspect')
+        n_dou = sum(1 for r in res if r['state'] in ('doute', 'isole'))
+        self.msg.config(text=(("interrompu · " if cancelled else "")
+                              + f"{n_sus} photo(s) incohérente(s), {n_dou} douteuse(s), "
+                                f"{len(res) - n_sus - n_dou} cohérente(s) · {dt:.1f} s"))
+        self.apply_btn.config(state='normal' if self._appliable() else 'disabled')
+
+    def _ref_verdict(self, r: Optional[dict]) -> None:
+        app = self.app
+        nom = self._nm(self._origin)
+        if r is None or r['state'] == 'isole':
+            self._show_ref('doute', f"★ Référence {nom} : non contrôlable (voisines "
+                                    "insuffisantes).")
+        elif r['state'] == 'ok':
+            self._show_ref('ok', f"★ Référence {nom} : cohérente avec ses {r['refs']} "
+                                 f"voisines ({self._amount(r)}).")
+        elif r['state'] == 'suspect':
+            self._show_ref('suspect', f"⚠ Référence {nom} : semble fausse par rapport à ses "
+                                      f"{r['refs']} voisines ({self._amount(r)}). Choisir "
+                                      "une autre référence, ou la corriger d'abord.")
+        else:
+            self._show_ref('doute', f"★ Référence {nom} : douteuse ({r['why']}).")
+
+    # ── ajustement de proche en proche ───────────────────────────────
+    def run_adjust(self) -> None:
+        prep = self._prepare('adjust')
+        if prep is None:
+            return
+        snap, org, cal, eye, mcc, use_xy, use_yaw = prep
+        self.msg.config(text=f"contrôle de la référence {self._nm(org)}…")
+        force = self._force_ref == org
+        threading.Thread(target=self._work_adjust,
+                         args=(snap, org, cal, eye, mcc, use_xy, use_yaw, force,
+                               self._cancel),
+                         daemon=True, name='bubblenav-ajust').start()
+
+    def _work_adjust(self, snap, org, cal, eye, mcc, use_xy, use_yaw, force, cancel) -> None:
+        gs = self.app.ground_strips
+        get = lambda s: gs.get(s.photo)
+        t0 = time.perf_counter()
+        try:
+            # 1. la référence elle-même : une référence fausse fausserait tout
+            o = next(s for s in snap if s.idx == org)
+            near = [s for s in snap if math.hypot(s.x - o.x, s.y - o.y) <= 6.0]
+            chk = ground_check(near, [org] + [s.idx for s in near if s.idx != org], get,
+                               cal, eye, min_cc=mcc, cancel=cancel)
+            rref = next((r for r in chk if r['idx'] == org), None)
+            self.app._post(self._ref_verdict, rref)
+            if rref is not None and rref['state'] == 'suspect' and not force:
+                self.app._post(self._ref_refused, chk)
+                return
+            # 2. de proche en proche
+            res = ground_adjust(snap, org, [s.idx for s in snap if s.idx != org], get, cal,
+                                eye, use_xy=use_xy, use_yaw=use_yaw, min_cc=mcc,
+                                max_shift=self.MAX_SHIFT, max_yaw=self.MAX_YAW,
+                                progress=self._progress_cb, cancel=cancel)
+            self.app._post(self._done_adjust, res, cancel.is_set(), time.perf_counter() - t0)
+        except Exception as exc:
+            msg = str(exc)
+            self.app._post(self._failed, msg)
+
+    def _ref_refused(self, chk) -> None:
+        if not self._alive():
+            return
+        self._idle()
+        self._force_ref = self._origin
+        self.gv.marks = {r['idx']: ('suspect', self._amount(r)) for r in chk
+                         if r['state'] == 'suspect'}
+        self.gv.redraw()
+        self.msg.config(text="Ajustement suspendu : la référence semble fausse. "
+                             "« Ajuster » à nouveau pour l'utiliser quand même.")
+
+    def _done_adjust(self, res, cancelled, dt) -> None:
+        if not self._alive():
+            return
+        self._idle()
+        self._result = res
+        app = self.app
+        self.tree.insert('', 'end', values=(f"★ {self._nm(self._origin)}", '—', '—', '—',
+                                            '—', '—', '—', 'référence (fixe)'), tags=('ref',))
+        marks = {}
+        n_fix = n_non = 0
+        for r in sorted(res, key=lambda r: (not r['ok'], -math.hypot(r['dx'], r['dy']))):
+            d = math.hypot(r['dx'], r['dy'])
+            if not r['ok']:
+                etat, tag = 'refusée : ' + r['why'], 'suspect'
+                marks[r['idx']] = ('doute', '?')
+                n_non += 1
+            elif d < ADJUST_TOL_XY and abs(r['dyaw']) < ADJUST_TOL_YAW:
+                etat, tag = 'en place (inchangée)', 'ok'
+            else:
+                etat, tag = 'à corriger', 'fix'
+                marks[r['idx']] = ('fix', self._amount(r))
+                n_fix += 1
+            self._row(r, etat, tag)
+        self.gv.marks = marks
+        self.gv.redraw()
+        ok = [r for r in res if r['ok']]
+        dmax = max((math.hypot(r['dx'], r['dy']) for r in ok), default=0.0)
+        amax = max((abs(r['dyaw']) for r in ok), default=0.0)
+        self.msg.config(text=(("interrompu · " if cancelled else "")
+                              + f"{n_fix} à corriger, {len(res) - n_fix - n_non} en place, "
+                                f"{n_non} refusée(s) · max {dmax * 100:.1f} cm, "
+                                f"{amax:.2f}° · {dt:.1f} s"))
+        self.apply_btn.config(state='normal' if self._appliable() else 'disabled')
+
+    # ── commun ───────────────────────────────────────────────────────
+    def _progress_cb(self, done, total, rep) -> None:
+        self.app._post(self._progress, done, total, rep)
 
     def _progress(self, done, total, rep) -> None:
         try:
             self.prog.config(maximum=max(1, total), value=done)
-            self.msg.config(text=f"{done} / {total} · {self.app._nom(rep['idx'])}")
+            self.msg.config(text=f"{done} / {total} · {self._nm(rep['idx'])}")
         except Exception:
             pass
 
-    def _done(self, res, cancelled, dt, err: str = '') -> None:
+    def _alive(self) -> bool:
         self._cancel = None
         try:
-            if not self.winfo_exists():
-                return
+            return bool(self.winfo_exists())
         except Exception:
-            return
-        self.run_btn.config(text="▶ Calculer")
-        if res is None:
-            self.msg.config(text=f"Erreur : {err}")
-            return
-        self._result = res
-        self.tree.delete(*self.tree.get_children())
-        app = self.app
-        self.tree.insert('', 'end', values=(app._nom(self._origin), '—', '—', '—', '—', '—',
-                                            '—', 'référence (fixe)'), tags=('ok',))
-        res_sorted = sorted(res, key=lambda r: (not r['ok'], -math.hypot(r['dx'], r['dy'])))
-        for r in res_sorted:
-            d = math.hypot(r['dx'], r['dy'])
-            if not r['ok']:
-                etat = 'refusée : ' + r['why']
-            elif d < ADJUST_TOL_XY and abs(r['dyaw']) < ADJUST_TOL_YAW:
-                etat = 'en place (inchangée)'
-            else:
-                etat = 'ajustée'
-            self.tree.insert('', 'end', iid=str(r['idx']),
-                             values=(app._nom(r['idx']), f"{r['dx'] * 100:+.1f}",
-                                     f"{r['dy'] * 100:+.1f}", f"{d * 100:.1f}",
-                                     f"{r['dyaw']:+.2f}", f"{r['cc']:.2f}", r['refs'], etat),
-                             tags=('ok' if r['ok'] else 'refus',))
-        ok = [r for r in res if r['ok'] and (math.hypot(r['dx'], r['dy']) >= ADJUST_TOL_XY
-                                             or abs(r['dyaw']) >= ADJUST_TOL_YAW)]
-        non = sum(1 for r in res if not r['ok'])
-        keep = len(res) - len(ok) - non
-        dmax = max((math.hypot(r['dx'], r['dy']) for r in ok), default=0.0)
-        amax = max((abs(r['dyaw']) for r in ok), default=0.0)
-        self.msg.config(text=(("interrompu · " if cancelled else "")
-                              + f"{len(ok)} à corriger, {keep} en place, {non} refusée(s) · max "
-                                f"{dmax * 100:.1f} cm, {amax:.2f}° · {dt:.1f} s"))
-        self.apply_btn.config(state='normal' if ok else 'disabled')
+            return False
+
+    def _idle(self) -> None:
+        self.chk_btn.config(text="🔍 Contrôler")
+        self.run_btn.config(text="▶ Ajuster depuis la référence")
+
+    def _failed(self, msg: str) -> None:
+        if self._alive():
+            self._idle()
+            self.msg.config(text=f"Erreur : {msg}")
+
+    def _nm(self, idx: Optional[int]) -> str:
+        return GroundView.full_name(self.app.stations[idx]) if idx is not None else "—"
+
+    @staticmethod
+    def _amount(r: dict) -> str:
+        return (f"{math.hypot(r['dx'], r['dy']) * 100:.1f} cm · "
+                f"{r['dyaw']:+.2f}°").replace('.', ',')
+
+    def _row(self, r: dict, etat: str, tag: str) -> None:
+        d = math.hypot(r['dx'], r['dy'])
+        nom = ('★ ' if r['idx'] == self._origin else '') + self._nm(r['idx'])
+        self.tree.insert('', 'end', iid=str(r['idx']),
+                         values=(nom, f"{r['dx'] * 100:+.1f}", f"{r['dy'] * 100:+.1f}",
+                                 f"{d * 100:.1f}", f"{r['dyaw']:+.2f}", f"{r['cc']:.2f}",
+                                 r['refs'], etat), tags=(tag,))
 
     def _on_pick(self, event) -> None:
         """Double-clic sur une ligne : la vue du sol se centre sur la station."""
@@ -8897,17 +9260,34 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
             self.gv._display()
             self.gv.request()
 
+    def _todo(self) -> List[dict]:
+        """Corrections à appliquer : après un ajustement, les bulles acceptées ;
+        après un contrôle, les seules photos incohérentes (recalées sur leurs
+        voisines cohérentes), jamais la référence."""
+        if not self._result:
+            return []
+        if self._mode == 'adjust':
+            return [r for r in self._result if r['ok']]
+        return [r for r in self._result if r['state'] == 'suspect'
+                and r['idx'] != self._origin
+                and math.hypot(r['dx'], r['dy']) <= self.MAX_SHIFT
+                and abs(r['dyaw']) <= self.MAX_YAW]
+
+    def _appliable(self) -> bool:
+        use_xy, use_yaw = self._used
+        return any((use_xy and math.hypot(r['dx'], r['dy']) >= ADJUST_TOL_XY)
+                   or (use_yaw and abs(r['dyaw']) >= ADJUST_TOL_YAW) for r in self._todo())
+
     # ── application : une seule annulation ───────────────────────────
     def apply(self) -> None:
         app = self.app
-        if not self._result:
+        todo = self._todo()
+        if not todo:
             return
         n = skipped = 0
         n_journal = len(app.journal)
         use_xy, use_yaw = self._used
-        for r in self._result:
-            if not r['ok']:
-                continue
+        for r in todo:
             st = app.stations[r['idx']]
             base = self._base.get(r['idx'])
             if base is None or (abs(st.x - base[0]) > 1e-6 or abs(st.y - base[1]) > 1e-6
@@ -8925,6 +9305,7 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
                 continue
             app.corrections.apply(st, **kw)
             app._refresh_links_of(st.idx)
+            self.gv.marks.pop(st.idx, None)
             n += 1
         # les n étapes du journal commun deviennent une seule annulation
         del app.journal[n_journal:]
@@ -8935,17 +9316,23 @@ class GroundAdjustDialog(tk.Toplevel if _TK_OK else object):
                 app.compare.request_render(force=True)
         self._result = None
         self.apply_btn.config(state='disabled')
-        txt = f"{n} bulle(s) ajustée(s) — Ctrl+Z annule l'ensemble"
+        self.gv.redraw()
+        txt = f"{n} bulle(s) corrigée(s) — Ctrl+Z annule l'ensemble"
         if skipped:
             txt += f" · {skipped} ignorée(s) (modifiée(s) entre-temps)"
         self.msg.config(text=txt)
-        app._set_status("Ajustement de proche en proche : " + txt, COLORS['edit'])
+        app._set_status("Vue du sol : " + txt, COLORS['edit'])
 
     def close(self) -> None:
         if self._cancel is not None:
             self._cancel.set()
         if self.gv.adjust_dlg is self:
             self.gv.adjust_dlg = None
+        try:
+            self.gv.marks = {}
+            self.gv.redraw()
+        except Exception:
+            pass
         try:
             self.destroy()
         except Exception:

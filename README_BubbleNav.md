@@ -208,28 +208,59 @@ l'image existante, recadrée ; le calcul complet suit en arrière-plan
 (≈ 0,2 s). À la première ouverture, le pavage apparaît au fur et à mesure du
 chargement.
 
-### Ajuster de proche en proche
+### Ce que corrige le pavage
 
-Bouton **« ⇄ Ajuster de proche en proche… »** de la vue du sol :
+La vue du sol **ne corrige rien d'elle-même** : elle montre. Ce qui corrige :
+* les **gestes** sur une tuile (Espace + glisser, Ctrl / Alt / Maj + molette) ;
+* le **contrôle / ajustement** ci-dessous.
 
-1. choisir la **référence** : le point de vue A ou la station active ; elle ne
-   bouge pas, choisir une station sûre ;
-2. choisir la **portée** (m), ce qui est corrigé (**position XY**,
-   **orientation de l'image**) et la **corrélation mini** ;
-3. **Calculer** : la bulle la plus proche des stations déjà ajustées est
-   recalée sur le sol vu par ses voisines, puis sert à son tour de référence ;
-   deux passes d'affinage répartissent ensuite l'erreur de tous côtés au lieu
-   de la laisser s'accumuler le long de la chaîne ;
-4. le **tableau** montre, pour chaque bulle, ΔX, ΔY, l'orientation, la
-   corrélation et l'état (ajustée, en place, refusée et pourquoi) ;
-   double-clic : la vue du sol se centre dessus ;
-5. **Appliquer** : les corrections passent dans le CSV de sortie (XY) et dans
-   l'orientation des images ; **un seul Ctrl+Z annule tout**.
+Les corrections portent sur la **position XY** de la station (écrite dans le
+CSV de sortie) et sur l'**orientation de son image** (appliquée à l'image,
+jamais au CSV). Les **pastilles** des bulles sont calculées à partir de ces
+deux valeurs : corriger la station corrige donc la place des pastilles, dans
+sa bulle (orientation) et dans celles des voisines (position). Δ et H ne sont
+jamais modifiés par le contrôle / ajustement.
+
+Sur le pavage, chaque station porte son **nom** (Locator) et son numéro de
+scan, sur fond sombre (case **Noms**). La référence porte une **★ dorée**.
+
+### Contrôler / ajuster
+
+Bouton **« ⇄ Contrôler / ajuster… »** de la vue du sol.
+
+**★ Référence** — la station qui ne bouge jamais : tout l'ajustement s'aligne
+sur elle ; elle doit donc être juste. Boutons **= A**, **= station active**,
+**= conseillée**. Elle est gardée d'une séance à l'autre pour ce relevé.
+
+**🔍 Contrôler** (rien ne change) — chaque photo est confrontée au sol de ses
+voisines, telles qu'elles sont. Une photo **mal placée ou mal orientée à elle
+seule** est entourée de **rouge** dans la vue du sol, avec l'écart (cm et °),
+et passe en tête du tableau. Une photo fausse fait paraître ses voisines
+justes légèrement décalées vers elle : les suspectes sont donc écartées et
+leurs voisines recontrôlées, pour ne garder que les vraies fautives. Le
+contrôle dit aussi si la **référence est cohérente** avec ses voisines et
+**conseille** la station la plus sûre (cohérente, le plus de voisines).
+*Appliquer* après un contrôle corrige **les seules photos incohérentes**, en
+les recalant sur leurs voisines cohérentes.
+
+**▶ Ajuster depuis la référence** — la référence est d'abord contrôlée : si
+elle semble fausse, l'ajustement est **suspendu** avec un avertissement (un
+second clic l'utilise quand même). Ensuite, la bulle la plus proche des
+stations déjà ajustées est recalée sur le sol de ses voisines, puis sert à son
+tour de référence ; deux passes d'affinage répartissent l'erreur de tous
+côtés. Les corrections proposées sont entourées d'**orange**.
+
+Le **tableau** donne, pour chaque bulle : ΔX, ΔY, écart, orientation,
+corrélation, nombre de voisines et état. Double-clic : la vue du sol se
+centre dessus.
+
+**✔ Appliquer** — **un seul Ctrl+Z annule tout**.
 
 Garde-fous : rien ne change avant « Appliquer » ; une bulle est refusée si la
 corrélation est faible ou la correction excessive (plus de 0,8 m ou 5°) ;
 sous 5 mm et 0,05°, elle est jugée en place et n'est pas retouchée ; Δ et H ne
-sont jamais modifiés ; les bornes habituelles (5 m du CSV) s'appliquent.
+sont jamais modifiés ; les bornes habituelles (5 m du CSV) s'appliquent. Une
+photo est dite incohérente au-delà de 2 cm ou 0,2°.
 
 ### Vérifications
 
@@ -241,7 +272,9 @@ Sur des panoramas de synthèse d'un même sol :
 * recalage d'une bulle faussée de (+18, −12) cm ou de 2° : retrouvé au
   millimètre et au centième de degré ;
 * de proche en proche sur 29 bulles faussées jusqu'à 27 cm et 2,3° : erreur
-  résiduelle 4 mm et 0,06° ; les stations justes ne bougent pas.
+  résiduelle 4 mm et 0,06° ; les stations justes ne bougent pas ;
+* contrôle de 28 bulles dont 4 faussées (jusqu'à 20 cm et 3°) : exactement
+  les 4 repérées, aucune fausse alerte ; une référence faussée est refusée.
 
 La **vue B** peut aussi se détacher dans sa propre fenêtre (bouton ⧉ de son
 en-tête), par exemple sur un second écran.
